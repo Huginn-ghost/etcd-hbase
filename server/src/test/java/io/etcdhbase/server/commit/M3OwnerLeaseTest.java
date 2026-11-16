@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.commit.AuxiliaryFormatUpgrade;
 import io.etcdhbase.core.commit.CommitControlStore;
 import io.etcdhbase.core.commit.CommitDecision;
 import io.etcdhbase.core.commit.CommitDecisionRepository;
@@ -62,6 +63,89 @@ class M3OwnerLeaseTest {
         store.failHeartbeat = true;
         assertTrue(lost.await(5, TimeUnit.SECONDS));
         assertFalse(lease.isReady());
+      } finally {
+        lease.close();
+        lease.drained().get(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  @Test
+  void startupFormatUpgradeRotatesTheFenceWithoutLosingOwnerRenewal() throws Exception {
+    var store = new MemoryControl();
+    var owners = new CommitOwnerService(store);
+    var clock = new MutableClock(System.currentTimeMillis());
+    try (var startup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var lease = M3OwnerLease.acquire(recovery(store, owners), owners, "owner-a",
+          Duration.ofMillis(1200), Duration.ofMillis(200), Duration.ofMillis(400), startup, () -> {}, clock).join();
+      try {
+        var previous = lease.token();
+        long previousDeadline = store.currentState().ownerLeaseDeadlineEpochMillis();
+        clock.advance(400);
+        var upgraded = lease.transitionFence(owners,
+            current -> new AuxiliaryFormatUpgrade(store)
+                .upgrade(current, System.currentTimeMillis(), startup), startup)
+            .get(5, TimeUnit.SECONDS);
+
+        assertEquals(previous.instance(), upgraded.instance());
+        assertTrue(upgraded.epoch() > previous.epoch());
+        assertEquals(upgraded, lease.token());
+        assertTrue(store.currentState().supportsAuxiliaryRecords());
+        assertTrue(store.currentState().ownerLeaseDeadlineEpochMillis() > previousDeadline,
+            "the fence transition extends the persisted owner deadline");
+        assertTrue(lease.isReady());
+      } finally {
+        lease.close();
+        lease.drained().get(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  @Test
+  void closingDuringFenceTransitionWaitsAndDoesNotPublishTheLateToken() throws Exception {
+    var store = new MemoryControl();
+    var owners = new CommitOwnerService(store);
+    var pending = new CompletableFuture<CommitOwnerService.OwnerToken>();
+    try (var startup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var lease = M3OwnerLease.acquire(recovery(store, owners), owners, "owner-a",
+          Duration.ofSeconds(30), Duration.ofSeconds(10), Duration.ofSeconds(1),
+          startup, () -> {}).join();
+      var previous = lease.token();
+      try {
+        var transition = lease.transitionFence(owners, current -> pending, startup);
+        assertFalse(lease.isReady());
+        lease.close();
+        assertFalse(lease.drained().isDone(), "the transition still owns its completion path");
+        pending.complete(new CommitOwnerService.OwnerToken(previous.instance(), previous.epoch() + 1));
+        assertThrows(CompletionException.class, transition::join);
+        assertEquals(previous, lease.token(), "a late transition cannot publish after stop");
+        lease.drained().get(5, TimeUnit.SECONDS);
+      } finally {
+        pending.complete(previous);
+        lease.close();
+        lease.drained().get(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  @Test
+  void rejectedFenceTransitionStopsTheOwnerWithoutPublishingItsToken() throws Exception {
+    var store = new MemoryControl();
+    var owners = new CommitOwnerService(store);
+    var lost = new AtomicInteger();
+    try (var startup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var lease = M3OwnerLease.acquire(recovery(store, owners), owners, "owner-a",
+          Duration.ofSeconds(30), Duration.ofSeconds(10), Duration.ofSeconds(1),
+          startup, lost::incrementAndGet).join();
+      var previous = lease.token();
+      try {
+        var transition = lease.transitionFence(owners, current -> CompletableFuture.completedFuture(
+            new CommitOwnerService.OwnerToken("another-owner", current.epoch())), startup);
+        assertThrows(CompletionException.class, transition::join);
+        assertEquals(previous, lease.token());
+        assertEquals(1, lost.get());
+        assertFalse(lease.isReady());
+        lease.drained().get(5, TimeUnit.SECONDS);
       } finally {
         lease.close();
         lease.drained().get(5, TimeUnit.SECONDS);
@@ -238,6 +322,7 @@ class M3OwnerLeaseTest {
       state = replacement;
       return CompletableFuture.completedFuture(true);
     }
+    private synchronized CommitState currentState() { return state; }
     private static ControlSnapshot snapshot(CommitState state) {
       return new ControlSnapshot(state, ByteBuffer.allocate(Long.BYTES).putLong(state.stateVersion()).array());
     }
