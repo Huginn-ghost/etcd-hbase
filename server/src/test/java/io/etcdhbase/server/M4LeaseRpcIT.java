@@ -1,0 +1,498 @@
+package io.etcdhbase.server;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import etcdserverpb.LeaseGrpc;
+import etcdserverpb.Rpc;
+import io.etcdhbase.admin.M3TableGroupInitializer;
+import io.etcdhbase.admin.M3TableGroupPlan;
+import io.etcdhbase.admin.TableGroupPlanFactory;
+import io.etcdhbase.admin.config.InitializationConfiguration;
+import io.etcdhbase.admin.config.InitializationConfigurationLoader;
+import io.etcdhbase.core.commit.CommitState;
+import io.etcdhbase.core.commit.ControlSnapshot;
+import io.etcdhbase.core.lease.LeaseTimeObservation;
+import io.etcdhbase.core.lease.LeaseTimeSource;
+import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.hbase.identity.HBaseAuthenticators;
+import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
+import io.etcdhbase.hbase.probe.TemporaryHBaseClusterProcess;
+import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
+import io.etcdhbase.server.config.M3RuntimeConfiguration;
+import io.etcdhbase.server.config.M3RuntimeConfigurationLoader;
+import io.etcdhbase.server.config.M3MemoryReservations;
+import io.etcdhbase.server.config.RuntimeConfiguration;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
+import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.time.Duration;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongFunction;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+/** Verifies J40 Lease RPCs against a disposable HBase cluster, both layouts, and runtime restart. */
+@Timeout(600)
+class M4LeaseRpcIT {
+  private static final int MAX_DRIVER_DIAGNOSTIC_BYTES = 8 * 1024;
+  private static final List<String> LAYOUT_FILES =
+      List.of("history-table.json", "native-cell-versions.json");
+  private static final RuntimeConfiguration.ResourceBudgets RESOURCES =
+      new RuntimeConfiguration.ResourceBudgets(65_536, 4, 30_000,
+          4 << 20, 4 << 20, 16, 0);
+
+  @Test
+  void realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts() throws Exception {
+    RunContext run = prepareRun();
+    prepareNativeEvidence(run);
+    try (var cluster = TemporaryHBaseClusterProcess.start()) {
+      int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
+      for (int index = 0; index < LAYOUT_FILES.size(); index++) {
+        String layoutFile = LAYOUT_FILES.get(index);
+        String layout = index == 0 ? "HISTORY" : "NATIVE";
+        runLayout(cluster, clientPort, layoutFile, layout, run);
+      }
+    }
+    compare(run, "HISTORY");
+    compare(run, "NATIVE");
+  }
+
+  @Test
+  void minimumMemoryPreservesLeaseLifecycleWhenClockFailsBeforeSelection() throws Exception {
+    try (var cluster = TemporaryHBaseClusterProcess.start()) {
+      int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
+      InitializationConfiguration initialization = initialization("history-table.json", clientPort);
+      var source = TableGroupPlanFactory.create(initialization, "local", null);
+      var plan = M3TableGroupPlan.from(source);
+      var authScope = new io.etcdhbase.spi.identity.AuthenticationScope(
+          source.tableGroupId(), source.hbaseProfile().id());
+      try (var initializer = new HBaseBackendIdentityProvider(source.identityProviderId(), authScope,
+              cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+              (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+              1, 1, Duration.ofSeconds(30));
+           var credentials = new io.etcdhbase.spi.identity.BackendCredentials("m4-initializer", new char[0])) {
+        var identity = authenticate(initializer, credentials, authScope);
+        var activation = minimumActivation();
+        initializeM4Layout(plan, source.fingerprint(), identity, initializer, activation);
+        var configuration = new RuntimeConfiguration(initialization.schemaVersion(),
+            List.of(new RuntimeConfiguration.Listener("m4-local", "127.0.0.1", 0, source.tableGroupId())),
+            initialization.hbaseProfiles(), initialization.saltProfiles(), initialization.tableGroups(), RESOURCES);
+        exerciseLeaseLifecycleAtMinimum(plan, initializer, identity, configuration, activation);
+      }
+    }
+  }
+
+  private static void exerciseLeaseLifecycleAtMinimum(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider initializer, io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      RuntimeConfiguration configuration, M3RuntimeConfiguration activation) throws Exception {
+    var now = new AtomicLong(10_000);
+    var healthy = new AtomicBoolean(true);
+    var observations = new AtomicInteger();
+    var armed = new AtomicBoolean(false);
+    var rewind = new AtomicBoolean(false);
+    LeaseTimeSource time = () -> {
+      boolean observedHealthy = healthy.get();
+      long observedNow = now.get();
+      if (armed.get() && observations.incrementAndGet() == 2) {
+        if (rewind.get()) now.set(12_000);
+        else healthy.set(false);
+      }
+      return new LeaseTimeObservation(observedNow, observedNow, observedHealthy);
+    };
+    try (RuntimeServer runtime = RuntimeServer.startM3WithLeaseTimeSource(configuration, activation, ignored -> time)) {
+      var channel = NettyChannelBuilder.forAddress("127.0.0.1", runtime.boundListeners().getFirst().port())
+          .usePlaintext().build();
+      try {
+        var client = LeaseGrpc.newBlockingStub(channel).withDeadlineAfter(120, TimeUnit.SECONDS);
+        long leaseId = 12345;
+        var request = Rpc.LeaseGrantRequest.newBuilder().setID(leaseId).setTTL(5).build();
+        assertEquals(leaseId, client.leaseGrant(request).getID());
+        now.set(20_000);
+        assertTrue(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
+            .anyMatch(lease -> lease.getID() == leaseId));
+        assertEquals(Status.Code.FAILED_PRECONDITION,
+            assertThrows(StatusRuntimeException.class, () -> client.leaseGrant(request)).getStatus().getCode());
+        long sequence = controlSnapshot(plan, initializer, identity).state().publishedSequence();
+        armed.set(true);
+        var ttlRequest = Rpc.LeaseTimeToLiveRequest.newBuilder().setID(leaseId).setKeys(true).build();
+        assertEquals(Status.Code.UNAVAILABLE,
+            assertThrows(StatusRuntimeException.class, () -> client.leaseTimeToLive(ttlRequest)).getStatus().getCode());
+        assertTrue(observations.get() >= 3);
+        assertEquals(sequence, controlSnapshot(plan, initializer, identity).state().publishedSequence());
+        armed.set(false);
+        healthy.set(true);
+        assertTrue(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
+            .anyMatch(lease -> lease.getID() == leaseId));
+        observations.set(0);
+        rewind.set(true);
+        armed.set(true);
+        assertEquals(Status.Code.UNAVAILABLE,
+            assertThrows(StatusRuntimeException.class, () -> client.leaseTimeToLive(ttlRequest)).getStatus().getCode());
+        assertTrue(observations.get() >= 3);
+        assertEquals(sequence, controlSnapshot(plan, initializer, identity).state().publishedSequence());
+        armed.set(false);
+        now.set(20_000);
+        assertEquals(-1, client.leaseTimeToLive(ttlRequest).getTTL());
+        assertFalse(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
+            .anyMatch(lease -> lease.getID() == leaseId));
+        assertEquals(leaseId, client.leaseGrant(request).getID());
+      } finally {
+        channel.shutdownNow();
+        assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+      }
+    }
+  }
+
+  private static M3RuntimeConfiguration minimumActivation() {
+    int maxRequest = 1_572_864;
+    return new M3RuntimeConfiguration("1", 6_000, 1_000, 60_000, 30_000,
+        M3MemoryReservations.minimumLeaseMemory(1, maxRequest), maxRequest,
+        2, 16, 60_000, false, true, 5, 1_000);
+  }
+
+  private static void runLayout(TemporaryHBaseClusterProcess cluster, int clientPort,
+      String layoutFile, String layout, RunContext run) throws Exception {
+    InitializationConfiguration initialization = initialization(layoutFile, clientPort);
+    var source = TableGroupPlanFactory.create(initialization, "local", null);
+    M3TableGroupPlan plan = M3TableGroupPlan.from(source);
+    var authScope = new io.etcdhbase.spi.identity.AuthenticationScope(
+        source.tableGroupId(), source.hbaseProfile().id());
+    try (var initializer = new HBaseBackendIdentityProvider(source.identityProviderId(), authScope,
+            cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+            (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+            1, 1, Duration.ofSeconds(30));
+         var credentials = new io.etcdhbase.spi.identity.BackendCredentials("m4-initializer", new char[0])) {
+      var identity = authenticate(initializer, credentials, authScope);
+      M3RuntimeConfiguration firstActivation = activation("1");
+      LayoutBaseline baseline = initializeM4Layout(
+          plan, source.fingerprint(), identity, initializer, firstActivation);
+      RuntimeConfiguration configuration = new RuntimeConfiguration(initialization.schemaVersion(),
+          List.of(new RuntimeConfiguration.Listener("m4-local", "127.0.0.1", 0, source.tableGroupId())),
+          initialization.hbaseProfiles(), initialization.saltProfiles(), initialization.tableGroups(), RESOURCES);
+      long explicitId = runFirstActivation(
+          plan, initializer, identity, configuration, firstActivation, baseline, layout, run);
+      verifyRestartedLeaseState(plan, initializer, identity, configuration, baseline.clusterId(),
+          explicitId, layout);
+      verifyClockReadiness(plan, initializer, identity, configuration, activation("3"));
+    }
+  }
+
+  private static io.etcdhbase.spi.identity.AuthorizedBackendIdentity authenticate(
+      HBaseBackendIdentityProvider initializer,
+      io.etcdhbase.spi.identity.BackendCredentials credentials,
+      io.etcdhbase.spi.identity.AuthenticationScope authScope) throws Exception {
+    return initializer.authenticate(credentials, authScope).toCompletableFuture()
+        .get(30, TimeUnit.SECONDS);
+  }
+
+  private static LayoutBaseline initializeM4Layout(M3TableGroupPlan plan, String fingerprint,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      HBaseBackendIdentityProvider initializer, M3RuntimeConfiguration activation) throws Exception {
+    var initialized = M3TableGroupInitializer.initializeFresh(
+        plan, "sha256:" + fingerprint, identity, initializer, activation.pinConfiguration());
+    ControlSnapshot preUpgrade = controlSnapshot(plan, initializer, identity);
+    assertEquals(CommitState.FORMAT_VERSION, preUpgrade.state().formatVersion());
+    long staleWriterNow = System.currentTimeMillis();
+    CommitState staleWriterClaim = preUpgrade.state().claimOwner("pre-m4-writer", staleWriterNow,
+        Math.addExact(staleWriterNow, 60_000));
+    return new LayoutBaseline(initialized.clusterId(), preUpgrade, staleWriterClaim);
+  }
+
+  private static long runFirstActivation(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider initializer,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      RuntimeConfiguration configuration, M3RuntimeConfiguration activation,
+      LayoutBaseline baseline, String layout, RunContext run) throws Exception {
+    RuntimeServer first = RuntimeServer.startM3(configuration, activation);
+    try {
+      assertTrue(first.dataReady());
+      assertOldWriterCannotPublish(plan, initializer, identity,
+          baseline.controlSnapshot(), baseline.staleWriterClaim());
+      runTargetDriver(run, layout, first.boundListeners().getFirst().port());
+      assertControlAndTableAreAuxiliary(plan, initializer, identity);
+    } finally {
+      first.close();
+    }
+    long explicitId = leaseIdForPrefix(run.prefix(), "explicit");
+    assertTrue(explicitId > 0);
+    return explicitId;
+  }
+
+  private static void verifyRestartedLeaseState(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider initializer,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      RuntimeConfiguration configuration, long clusterId, long explicitId, String layout)
+      throws Exception {
+    M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
+    if (layout.equals("HISTORY")) {
+      assertM4CannotBeDisabledAfterFormatUpgrade(configuration, activation("3", false));
+    }
+    try (RuntimeServer restarted = RuntimeServer.startM3(configuration, activation("2"))) {
+      assertTrue(restarted.dataReady());
+      Rpc.LeaseTimeToLiveResponse ttl = timeToLive(restarted, explicitId, true);
+      assertEquals(explicitId, ttl.getID());
+      assertTrue(ttl.getTTL() > 0);
+      assertEquals(30, ttl.getGrantedTTL());
+      assertEquals(0, ttl.getKeysCount());
+      assertEquals(clusterId, ttl.getHeader().getClusterId());
+      assertEquals(1, ttl.getHeader().getRevision());
+      Rpc.LeaseLeasesResponse leases = leases(restarted);
+      assertTrue(leases.getLeasesList().stream().anyMatch(value -> value.getID() == explicitId));
+      assertEquals(clusterId, leases.getHeader().getClusterId());
+      assertEquals(1, leases.getHeader().getRevision());
+      assertEquals(2, leases.getHeader().getMemberId());
+    }
+  }
+
+  private static void verifyClockReadiness(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider initializer,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      RuntimeConfiguration configuration, M3RuntimeConfiguration activation) throws Exception {
+    M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
+    var clockHealthy = new AtomicBoolean(true);
+    LeaseTimeSource timeSource = () -> clockHealthy.get()
+        ? new LeaseTimeObservation(10_000, 12_000, true)
+        : new LeaseTimeObservation(0, 0, false);
+    LongFunction<LeaseTimeSource> factory = ignored -> timeSource;
+
+    try (RuntimeServer runtime = RuntimeServer.startM3WithLeaseTimeSource(
+        configuration, activation, factory)) {
+      assertTrue(runtime.dataReady());
+      clockHealthy.set(false);
+      assertFalse(runtime.dataReady());
+    }
+  }
+
+  private record LayoutBaseline(long clusterId, ControlSnapshot controlSnapshot,
+      CommitState staleWriterClaim) {}
+
+  private static ControlSnapshot controlSnapshot(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider provider,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity) throws Exception {
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+      return HBaseCommitControlStore.open(provider, identity, plan.system(), scope).join()
+          .read(scope).join().orElseThrow();
+    }
+  }
+
+  private static void assertOldWriterCannotPublish(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider provider,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      ControlSnapshot preUpgrade, CommitState staleWriterClaim) throws Exception {
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+      var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope).join();
+      assertFalse(control.compareAndSet(preUpgrade, staleWriterClaim, scope).join());
+      assertEquals(CommitState.AUXILIARY_FORMAT_VERSION,
+          control.read(scope).join().orElseThrow().state().formatVersion());
+    }
+  }
+
+  private static void assertM4CannotBeDisabledAfterFormatUpgrade(
+      RuntimeConfiguration configuration, M3RuntimeConfiguration disabledActivation) {
+    IOException failure = assertThrows(IOException.class,
+        () -> RuntimeServer.startM3(configuration, disabledActivation));
+    assertTrue(causeChainContains(failure,
+        "M4 Lease activation must remain enabled for a table group with auxiliary state"));
+  }
+
+  private static boolean causeChainContains(Throwable failure, String expected) {
+    for (Throwable current = failure; current != null; current = current.getCause()) {
+      if (current.getMessage() != null && current.getMessage().contains(expected)) return true;
+    }
+    return false;
+  }
+
+  private static void assertControlAndTableAreAuxiliary(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider provider,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity) throws Exception {
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+      var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope).join();
+      var state = control.read(scope).join().orElseThrow().state();
+      assertEquals(io.etcdhbase.core.commit.CommitState.AUXILIARY_FORMAT_VERSION, state.formatVersion());
+      assertTrue(state.publishedSequence() > 0);
+      assertEquals(1, state.publishedRevision());
+      var connection = provider.connectionFor(identity).toCompletableFuture().join();
+      var descriptor = connection.getAdmin().getDescriptor(plan.system().table()).join();
+      assertTrue(plan.system().supportsAuxiliary(descriptor));
+    }
+  }
+
+  private static Rpc.LeaseTimeToLiveResponse timeToLive(RuntimeServer server, long id,
+      boolean includeKeys) throws Exception {
+    var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListeners().getFirst().port())
+        .usePlaintext().build();
+    try {
+      return LeaseGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS)
+          .leaseTimeToLive(Rpc.LeaseTimeToLiveRequest.newBuilder().setID(id).setKeys(includeKeys).build());
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+    }
+  }
+
+  private static Rpc.LeaseLeasesResponse leases(RuntimeServer server) throws Exception {
+    var channel = NettyChannelBuilder.forAddress("127.0.0.1", server.boundListeners().getFirst().port())
+        .usePlaintext().build();
+    try {
+      return LeaseGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS)
+          .leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance());
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+    }
+  }
+
+  private static InitializationConfiguration initialization(String file, int clientPort) throws Exception {
+    ObjectMapper mapper = new ObjectMapper();
+    Path path = WireProcesses.repositoryRoot().resolve("config/examples/j05").resolve(file);
+    ObjectNode tree = (ObjectNode) mapper.readTree(Files.readAllBytes(path));
+    ObjectNode profile = (ObjectNode) tree.withArray("hbase_profiles").get(0);
+    profile.put("namespace", "m4_" + UUID.randomUUID().toString().replace("-", ""))
+        .put("quorum", "127.0.0.1").put("client_port", clientPort);
+    ObjectNode system = (ObjectNode) tree.withArray("table_groups").get(0).get("system_table");
+    boolean hasResultCategory = false;
+    for (var category : system.withArray("record_categories")) {
+      if (category.asText().equals("RESULT")) {
+        hasResultCategory = true;
+        break;
+      }
+    }
+    if (!hasResultCategory) {
+      system.withArray("record_categories").add("RESULT");
+    }
+    return new InitializationConfigurationLoader()
+        .load(new ByteArrayInputStream(mapper.writeValueAsBytes(tree)));
+  }
+
+  private static M3RuntimeConfiguration activation(String memberId) throws Exception {
+    return activation(memberId, true);
+  }
+
+  private static M3RuntimeConfiguration activation(String memberId, boolean enableLeaseApi)
+      throws Exception {
+    ObjectMapper mapper = new ObjectMapper();
+    Path path = WireProcesses.repositoryRoot().resolve("config/examples/m4/activation.json");
+    ObjectNode tree = (ObjectNode) mapper.readTree(Files.readAllBytes(path));
+    tree.put("member_id", memberId).put("owner_lease_ms", 1_500).put("heartbeat_ms", 200)
+        .put("m4_lease_api_enabled", enableLeaseApi);
+    return new M3RuntimeConfigurationLoader()
+        .load(new ByteArrayInputStream(mapper.writeValueAsBytes(tree)));
+  }
+
+  private static long leaseIdForPrefix(String prefix, String purpose) throws Exception {
+    byte[] digest = MessageDigest.getInstance("SHA-256")
+        .digest((prefix + ":" + purpose).getBytes(StandardCharsets.UTF_8));
+    long id = ByteBuffer.wrap(digest).getLong() & Long.MAX_VALUE;
+    return id == 0 ? 1 : id;
+  }
+
+  private static RunContext prepareRun() throws IOException {
+    Path root = WireProcesses.repositoryRoot();
+    String runId = System.getenv().getOrDefault("M4_RUN_ID", "rpc-" + UUID.randomUUID());
+    if (!runId.matches("[A-Za-z0-9][A-Za-z0-9._-]{0,63}")) {
+      throw new IllegalArgumentException("invalid M4 fixture run ID");
+    }
+    String configuredRoot = System.getenv("M4_ARTIFACT_ROOT");
+    Path artifacts = configuredRoot == null
+        ? root.resolve(".artifacts/m4").resolve(runId) : Path.of(configuredRoot).toAbsolutePath();
+    if (!artifacts.normalize().startsWith(root.resolve(".artifacts/m4").toAbsolutePath().normalize())
+        || !artifacts.getFileName().toString().equals(runId)) {
+      throw new IllegalArgumentException("M4 fixture output must be under its run directory");
+    }
+    Files.createDirectories(artifacts);
+    return new RunContext(root, artifacts, runId,
+        "etcd-hbase-m4-test/" + runId + "/", artifacts.resolve("native-trace.jsonl"));
+  }
+
+  private static void prepareNativeEvidence(RunContext run) throws Exception {
+    if (!Files.exists(run.nativeTrace())) {
+      runDriver(run, run.artifacts().resolve("native.log"), "run",
+          "--native-data-dir", run.artifacts().resolve("native-data").toString(),
+          "--scope", "native-etcd", "--prefix", run.prefix(),
+          "--trace", run.nativeTrace().toString(),
+          "--metadata", run.artifacts().resolve("native-metadata.json").toString());
+    }
+  }
+
+  private static void runTargetDriver(RunContext run, String layout, int port) throws Exception {
+    String suffix = layout.toLowerCase(java.util.Locale.ROOT);
+    runDriver(run, run.artifacts().resolve("target-" + suffix + ".log"), "run",
+        "--endpoint", "127.0.0.1:" + port, "--scope", "target-hbase", "--layout", layout,
+        "--prefix", run.prefix(), "--trace", run.artifacts().resolve("target-" + suffix + "-trace.jsonl").toString(),
+        "--metadata", run.artifacts().resolve("target-" + suffix + "-metadata.json").toString());
+  }
+
+  private static void compare(RunContext run, String layout) throws Exception {
+    String suffix = layout.toLowerCase(java.util.Locale.ROOT);
+    runDriver(run, run.artifacts().resolve("compare-" + suffix + ".log"), "compare",
+        "--left", run.nativeTrace().toString(),
+        "--right", run.artifacts().resolve("target-" + suffix + "-trace.jsonl").toString());
+  }
+
+  private static void runDriver(RunContext run, Path log, String... arguments) throws Exception {
+    var command = new java.util.ArrayList<String>();
+    command.add(run.root().resolve("scripts/dev/go-program.sh").toString());
+    command.add("m4driver");
+    if (arguments.length > 0 && arguments[0].equals("run")) {
+      command.addAll(List.of("run", "--scenario",
+          run.root().resolve("testkit/scenarios/m4-lease.yaml").toString()));
+      command.addAll(List.of(arguments).subList(1, arguments.length));
+    } else {
+      command.addAll(List.of(arguments));
+    }
+    ProcessBuilder builder = new ProcessBuilder(command).directory(run.root().toFile())
+        .redirectErrorStream(true).redirectOutput(log.toFile());
+    builder.environment().put("M4_RUN_ID", run.runId());
+    String source = System.getenv("M4_SOURCE_COMMIT");
+    if (source != null) builder.environment().put("M4_SOURCE_COMMIT", source);
+    Process process = builder.start();
+    try {
+      if (!process.waitFor(180, TimeUnit.SECONDS)) {
+        throw new IllegalStateException("M4 driver timed out; inspect the local run log");
+      }
+      int exitCode = process.exitValue();
+      if (exitCode != 0) {
+        assertEquals(0, exitCode, "M4 Go driver failed; last log bytes:\n" + tail(log));
+      }
+    } finally {
+      if (process.isAlive()) {
+        process.destroyForcibly();
+        assertTrue(process.waitFor(10, TimeUnit.SECONDS));
+      }
+    }
+  }
+
+  private static String tail(Path log) {
+    try {
+      long size = Files.size(log);
+      long offset = Math.max(0, size - MAX_DRIVER_DIAGNOSTIC_BYTES);
+      try (var input = Files.newInputStream(log)) {
+        input.skipNBytes(offset);
+        byte[] bytes = input.readNBytes(MAX_DRIVER_DIAGNOSTIC_BYTES);
+        return (offset == 0 ? "" : "[earlier log output omitted]\n")
+            + new String(bytes, StandardCharsets.UTF_8);
+      }
+    } catch (IOException failure) {
+      return "driver log unavailable (" + failure.getClass().getSimpleName() + ")";
+    }
+  }
+
+  private record RunContext(Path root, Path artifacts, String runId, String prefix, Path nativeTrace) {}
+}

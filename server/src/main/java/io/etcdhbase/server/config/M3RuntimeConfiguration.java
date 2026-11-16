@@ -4,7 +4,17 @@ import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.SnapshotPinConfiguration;
 import java.time.Duration;
 
-/** Explicit activation settings; member identity and budgets are never invented at startup. */
+/**
+ * Explicit activation settings; member identity and budgets are never invented at startup.
+ *
+ * <p>When M4 Lease support is enabled, the configured clock uncertainty is an operator-provided
+ * absolute UTC error bound for the runtime lifetime. The runtime detects wall-clock discontinuity
+ * against its local monotonic clock, but deployment must establish the initial synchronization
+ * bound before startup and after restart.
+ *
+ * @param leaseClockUncertaintyMs absolute wall-clock uncertainty in milliseconds; zero disables
+ *     M4 Lease activation
+ */
 public record M3RuntimeConfiguration(
     String memberId,
     int ownerLeaseMs,
@@ -16,7 +26,10 @@ public record M3RuntimeConfiguration(
     int pinShards,
     int pinSlotsPerShard,
     int pinLeaseMs,
-    boolean readCacheEnabled) {
+    boolean readCacheEnabled,
+    boolean m4LeaseApiEnabled,
+    long leaseMinTtlSeconds,
+    long leaseClockUncertaintyMs) {
   private static final long MIN_MEMORY = 256L << 20;
   private static final long MAX_MEMORY = 1L << 40;
 
@@ -32,7 +45,16 @@ public record M3RuntimeConfiguration(
       int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,
       int pinShards, int pinSlotsPerShard, int pinLeaseMs) {
     this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
-        maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, false);
+        maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, false, false, 1, 1_000);
+  }
+
+  /** Preserve callers that explicitly set the disabled-cache state. */
+  public M3RuntimeConfiguration(String memberId, int ownerLeaseMs, int heartbeatMs,
+      int startupTimeoutMs, int shutdownTimeoutMs, long memoryBytes, int maxEtcdRequestBytes,
+      int pinShards, int pinSlotsPerShard, int pinLeaseMs, boolean readCacheEnabled) {
+    this(memberId, ownerLeaseMs, heartbeatMs, startupTimeoutMs, shutdownTimeoutMs, memoryBytes,
+        maxEtcdRequestBytes, pinShards, pinSlotsPerShard, pinLeaseMs, readCacheEnabled,
+        false, 1, 1_000);
   }
 
   public M3RuntimeConfiguration {
@@ -51,8 +73,16 @@ public record M3RuntimeConfiguration(
         || heartbeatMs > ownerLeaseMs / 3 || startupTimeoutMs < 100 || startupTimeoutMs > 600_000
         || shutdownTimeoutMs < 1_000 || shutdownTimeoutMs > 600_000
         || memoryBytes < MIN_MEMORY || memoryBytes > MAX_MEMORY
-        || maxEtcdRequestBytes < 1 || maxEtcdRequestBytes > MutationForwardRequest.MAX_OPERATION_BYTES) {
+        || maxEtcdRequestBytes < 1 || maxEtcdRequestBytes > MutationForwardRequest.MAX_OPERATION_BYTES
+        || leaseMinTtlSeconds < 1 || leaseMinTtlSeconds > 9_000_000_000L
+        || leaseClockUncertaintyMs < 0 || leaseClockUncertaintyMs > 60_000
+        || m4LeaseApiEnabled && leaseClockUncertaintyMs == 0) {
       throw new IllegalArgumentException("invalid M3 runtime limits");
+    }
+    long minimumLeaseMemory = M3MemoryReservations.minimumLeaseMemory(1, maxEtcdRequestBytes);
+    if (m4LeaseApiEnabled && memoryBytes < minimumLeaseMemory) {
+      throw new IllegalArgumentException("M4 memory_bytes must be at least " + minimumLeaseMemory
+          + " for one group recovery account and one Lease request/owner pair");
     }
     new SnapshotPinConfiguration(pinShards, pinSlotsPerShard, Duration.ofMillis(pinLeaseMs));
   }

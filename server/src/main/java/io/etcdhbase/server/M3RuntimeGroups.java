@@ -7,10 +7,12 @@ import io.etcdhbase.admin.TableGroupInitializationPlan;
 import io.etcdhbase.admin.TableGroupPlanFactory;
 import io.etcdhbase.admin.config.DevelopmentHBaseConfiguration;
 import io.etcdhbase.admin.config.InitializationConfiguration.AuthenticationMode;
+import io.etcdhbase.core.lease.LeaseTimeSource;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.core.scan.ScanScheduler;
 import io.etcdhbase.grpc.service.KvService;
+import io.etcdhbase.grpc.service.LeaseService;
 import io.etcdhbase.hbase.identity.HBaseAuthenticators;
 import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
 import io.etcdhbase.server.commit.M3TableGroupRuntime;
@@ -27,11 +29,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongFunction;
 import org.apache.hadoop.security.UserGroupInformation;
 
 /** Owns activated local-development group runtimes and their verified HBase connections. */
@@ -49,6 +53,19 @@ final class M3RuntimeGroups implements AutoCloseable {
 
   static M3RuntimeGroups open(RuntimeConfiguration configuration, M3RuntimeConfiguration activation)
       throws IOException {
+    return openInternal(configuration, activation, Optional.empty());
+  }
+
+  static M3RuntimeGroups openWithLeaseTimeSource(RuntimeConfiguration configuration,
+      M3RuntimeConfiguration activation, LongFunction<LeaseTimeSource> leaseTimeSourceFactory)
+      throws IOException {
+    return openInternal(configuration, activation,
+        Optional.of(Objects.requireNonNull(leaseTimeSourceFactory, "leaseTimeSourceFactory")));
+  }
+
+  private static M3RuntimeGroups openInternal(RuntimeConfiguration configuration,
+      M3RuntimeConfiguration activation,
+      Optional<LongFunction<LeaseTimeSource>> leaseTimeSourceFactory) throws IOException {
     var budgets = M3RuntimeBudgets.create(configuration, activation);
     var scans = new ScanScheduler(budgets, Duration.ofMillis(configuration.resources().requestDeadlineMs()));
     Map<String, ManagedGroup> opened = new LinkedHashMap<>();
@@ -61,7 +78,8 @@ final class M3RuntimeGroups implements AutoCloseable {
             || !source.identityProviderId().equals(DEVELOPMENT_NO_AUTH_PROVIDER_ID)) {
           throw new IllegalArgumentException("configured target identity activation is not available");
         }
-        ManagedGroup managed = openGroup(plan, configuration, activation, budgets, scans);
+        ManagedGroup managed = openGroup(plan, configuration, activation, budgets, scans,
+            leaseTimeSourceFactory);
         try {
           opened.put(group, managed);
         } catch (RuntimeException | Error failure) {
@@ -86,7 +104,8 @@ final class M3RuntimeGroups implements AutoCloseable {
   }
 
   private static ManagedGroup openGroup(M3TableGroupPlan plan, RuntimeConfiguration configuration,
-      M3RuntimeConfiguration activation, BudgetManager budgets, ScanScheduler scans) throws Exception {
+      M3RuntimeConfiguration activation, BudgetManager budgets, ScanScheduler scans,
+      Optional<LongFunction<LeaseTimeSource>> leaseTimeSourceFactory) throws Exception {
     var source = plan.source();
     var provider = createProvider(source, activation);
     boolean providerCloseDeferred = false;
@@ -94,7 +113,8 @@ final class M3RuntimeGroups implements AutoCloseable {
       M3TableGroupRuntime runtime;
       try (var startup = RequestScope.withTimeout(Duration.ofMillis(activation.startupTimeoutMs()))) {
         AuthorizedBackendIdentity identity = authenticate(provider, source, activation);
-        runtime = startRuntime(plan, configuration, activation, budgets, scans, provider, identity, startup);
+        runtime = startRuntime(plan, configuration, activation, budgets, scans, provider, identity,
+            startup, leaseTimeSourceFactory);
       } catch (M3TableGroupRuntime.StartupException failure) {
         providerCloseDeferred = true;
         awaitCleanup(closeAfter(failure.cleanup(), provider), activation.shutdownTimeoutMs(), failure);
@@ -140,7 +160,12 @@ final class M3RuntimeGroups implements AutoCloseable {
   private static M3TableGroupRuntime startRuntime(M3TableGroupPlan plan,
       RuntimeConfiguration configuration, M3RuntimeConfiguration activation,
       BudgetManager budgets, ScanScheduler scans, HBaseBackendIdentityProvider provider,
-      AuthorizedBackendIdentity identity, RequestScope startup) throws Exception {
+      AuthorizedBackendIdentity identity, RequestScope startup,
+      Optional<LongFunction<LeaseTimeSource>> leaseTimeSourceFactory) throws Exception {
+    if (leaseTimeSourceFactory.isPresent()) {
+      return M3TableGroupRuntime.openWithLeaseTimeSource(plan, activation, configuration.resources(),
+          provider, identity, budgets, scans, startup, leaseTimeSourceFactory.orElseThrow());
+    }
     return M3TableGroupRuntime.open(plan, activation, configuration.resources(),
         provider, identity, budgets, scans, startup);
   }
@@ -172,6 +197,12 @@ final class M3RuntimeGroups implements AutoCloseable {
     ManagedGroup managed = groups.get(group);
     if (managed == null || closing.get()) throw new IllegalArgumentException("table group is not active");
     return managed.runtime().kvService();
+  }
+
+  LeaseService leaseService(String group) {
+    ManagedGroup managed = groups.get(group);
+    if (managed == null || closing.get()) throw new IllegalArgumentException("table group is not active");
+    return managed.runtime().leaseService();
   }
 
   RequestMetrics metrics(String group) {
