@@ -76,6 +76,29 @@ class LeaseGrantPreparationTest {
     }
   }
 
+  @Test
+  void persistsNoChangeResponseWithoutCreatingAnEmptyAuxiliaryManifest() throws Exception {
+    try (Fixture fixture = new Fixture()) {
+      ByteKey response = ByteKey.copyOf(new byte[] {4, 2, 1});
+      AtomicBoolean readFinished = new AtomicBoolean();
+
+      InvocationBinding completed = fixture.auxiliaryMutationPreparation.completeWithoutChanges(
+          fixture.invocation, response, () -> {
+            readFinished.set(true);
+            return CompletableFuture.completedFuture(null);
+          }, fixture.scope, fixture.account).join();
+
+      assertTrue(readFinished.get());
+      assertEquals(InvocationBinding.State.NO_CHANGES, completed.state());
+      assertEquals(completed, fixture.current.get());
+      assertEquals(response, ByteKey.copyOf(fixture.results.page.payload()));
+      assertTrue(fixture.records.isEmpty());
+      assertTrue(fixture.pages.isEmpty());
+      assertTrue(fixture.directories.isEmpty());
+      assertEquals(0, fixture.seals);
+    }
+  }
+
   private static final class Fixture implements AutoCloseable {
     private final RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(10));
     private final InvocationBinding invocation = InvocationBinding.begin(InvocationId.create(),
@@ -88,6 +111,7 @@ class LeaseGrantPreparationTest {
     private final Results results = new Results();
     private final BudgetManager budgets;
     private final BudgetManager.Account account;
+    private final LeaseAuxiliaryMutationPreparation auxiliaryMutationPreparation;
     private final LeaseGrantPreparation preparation;
     private volatile int seals;
 
@@ -128,9 +152,14 @@ class LeaseGrantPreparationTest {
           return CompletableFuture.completedFuture(current.compareAndSet(expected, replacement));
         }
       };
-      preparation = new LeaseGrantPreparation(new ResultPreparation(results), new ResultCatalog(results),
-          new ManifestPreparation(manifestRepository, new ManifestPreparation.Limits(0, 0, 0, 0)),
-          new InvocationService(invocationRepository));
+      var resultPreparation = new ResultPreparation(results);
+      var resultCatalog = new ResultCatalog(results);
+      var manifestPreparation = new ManifestPreparation(manifestRepository,
+          new ManifestPreparation.Limits(0, 0, 0, 0));
+      var invocationService = new InvocationService(invocationRepository);
+      auxiliaryMutationPreparation = new LeaseAuxiliaryMutationPreparation(resultPreparation,
+          resultCatalog, manifestPreparation, invocationService);
+      preparation = new LeaseGrantPreparation(auxiliaryMutationPreparation);
     }
 
     private static CompletableFuture<SystemRecordStore.CreateResult> created() {

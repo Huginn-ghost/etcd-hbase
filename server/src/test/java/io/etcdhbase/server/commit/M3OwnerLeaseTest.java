@@ -17,28 +17,39 @@ import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
 import io.etcdhbase.core.commit.InvocationBinding;
 import io.etcdhbase.core.commit.InvocationId;
+import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.commit.InvocationRepository;
 import io.etcdhbase.core.commit.RecoveryManager;
 import io.etcdhbase.core.commit.SystemRecordStore;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.server.TestTlsCertificate;
+import io.etcdhbase.server.config.M3RuntimeConfiguration;
+import java.net.ServerSocket;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class M3OwnerLeaseTest {
   private static final ByteKey PROFILE = ByteKey.copyOf(new byte[32]);
+  @TempDir Path forwardingDirectory;
 
   @Test
   void recoversBeforeReadyRenewsAndFencesTheLaneOnHeartbeatFailure() throws Exception {
@@ -118,7 +129,8 @@ class M3OwnerLeaseTest {
         assertFalse(lease.drained().isDone(), "the transition still owns its completion path");
         pending.complete(new CommitOwnerService.OwnerToken(previous.instance(), previous.epoch() + 1));
         assertThrows(CompletionException.class, transition::join);
-        assertEquals(previous, lease.token(), "a late transition cannot publish after stop");
+        assertTrue(lease.currentToken().isEmpty(), "a stopped owner must not expose a stale token");
+        assertThrows(IllegalStateException.class, lease::token);
         lease.drained().get(5, TimeUnit.SECONDS);
       } finally {
         pending.complete(previous);
@@ -142,7 +154,8 @@ class M3OwnerLeaseTest {
         var transition = lease.transitionFence(owners, current -> CompletableFuture.completedFuture(
             new CommitOwnerService.OwnerToken("another-owner", current.epoch())), startup);
         assertThrows(CompletionException.class, transition::join);
-        assertEquals(previous, lease.token());
+        assertTrue(lease.currentToken().isEmpty(), "a rejected transition must fence the old token");
+        assertThrows(IllegalStateException.class, lease::token);
         assertEquals(1, lost.get());
         assertFalse(lease.isReady());
         lease.drained().get(5, TimeUnit.SECONDS);
@@ -252,7 +265,227 @@ class M3OwnerLeaseTest {
     }
   }
 
-  private static RecoveryManager recovery(MemoryControl store, CommitOwnerService owners) {
+  @Test
+  void forwardingResolvesFreshAndLegacyOwnerIdentities() throws Exception {
+    try (var certificate = TestTlsCertificate.create(forwardingDirectory, "owner-a")) {
+      int port;
+      try (var socket = new ServerSocket(0)) { port = socket.getLocalPort(); }
+      var peer = new M3RuntimeConfiguration.OwnerPeer(
+          "owner-a", "127.0.0.1", port, "owner-a");
+      var settings = new M3RuntimeConfiguration.OwnerForwardingSettings(
+          "127.0.0.1", port, certificate.certificate().toString(), certificate.privateKey().toString(),
+          certificate.certificate().toString(), List.of(peer));
+      try (var forwarding = new OwnerForwardingRuntime("owner-a", settings,
+          new OwnerForwardingRuntime.RequestLimits(65536, 1, 262144), 1000, 1000)) {
+        forwarding.register("group", (identity, request, scope) ->
+            CompletableFuture.completedFuture(new OwnerForwarding.Unknown(
+                BackendFailure.Category.UNAVAILABLE)));
+        forwarding.start();
+        String incarnation = OwnerIncarnation.newId("owner-a");
+        var route = forwarding.resolve("group", incarnation, 7).join();
+        assertEquals(incarnation, route.ownerInstance());
+        assertEquals("owner-a", route.endpointId());
+        assertEquals("owner-a", route.peerIdentity());
+        assertEquals("owner-a", forwarding.resolve("group", "owner-a", 7).join().endpointId());
+        assertThrows(CompletionException.class,
+            () -> forwarding.resolve("group", OwnerIncarnation.newId("unknown"), 7).join());
+        assertThrows(CompletionException.class,
+            () -> forwarding.resolve("group", OwnerIncarnation.routeKey("owner-a") + ":bad", 7).join());
+      }
+    }
+  }
+
+  @Test
+  void samePeerRestartUsesFreshIncarnationAndFencesOldToken() throws Exception {
+    var clock = new MutableClock(1_000);
+    var store = new MemoryControl();
+    var owners = new CommitOwnerService(store);
+    String originalId = OwnerIncarnation.newId("owner-a");
+    String replacementId = OwnerIncarnation.newId("owner-a");
+    assertFalse(originalId.equals(replacementId));
+    assertEquals(OwnerIncarnation.routeKey("owner-a"),
+        OwnerIncarnation.routeKeyFromInstance(originalId));
+    assertEquals(OwnerIncarnation.routeKey("owner-a"),
+        OwnerIncarnation.routeKeyFromInstance(replacementId));
+    assertTrue(originalId.getBytes(StandardCharsets.UTF_8).length
+        <= CommitState.MAX_OWNER_INSTANCE_BYTES);
+    assertFalse(OwnerIncarnation.routeKey("owner-a").equals(OwnerIncarnation.routeKey("owner-b")));
+    try (var startup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var active = M3OwnerLease.acquireOrStandby(recovery(store, owners), owners, originalId,
+          Duration.ofMillis(1200), Duration.ofMillis(50), Duration.ofMillis(400), startup, () -> {}, clock).join();
+      var overlap = M3OwnerLease.acquireOrStandby(recovery(store, owners), owners, replacementId,
+          Duration.ofMillis(1200), Duration.ofMillis(50), Duration.ofMillis(400), startup, () -> {}, clock).join();
+      M3OwnerLease restart = null;
+      try {
+        var oldToken = active.token();
+        assertTrue(active.isOwner());
+        assertFalse(overlap.isOwner(), "overlapping processes sharing a route must not share a token");
+        overlap.close();
+        overlap.drained().get(5, TimeUnit.SECONDS);
+        active.close();
+        active.drained().get(5, TimeUnit.SECONDS);
+        String restartId = OwnerIncarnation.newId("owner-a");
+        restart = M3OwnerLease.acquireOrStandby(recovery(store, owners), owners, restartId,
+            Duration.ofMillis(1200), Duration.ofMillis(50), Duration.ofMillis(400), startup, () -> {}, clock).join();
+        assertFalse(restart.isOwner(), "restart must wait for the prior durable lease to expire");
+        store.expectedOwnerClaim = restartId;
+        clock.advance(1201);
+        assertTrue(store.expectedOwnerClaimed.await(5, TimeUnit.SECONDS));
+        assertTrue(awaitOwner(restart, Duration.ofSeconds(5)));
+        assertTrue(restart.token().epoch() > oldToken.epoch());
+        assertFalse(owners.heartbeat(oldToken, clock.millis() + 1200, startup).join(),
+            "a late heartbeat with the old token must not renew the replacement's lease");
+      } finally {
+        active.close();
+        overlap.close();
+        if (restart != null) {
+          restart.close();
+          restart.drained().get(5, TimeUnit.SECONDS);
+        }
+      }
+    }
+  }
+
+  @Test
+  void standbyStartsReadyAndClaimsOwnerAfterActiveOwnerExpires() throws Exception {
+    var clock = new MutableClock(1_000);
+    var store = new MemoryControl();
+    var owners = new CommitOwnerService(store);
+    var activeLost = new CountDownLatch(1);
+    try (var activeStartup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         var standbyStartup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var active = M3OwnerLease.acquire(recovery(store, owners), owners, "owner-a",
+          Duration.ofMillis(1200), Duration.ofMillis(50), Duration.ofMillis(400),
+          activeStartup, activeLost::countDown, clock).join();
+      var standby = M3OwnerLease.acquireOrStandby(recovery(store, owners), owners, "owner-b",
+          Duration.ofMillis(1200), Duration.ofMillis(50), Duration.ofMillis(400),
+          standbyStartup, () -> {}, clock).join();
+      try {
+        long activeEpoch = active.token().epoch();
+        assertTrue(standby.isReady(), "a recovered follower can serve its ready read path");
+        assertFalse(standby.isOwner());
+        store.expectedOwnerClaim = "owner-b";
+
+        clock.advance(1200);
+
+        assertTrue(activeLost.await(5, TimeUnit.SECONDS), "the expired owner must fence its lane");
+        assertTrue(store.expectedOwnerClaimed.await(5, TimeUnit.SECONDS),
+            "the standby must claim only after the durable owner deadline expires");
+        assertTrue(awaitOwner(standby, Duration.ofSeconds(5)),
+            "the standby publishes its local owner token after verifying the durable claim");
+        assertTrue(standby.isReady());
+        assertTrue(standby.isOwner());
+        assertTrue(standby.token().epoch() > activeEpoch);
+        assertEquals("owner-b", store.currentState().ownerInstance().orElseThrow());
+        active.drained().get(5, TimeUnit.SECONDS);
+      } finally {
+        active.close();
+        standby.close();
+        active.drained().get(5, TimeUnit.SECONDS);
+        standby.drained().get(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  @Test
+  void standbyClaimTimeoutDoesNotRetryUntilPhysicalRecoveryReadDrains() throws Exception {
+    var clock = new MutableClock(1_000);
+    var store = new MemoryControl();
+    var owners = new CommitOwnerService(store);
+    var controlledReads = new ControllableControlRead(store);
+    var blockedRead = new PendingControlRead();
+    var activeLost = new CountDownLatch(1);
+    try (var activeStartup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         var standbyStartup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var active = M3OwnerLease.acquire(recovery(store, owners), owners, "owner-a",
+          Duration.ofMillis(1200), Duration.ofMillis(50), Duration.ofMillis(400),
+          activeStartup, activeLost::countDown, clock).join();
+      var standby = M3OwnerLease.acquireOrStandby(recovery(controlledReads, owners), owners, "owner-b",
+          Duration.ofMillis(1200), Duration.ofMillis(50), Duration.ofMillis(400),
+          standbyStartup, () -> {}, clock).join();
+      try {
+        store.expectedOwnerClaim = "owner-b";
+        controlledReads.blockNextRead(blockedRead);
+        clock.advance(1200);
+
+        assertTrue(activeLost.await(5, TimeUnit.SECONDS), "the active owner must fence after expiry");
+        assertTrue(blockedRead.started.await(5, TimeUnit.SECONDS), "standby recovery must reach the blocked read");
+        assertTrue(blockedRead.cancellationRequested.await(5, TimeUnit.SECONDS),
+            "the claim timeout must cancel the standby recovery scope");
+        assertFalse(blockedRead.result.isDone(), "the controlled logical result must remain pending");
+        assertFalse(awaitOwner(standby, Duration.ofMillis(600)),
+            "a later claim must wait while the old HBase read is still physically in flight");
+        assertFalse(blockedRead.result.isDone(), "the physical producer remains owned by its backend");
+        blockedRead.result.completeExceptionally(new CancellationException("simulated backend drain"));
+        assertFalse(awaitOwner(standby, Duration.ofMillis(600)),
+            "a canceled logical read must not release the claim slot before physical drain");
+        blockedRead.physicalDrain.complete(null);
+        assertTrue(awaitOwner(standby, Duration.ofSeconds(5)),
+            "physical drain must release the owner-claim slot for a later attempt");
+        assertTrue(standby.isOwner());
+        assertEquals("owner-b", store.currentState().ownerInstance().orElseThrow());
+      } finally {
+        blockedRead.result.completeExceptionally(new CancellationException("release the late test result"));
+        blockedRead.physicalDrain.complete(null);
+        active.close();
+        standby.close();
+        active.drained().get(5, TimeUnit.SECONDS);
+        standby.drained().get(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  @Test
+  void standbyClaimTimeoutCancelsStalledRecoveryAndAllowsRetry() throws Exception {
+    var clock = new MutableClock(1_000);
+    var store = new MemoryControl();
+    var owners = new CommitOwnerService(store);
+    try (var activeStartup = RequestScope.withTimeout(Duration.ofSeconds(5));
+         var standbyStartup = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      var active = M3OwnerLease.acquire(recovery(store, owners), owners, "owner-a",
+          Duration.ofMillis(1800), Duration.ofMillis(500), Duration.ofMillis(300),
+          activeStartup, () -> {}, clock).join();
+      var standby = M3OwnerLease.acquireOrStandby(recovery(store, owners), owners, "owner-b",
+          Duration.ofMillis(1800), Duration.ofMillis(500), Duration.ofMillis(300),
+          standbyStartup, () -> {}, clock).join();
+      try {
+        long activeEpoch = active.token().epoch();
+        assertTrue(standby.isReady());
+        assertFalse(standby.isOwner());
+        active.close();
+        active.drained().get(5, TimeUnit.SECONDS);
+        store.expectedOwnerClaim = "owner-b";
+        store.stallNextRead.set(true);
+        clock.advance(1801);
+
+        assertTrue(store.stalledReadStarted.await(5, TimeUnit.SECONDS),
+            "standby recovery must begin against the expired durable owner");
+        assertTrue(store.stalledReadCancelled.await(5, TimeUnit.SECONDS),
+            "the claim timeout must cancel its stalled recovery scope");
+        assertTrue(store.expectedOwnerClaimed.await(5, TimeUnit.SECONDS),
+            "a later heartbeat must retry and claim after the timed-out attempt drains");
+        assertTrue(awaitOwner(standby, Duration.ofSeconds(5)));
+        assertTrue(standby.token().epoch() > activeEpoch);
+      } finally {
+        active.close();
+        standby.close();
+        active.drained().get(5, TimeUnit.SECONDS);
+        standby.drained().get(5, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  private static boolean awaitOwner(M3OwnerLease lease, Duration timeout) throws InterruptedException {
+    long deadline = System.nanoTime() + timeout.toNanos();
+    while (!lease.isOwner()) {
+      long remaining = deadline - System.nanoTime();
+      if (remaining <= 0) return false;
+      TimeUnit.NANOSECONDS.sleep(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(1)));
+    }
+    return true;
+  }
+
+  private static RecoveryManager recovery(CommitControlStore store, CommitOwnerService owners) {
     InvocationRepository invocations = new InvocationRepository() {
       @Override public CompletableFuture<Optional<InvocationBinding>> read(InvocationId id, RequestScope scope) {
         throw new AssertionError("no publication should require an invocation lookup");
@@ -276,11 +509,57 @@ class M3OwnerLeaseTest {
         (invocation, publication, scope) -> { throw new AssertionError("unexpected finalization"); });
   }
 
+  private static final class ControllableControlRead implements CommitControlStore {
+    private final CommitControlStore delegate;
+    private final AtomicReference<PendingControlRead> nextRead = new AtomicReference<>();
+
+    private ControllableControlRead(CommitControlStore delegate) {
+      this.delegate = delegate;
+    }
+
+    private void blockNextRead(PendingControlRead blockedRead) {
+      if (!nextRead.compareAndSet(null, blockedRead)) {
+        throw new IllegalStateException("a control read is already armed");
+      }
+    }
+
+    @Override public CompletableFuture<Optional<ControlSnapshot>> read(RequestScope scope) {
+      PendingControlRead blockedRead = nextRead.getAndSet(null);
+      if (blockedRead == null) return delegate.read(scope);
+      blockedRead.started.countDown();
+      scope.registerCleanup(() -> blockedRead.cancellationRequested.countDown());
+      scope.trackPhysicalProducer(blockedRead.physicalDrain);
+      return blockedRead.result;
+    }
+
+    @Override public CompletableFuture<Boolean> initializeIfAbsent(
+        CommitState initialState, RequestScope scope) {
+      return delegate.initializeIfAbsent(initialState, scope);
+    }
+
+    @Override public CompletableFuture<Boolean> compareAndSet(
+        ControlSnapshot observed, CommitState replacement, RequestScope scope) {
+      return delegate.compareAndSet(observed, replacement, scope);
+    }
+  }
+
+  private static final class PendingControlRead {
+    private final CountDownLatch started = new CountDownLatch(1);
+    private final CountDownLatch cancellationRequested = new CountDownLatch(1);
+    private final CompletableFuture<Optional<ControlSnapshot>> result = new CompletableFuture<>();
+    private final CompletableFuture<Void> physicalDrain = new CompletableFuture<>();
+  }
+
   private static final class MemoryControl implements CommitControlStore {
     private CommitState state = CommitState.initial(PROFILE, 1);
     private final CountDownLatch heartbeat = new CountDownLatch(1);
+    private final CountDownLatch expectedOwnerClaimed = new CountDownLatch(1);
+    private final AtomicBoolean stallNextRead = new AtomicBoolean();
+    private final CountDownLatch stalledReadStarted = new CountDownLatch(1);
+    private final CountDownLatch stalledReadCancelled = new CountDownLatch(1);
     private volatile boolean failHeartbeat;
     private volatile boolean blockHeartbeat;
+    private volatile String expectedOwnerClaim;
     private boolean failVerificationRead;
     private boolean delayVerificationRead;
     private final CompletableFuture<Optional<ControlSnapshot>> delayedVerification = new CompletableFuture<>();
@@ -290,6 +569,15 @@ class M3OwnerLeaseTest {
 
     @Override public synchronized CompletableFuture<Optional<ControlSnapshot>> read(RequestScope scope) {
       reads++;
+      if (stallNextRead.compareAndSet(true, false)) {
+        var reply = new CompletableFuture<Optional<ControlSnapshot>>();
+        reply.whenComplete((value, failure) -> {
+          if (failure != null) stalledReadCancelled.countDown();
+        });
+        scope.registerCleanup(() -> reply.completeExceptionally(new CancellationException()));
+        stalledReadStarted.countDown();
+        return reply;
+      }
       if (reads == 4 && delayVerificationRead) {
         verificationSnapshot = snapshot(state);
         return delayedVerification;
@@ -305,6 +593,7 @@ class M3OwnerLeaseTest {
     @Override public synchronized CompletableFuture<Boolean> compareAndSet(
         ControlSnapshot observed, CommitState replacement, RequestScope scope) {
       if (observed.state().stateVersion() != state.stateVersion()) return CompletableFuture.completedFuture(false);
+      long previousEpoch = state.ownerEpoch();
       if (replacement.ownerEpoch() == state.ownerEpoch()) {
         if (blockHeartbeat && reads > 4) {
           var reply = new CompletableFuture<Boolean>();
@@ -320,6 +609,10 @@ class M3OwnerLeaseTest {
         }
       }
       state = replacement;
+      if (replacement.ownerEpoch() > previousEpoch && expectedOwnerClaim != null
+          && replacement.ownerInstance().filter(expectedOwnerClaim::equals).isPresent()) {
+        expectedOwnerClaimed.countDown();
+      }
       return CompletableFuture.completedFuture(true);
     }
     private synchronized CommitState currentState() { return state; }
