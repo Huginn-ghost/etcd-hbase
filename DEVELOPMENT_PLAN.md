@@ -823,11 +823,17 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 公开验证：源代码 head=`ec15546`、base=`cf3354a`、Temurin JDK 21；`scripts/verify/m4.sh --scope public --task J42` 状态=passed，Go 测试 308 项、Maven XML 报告 161 份合计 932 项，J42 gRPC/MiniCluster 测试 6 项；失败、错误、跳过均为 0；HISTORY/NATIVE 两种布局在该 profile 内验证。证据目录留本地 `.artifacts/m4/j42-restacked-j41-de55-fix1-20261116`。
   - 作者自审=完成；独立复核=已完成（两项发现已修正并加入回归测试）。
 
-- [ ] **J43｜ExpiryWorker、时间窗口索引、Revoke 与撤销恢复**
+- [x] **J43｜ExpiryWorker、时间窗口索引、Revoke 与撤销恢复**
   - 依赖：J33/J41/J42。
   - 完成标准：限定到期窗口与持久化水位补查，不扫描全部业务 KV；核对 generation 并统一提交删除/PrevKV/事件；多副本任务接管、旧 worker 返回与 Pod 重建不误删，记录到期延迟和陈旧索引。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：状态=公开实现与公开 MiniCluster 验证完成，维护者 review 待处理；负责人=项目贡献者；完成日期=2026-11-17；PR/commit=[PR #50](https://github.com/Reidddddd/etcd-hbase/pull/50)；评审人/结论=`Reidddddd` / 待评审；目标环境与 M4 阶段验收=未完成。
+  - 复核前完整公开验证：代码提交 `981ec5b6c129fbdf592c46cfa70f9b0cae48e55d`、upstream base `e7e05a912807ea527c2ada8e3fd9ffa88584ca9d`，运行 `scripts/verify/m4.sh --scope public --task J43`，Go 测试 322 项、Maven XML 报告 172 份合计 Java 测试 1006 项、22 条原生 trace；HISTORY/NATIVE 两种布局与 J29.4 并发 1、2、4 均覆盖，失败、错误和跳过均为 0。原始报告保留本地 `.artifacts/m4/j43-final-20261116-6`。
+  - Review 修复：`LeaseBindingReader` 的累计绑定 key 字节上限改用 Lease 准入的 `maximumKeyBytes`，与单 RPC 请求/响应上限分开。新增 64 个 30 KiB key 的 MiniCluster 回归；它们分批绑定后，Revoke 必须以一个 revision 删除全部 key，而超限的 `TimeToLive(keys=true)` 必须返回 `RESOURCE_EXHAUSTED`。
+  - Review 修复定向验证：Temurin JDK 21 下运行 `scripts/dev/mvn21.sh -B -ntp -pl server -P m4-j43-public clean verify -Dtest=LeaseRevocationPreparerTest -Dit.test=M4LeaseRevokeRpcIT`，`LeaseRevocationPreparerTest` 10 项、`M4LeaseRevokeRpcIT` 5 项通过；失败、错误和跳过均为 0。HISTORY/NATIVE 两种布局均覆盖。该定向结果补充复核前的完整公开验证，不把旧 head 的完整结果当作新 head 的完整验证。
+  - Review 修复后完整公开验证：代码提交 `9dfd742daecf03e0a623739c4f5bb45b88f9b298`、upstream base `e7e05a912807ea527c2ada8e3fd9ffa88584ca9d`，`scripts/verify/m4.sh --scope public --task J43` 通过；Go 322 项、Maven XML 报告 172 份合计 Java 1006 项、22 条原生 trace；HISTORY/NATIVE 两种布局及 J29.4 并发 1、2、4 均覆盖，失败、错误、跳过均为 0。验证 run ID=`j43-pr50-head-20261117-parallel`，原始报告保留本地。
+  - 后续检查点断言验证：在 J43 head=`6e467042aef8142c451276c85bdd3cb2eb231394` 上执行 `ETCD_HBASE_JDK21_HOME=<pinned Temurin 21> scripts/dev/mvn21.sh -B -ntp -pl server -am -Dtest=LeaseRevocationPreparerTest -Dsurefire.failIfNoSpecifiedTests=false test`，10 项通过，失败、错误、跳过为 0；该定向检查覆盖检查点 target identity 与 sequence 的新增断言。
+  - 作者自审=完成；独立复核=已完成（1 项 P1 已修复并定向验证）；维护者正式 review=待处理。
 
 - [ ] **J44｜已提交事件页、共享 EventTailer 与事件读取预算**
   - 依赖：J23/J24。

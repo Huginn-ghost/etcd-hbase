@@ -4,7 +4,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.protobuf.ByteString;
 import etcdserverpb.KVGrpc;
@@ -19,11 +21,13 @@ import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
 import io.etcdhbase.core.lease.LeaseTimeObservation;
 import io.etcdhbase.core.lease.LeaseTimeSource;
+import io.etcdhbase.core.lease.LeaseCostAdmission;
 import io.etcdhbase.core.commit.InvocationId;
 import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.SystemRecordType;
+import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
 import io.etcdhbase.core.lease.LeaseState;
 import io.etcdhbase.grpc.internal.v1.ForwardMutationRequest;
@@ -35,11 +39,14 @@ import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
 import io.etcdhbase.hbase.codec.LeaseStateMessages;
 import io.etcdhbase.hbase.probe.TemporaryHBaseClusterProcess;
 import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
+import io.etcdhbase.hbase.storage.HBaseInvocationRepository;
 import io.etcdhbase.hbase.storage.HBaseSystemRecordStore;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.M3RuntimeConfigurationLoader;
+import io.etcdhbase.server.config.M3MemoryReservations;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.server.commit.ServiceAuthorizationContextReference;
+import io.etcdhbase.server.commit.LeaseBudgetProfile;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
 import io.grpc.ClientCall;
@@ -70,32 +77,55 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongFunction;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
-import io.etcdhbase.server.config.M3MemoryReservations;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 /** Verifies M4 Lease RPCs against native etcd, a disposable HBase cluster, and runtime restart. */
 @Timeout(600)
 class M4LeaseRpcIT {
   private static final int MAX_DRIVER_DIAGNOSTIC_BYTES = 8 * 1024;
+  private static final int MIXED_LOAD_KEEPALIVE_RESPONSE_TIMEOUT_SECONDS = 60;
+  private static final int MIXED_LOAD_WORKER_BASE_TIMEOUT_SECONDS = 30;
+  private static final int MIXED_LOAD_WORKER_TIMEOUT_PER_ITERATION_SECONDS = 5;
+  private static final int MIXED_LOAD_WORKER_MAX_TIMEOUT_SECONDS = 180;
   private static final int TEST_OWNER_LEASE_MILLIS = 6_000;
   private static final int TEST_HEARTBEAT_MILLIS = 1_000;
   private static final List<String> LAYOUT_FILES =
       List.of("history-table.json", "native-cell-versions.json");
+  private static final List<String> MIXED_EVIDENCE_SOURCE_FILES = List.of(
+      "core/src/main/java/io/etcdhbase/core/lease/LeaseExpiryCheckpoint.java",
+      "server/src/main/java/io/etcdhbase/server/commit/LeaseExpiryWorker.java",
+      "server/src/main/java/io/etcdhbase/server/commit/LeaseRevocationExecutor.java",
+      "server/src/main/java/io/etcdhbase/server/observability/RequestMetrics.java",
+      "server/src/test/java/io/etcdhbase/server/M4LeaseRpcIT.java",
+      "server/src/test/java/io/etcdhbase/server/M4MixedLeaseBenchmarkIT.java",
+      "scripts/verify/m4-report.py",
+      "testkit/cases/m4-cases.json");
   private static final RuntimeConfiguration.ResourceBudgets RESOURCES =
       new RuntimeConfiguration.ResourceBudgets(65_536, 4, 30_000,
+          4 << 20, 4 << 20, 16, 0);
+  // Four KeepAlive streams and their independent Put RPCs must fit at the listener.
+  private static final RuntimeConfiguration.ResourceBudgets MIXED_LOAD_RESOURCES =
+      new RuntimeConfiguration.ResourceBudgets(65_536, 8, 30_000,
           4 << 20, 4 << 20, 16, 0);
   @TempDir Path testDirectory;
 
@@ -116,7 +146,7 @@ class M4LeaseRpcIT {
   }
 
  @Test
-  void minimumMemoryPreservesLeaseLifecycleWhenClockFailsBeforeSelection() throws Exception {
+  void minimumMemoryPreservesLeaseLifecycleAcrossClockFailures() throws Exception {
     try (var cluster = TemporaryHBaseClusterProcess.start()) {
       int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
       InitializationConfiguration initialization = initialization("history-table.json", clientPort);
@@ -146,17 +176,18 @@ class M4LeaseRpcIT {
       RuntimeConfiguration configuration, M3RuntimeConfiguration activation) throws Exception {
     var now = new AtomicLong(10_000);
     var healthy = new AtomicBoolean(true);
-    var observations = new AtomicInteger();
+    var highestObservedTime = new AtomicLong(10_000);
     var armed = new AtomicBoolean(false);
     var rewind = new AtomicBoolean(false);
     LeaseTimeSource time = () -> {
-      boolean observedHealthy = healthy.get();
-      long observedNow = now.get();
-      if (armed.get() && observations.incrementAndGet() == 2) {
-        if (rewind.get()) now.set(12_000);
+      if (armed.get()) {
+        if (rewind.get()) now.set(11_000);
         else healthy.set(false);
       }
-      return new LeaseTimeObservation(observedNow, observedNow, observedHealthy);
+      long observedNow = now.get();
+      long previousHighWater = highestObservedTime.getAndAccumulate(observedNow, Math::max);
+      boolean monotonic = observedNow >= previousHighWater;
+      return new LeaseTimeObservation(observedNow, observedNow, healthy.get() && monotonic);
     };
     try (RuntimeServer runtime = RuntimeServer.startM3WithLeaseTimeSource(configuration, activation, ignored -> time)) {
       var channel = NettyChannelBuilder.forAddress("127.0.0.1", runtime.boundListeners().getFirst().port())
@@ -166,31 +197,40 @@ class M4LeaseRpcIT {
         long leaseId = 12345;
         var request = Rpc.LeaseGrantRequest.newBuilder().setID(leaseId).setTTL(5).build();
         assertEquals(leaseId, client.leaseGrant(request).getID());
-        now.set(20_000);
+        // Keep the Lease below its deadline while asserting that unhealthy and rewound clock
+        // observations do not select an expiry mutation in the background.
+        now.set(12_000);
         assertTrue(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
             .anyMatch(lease -> lease.getID() == leaseId));
         assertEquals(Status.Code.FAILED_PRECONDITION,
             assertThrows(StatusRuntimeException.class, () -> client.leaseGrant(request)).getStatus().getCode());
-        long sequence = controlSnapshot(plan, initializer, identity).state().publishedSequence();
+        long revision = controlSnapshot(plan, initializer, identity).state().publishedRevision();
         armed.set(true);
         var ttlRequest = Rpc.LeaseTimeToLiveRequest.newBuilder().setID(leaseId).setKeys(true).build();
         assertEquals(Status.Code.UNAVAILABLE,
             assertThrows(StatusRuntimeException.class, () -> client.leaseTimeToLive(ttlRequest)).getStatus().getCode());
-        assertTrue(observations.get() >= 3);
-        assertEquals(sequence, controlSnapshot(plan, initializer, identity).state().publishedSequence());
+        assertEquals(revision, controlSnapshot(plan, initializer, identity).state().publishedRevision());
         armed.set(false);
         healthy.set(true);
         assertTrue(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
             .anyMatch(lease -> lease.getID() == leaseId));
-        observations.set(0);
         rewind.set(true);
         armed.set(true);
         assertEquals(Status.Code.UNAVAILABLE,
             assertThrows(StatusRuntimeException.class, () -> client.leaseTimeToLive(ttlRequest)).getStatus().getCode());
-        assertTrue(observations.get() >= 3);
-        assertEquals(sequence, controlSnapshot(plan, initializer, identity).state().publishedSequence());
+        assertEquals(revision, controlSnapshot(plan, initializer, identity).state().publishedRevision());
+        assertTrue(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
+            .anyMatch(lease -> lease.getID() == leaseId),
+            "an unhealthy or rewound clock must not revoke a live Lease");
         armed.set(false);
         now.set(20_000);
+        long expiredTtl = client.leaseTimeToLive(ttlRequest).getTTL();
+        assertTrue(expiredTtl == 0 || expiredTtl == -1,
+            "the lease is either awaiting expiry work or already revoked");
+        if (client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
+            .anyMatch(lease -> lease.getID() == leaseId)) {
+          client.leaseRevoke(Rpc.LeaseRevokeRequest.newBuilder().setID(leaseId).build());
+        }
         assertEquals(-1, client.leaseTimeToLive(ttlRequest).getTTL());
         assertFalse(client.leaseLeases(Rpc.LeaseLeasesRequest.getDefaultInstance()).getLeasesList().stream()
             .anyMatch(lease -> lease.getID() == leaseId));
@@ -206,12 +246,16 @@ class M4LeaseRpcIT {
   private static M3RuntimeConfiguration minimumActivation() {
     int maxRequest = 1_572_864;
     return new M3RuntimeConfiguration("1", 6_000, 1_000, 60_000, 30_000,
-        M3MemoryReservations.minimumLeaseMemory(1, maxRequest), maxRequest,
-        2, 16, 60_000, false, true, 5, 1_000);
+        Math.addExact(M3MemoryReservations.minimumLeaseMemory(1, maxRequest),
+            LeaseBudgetProfile.capacityForGroups(1, maxRequest).memoryBytes()), maxRequest,
+        2, 16, 60_000, false, true, 5, 1_000, 1_000,
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
+        LeaseCostAdmission.DEFAULT_LIMITS.maximumRevokeCostBytes());
   }
 
 
-  static void verifyDualRuntimeForwardsKeepAliveOverMtlsAndFencesTheOldOwner(
+  static OwnerTakeoverEvidence verifyDualRuntimeForwardsKeepAliveOverMtlsAndFencesTheOldOwner(
       Path testDirectory) throws Exception {
     RunContext run = prepareRun();
     try (var cluster = TemporaryHBaseClusterProcess.start()) {
@@ -272,9 +316,11 @@ class M4LeaseRpcIT {
               CommitState activeOwner = controlSnapshot(plan, initializer, identity).state();
               assertTrue(isOwnerForPeer(activeOwner, "owner-a"));
               long scopeProbeLease = leaseIdForPrefix(run.prefix(), "forwarding-context-probe");
+              InvocationId invalidContextInvocation = InvocationId.create();
               var invalidContextRequest = keepAliveForwardRequest(source.tableGroupId(),
                   runtimeForwardingIdentity, Rpc.LeaseKeepAliveRequest.newBuilder()
-                      .setID(scopeProbeLease).build(), InvocationId.create(), activeOwner.ownerEpoch())
+                      .setID(scopeProbeLease).build(), invalidContextInvocation,
+                  activeOwner.ownerEpoch())
                   .toBuilder()
                   .setAuthorizationContextReference(ByteString.copyFromUtf8("unresolved-context"))
                   .build();
@@ -283,8 +329,15 @@ class M4LeaseRpcIT {
               assertEquals(ForwardMutationResponse.Outcome.UNKNOWN, invalidContextReply.getOutcome());
               assertEquals("PERMISSION", invalidContextReply.getFailureCode());
               CommitState afterInvalidContext = controlSnapshot(plan, initializer, identity).state();
-              assertEquals(activeOwner.publishedSequence(), afterInvalidContext.publishedSequence(),
-                  "an unresolved forwarded service context must be rejected before invocation binding");
+              assertEquals(activeOwner.publishedRevision(), afterInvalidContext.publishedRevision(),
+                  "an unresolved forwarded service context must not change the KV revision");
+              try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+                var records = HBaseSystemRecordStore.open(initializer, identity, plan.system(), scope)
+                    .join();
+                assertTrue(new HBaseInvocationRepository(records)
+                    .read(invalidContextInvocation, scope).join().isEmpty(),
+                    "an unresolved forwarded service context must be rejected before invocation binding");
+              }
 
               Rpc.PutResponse forwardedPut = putThrough(ownerB, "forwarded-before-takeover", 2);
               assertEquals(initialized.clusterId(), forwardedPut.getHeader().getClusterId());
@@ -297,6 +350,10 @@ class M4LeaseRpcIT {
               grantThrough(ownerB, leaseA, 30);
               grantThrough(ownerB, leaseB, 60);
               CommitState beforeRenewal = controlSnapshot(plan, initializer, identity).state();
+              LeaseState leaseABeforeRenewal = leaseStateAt(plan, initializer, identity, leaseA,
+                  beforeRenewal.finalizedSequence());
+              LeaseState leaseBBeforeRenewal = leaseStateAt(plan, initializer, identity, leaseB,
+                  beforeRenewal.finalizedSequence());
               List<Rpc.LeaseKeepAliveResponse> renewals = keepAliveThrough(
                   ownerB, leaseA, leaseB, missingLease);
               assertEquals(List.of(leaseA, leaseB, missingLease),
@@ -311,9 +368,17 @@ class M4LeaseRpcIT {
               }
               CommitState afterRenewal = controlSnapshot(plan, initializer, identity).state();
               assertEquals(beforeRenewal.publishedRevision(), afterRenewal.publishedRevision());
-              assertEquals(beforeRenewal.publishedSequence() + 2,
-                  afterRenewal.publishedSequence(),
-                  "unknown Lease KeepAlive must persist its TTL=0 result without advancing sequence");
+              assertTrue(afterRenewal.publishedSequence() >= beforeRenewal.publishedSequence() + 2,
+                  "both successful KeepAlive requests must select an auxiliary commit; expiry "
+                      + "checkpoint maintenance may also advance the metadata-only sequence");
+              LeaseState leaseAAfterRenewal = leaseStateAt(plan, initializer, identity, leaseA,
+                  afterRenewal.finalizedSequence());
+              LeaseState leaseBAfterRenewal = leaseStateAt(plan, initializer, identity, leaseB,
+                  afterRenewal.finalizedSequence());
+              assertEquals(leaseABeforeRenewal.renewalGeneration() + 1,
+                  leaseAAfterRenewal.renewalGeneration());
+              assertEquals(leaseBBeforeRenewal.renewalGeneration() + 1,
+                  leaseBAfterRenewal.renewalGeneration());
 
               InvocationId missingInvocation = InvocationId.create();
               var missingKeepAlive = Rpc.LeaseKeepAliveRequest.newBuilder().setID(missingLease).build();
@@ -326,8 +391,13 @@ class M4LeaseRpcIT {
               assertTrue(java.util.Arrays.equals(missingInvocation.bytes(),
                   firstMissingReply.getOperationResult().toByteArray()));
               CommitState afterMissingReply = controlSnapshot(plan, initializer, identity).state();
-              assertEquals(afterRenewal.publishedSequence(), afterMissingReply.publishedSequence());
               assertEquals(afterRenewal.publishedRevision(), afterMissingReply.publishedRevision());
+              assertEquals(leaseAAfterRenewal,
+                  leaseStateAt(plan, initializer, identity, leaseA, afterMissingReply.finalizedSequence()),
+                  "an unknown Lease KeepAlive must not change another Lease");
+              assertEquals(leaseBAfterRenewal,
+                  leaseStateAt(plan, initializer, identity, leaseB, afterMissingReply.finalizedSequence()),
+                  "an unknown Lease KeepAlive must not change another Lease");
 
               ForwardMutationResponse replayedMissingReply = forwardMutation(
                   ownerAPort, "owner-a", trustedPeers, ownerBCertificate, missingAttempt);
@@ -335,22 +405,36 @@ class M4LeaseRpcIT {
               assertTrue(java.util.Arrays.equals(missingInvocation.bytes(),
                   replayedMissingReply.getOperationResult().toByteArray()));
               CommitState afterMissingReplay = controlSnapshot(plan, initializer, identity).state();
-              assertEquals(afterMissingReply.publishedSequence(), afterMissingReplay.publishedSequence());
               assertEquals(afterMissingReply.publishedRevision(), afterMissingReplay.publishedRevision());
+              assertEquals(leaseAAfterRenewal,
+                  leaseStateAt(plan, initializer, identity, leaseA, afterMissingReplay.finalizedSequence()),
+                  "replaying an unknown Lease result must remain side-effect free");
+              assertEquals(leaseBAfterRenewal,
+                  leaseStateAt(plan, initializer, identity, leaseB, afterMissingReplay.finalizedSequence()),
+                  "replaying an unknown Lease result must remain side-effect free");
 
               long oldEpoch = afterMissingReplay.ownerEpoch();
+              long takeoverStartedNanos = System.nanoTime();
               ownerA.close();
               M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
               CommitState newOwner = awaitOwner(plan, initializer, identity, "owner-b", oldEpoch);
+              long takeoverElapsedMillis = TimeUnit.NANOSECONDS.toMillis(
+                  System.nanoTime() - takeoverStartedNanos);
               assertTrue(newOwner.ownerEpoch() > oldEpoch);
               assertEquals(2, putThrough(ownerB, "forwarded-after-takeover", 2)
                   .getHeader().getMemberId());
               CommitState beforeStaleRenewal = controlSnapshot(plan, initializer, identity).state();
+              LeaseState leaseBeforeStaleRenewal = leaseStateAt(plan, initializer, identity, leaseA,
+                  beforeStaleRenewal.finalizedSequence());
               assertRejectedStaleOwner(ownerBForwarding, trustedPeers, ownerBPort, ownerACertificate,
                   source.tableGroupId(), identity, leaseA, oldEpoch);
               CommitState afterStaleRenewal = controlSnapshot(plan, initializer, identity).state();
-              assertEquals(beforeStaleRenewal.publishedSequence(), afterStaleRenewal.publishedSequence());
+              assertEquals(leaseBeforeStaleRenewal, leaseStateAt(plan, initializer, identity, leaseA,
+                  afterStaleRenewal.finalizedSequence()),
+                  "a stale-owner request must not change the authoritative Lease version");
               assertEquals(beforeStaleRenewal.publishedRevision(), afterStaleRenewal.publishedRevision());
+              return new OwnerTakeoverEvidence(oldEpoch, newOwner.ownerEpoch(),
+                  takeoverElapsedMillis, newOwner.ownerInstance().orElseThrow());
             } finally {
               if (ownerB != null) ownerB.close();
               ownerA.close();
@@ -456,17 +540,26 @@ class M4LeaseRpcIT {
             assertEquals(initialized.clusterId(), forwardedReply.getHeader().getClusterId());
             assertEquals(2, forwardedReply.getHeader().getMemberId());
 
+            long recoveryLease = leaseIdForPrefix(
+                beforeFailover.prefix(), "keepalive-owner-recovery");
+            Rpc.LeaseGrantResponse recoveryLeaseGrant = grantThrough(
+                ownerBClientPort, recoveryLease, 120);
+            assertEquals(recoveryLease, recoveryLeaseGrant.getID());
+            assertEquals(120, recoveryLeaseGrant.getTTL(),
+                "the failover probe needs a live Lease while the new owner is elected");
+
             ownerAStop = terminateOwnerProcess(ownerA, true);
             CommitState recovered = awaitOwner(plan, initializer, identity, "owner-b", oldEpoch);
             newEpoch = recovered.ownerEpoch();
             assertTrue(newEpoch > oldEpoch);
             assertRejectedStaleOwner(ownerBForwarding, trustedPeers, ownerBPeerPort,
-                ownerACertificate, source.tableGroupId(), runtimeForwardingIdentity, renewedLease, oldEpoch);
+                ownerACertificate, source.tableGroupId(), runtimeForwardingIdentity,
+                recoveryLease, oldEpoch);
 
             LeaseState beforeRecoveryKeepAlive = leaseStateAt(
-                plan, initializer, identity, renewedLease, recovered.publishedSequence());
+                plan, initializer, identity, recoveryLease, recovered.publishedSequence());
             KeepAliveOnceObservation keepAliveOnce = runKeepAliveOnceAfterRecovery(
-                afterFailover, ownerBClientPort, renewedLease);
+                afterFailover, ownerBClientPort, recoveryLease);
             keepAliveClientPid = keepAliveOnce.processId();
             keepAliveClientExitCode = keepAliveOnce.exitCode();
             keepAliveClientTtl = keepAliveOnce.ttl();
@@ -478,12 +571,13 @@ class M4LeaseRpcIT {
                 "the original Go client must observe the unchanged KV revision after owner failover");
             assertEquals(recovered.publishedRevision(), afterRecoveryKeepAlive.publishedRevision(),
                 "KeepAliveOnce must not create a KV revision");
-            assertEquals(recovered.publishedSequence() + 1, afterRecoveryKeepAlive.publishedSequence(),
-                "KeepAliveOnce must persist one auxiliary sequence before returning");
-            LeaseState afterRecoveryLease = leaseStateAt(plan, initializer, identity, renewedLease,
+            assertTrue(afterRecoveryKeepAlive.publishedSequence() > recovered.publishedSequence(),
+                "KeepAliveOnce must persist its auxiliary result before returning");
+            LeaseState afterRecoveryLease = leaseStateAt(plan, initializer, identity, recoveryLease,
                 afterRecoveryKeepAlive.publishedSequence());
             assertEquals(beforeRecoveryKeepAlive.renewalGeneration() + 1,
                 afterRecoveryLease.renewalGeneration());
+            assertTrue(afterRecoveryLease.sequence() > beforeRecoveryKeepAlive.sequence());
             assertTrue(afterRecoveryLease.deadlineEpochMillis()
                 > beforeRecoveryKeepAlive.deadlineEpochMillis());
           } catch (Exception | Error failure) {
@@ -595,8 +689,6 @@ class M4LeaseRpcIT {
               CommitState selected = controlSnapshot(plan, initializer, identity).state();
               assertEquals(beforeRenewal.publishedRevision(), selected.publishedRevision(),
                   "KeepAlive must not publish a KV revision");
-              assertEquals(beforeRenewal.publishedSequence() + 1, selected.publishedSequence(),
-                  "the renewal must be selected before its response is lost");
               LeaseState leaseAfterRenewal = leaseStateAt(plan, initializer, identity, leaseId,
                   selected.publishedSequence());
               assertEquals(leaseBeforeRenewal.renewalGeneration() + 1,
@@ -605,7 +697,8 @@ class M4LeaseRpcIT {
               assertTrue(leaseAfterRenewal.deadlineEpochMillis()
                   > leaseBeforeRenewal.deadlineEpochMillis(),
                   "the selected renewal must persist a later deadline");
-              assertEquals(selected.publishedSequence(), leaseAfterRenewal.sequence());
+              assertTrue(leaseAfterRenewal.sequence() > beforeRenewal.publishedSequence(),
+                  "the durable Lease version must follow the pre-renewal view");
               long selectedOwnerEpoch = selected.ownerEpoch();
 
               ownerA.close();
@@ -619,11 +712,11 @@ class M4LeaseRpcIT {
               assertTrue(java.util.Arrays.equals(invocation.bytes(), recoveredReply.getOperationResult().toByteArray()));
 
               CommitState afterRetry = controlSnapshot(plan, initializer, identity).state();
-              assertEquals(selected.publishedSequence(), afterRetry.publishedSequence(),
-                  "replaying the original invocation must not renew the Lease a second time");
+              assertTrue(afterRetry.publishedSequence() >= selected.publishedSequence(),
+                  "replay cannot move the durable sequence backwards");
               assertEquals(selected.publishedRevision(), afterRetry.publishedRevision());
               assertEquals(leaseAfterRenewal, leaseStateAt(plan, initializer, identity, leaseId,
-                  afterRetry.publishedSequence()),
+                  afterRetry.finalizedSequence()),
                   "replay after owner takeover must preserve the exact durable Lease version");
               Rpc.LeaseTimeToLiveResponse ttl = timeToLive(ownerB, leaseId, true);
               assertEquals(leaseId, ttl.getID());
@@ -673,9 +766,11 @@ class M4LeaseRpcIT {
 
         long leaseId = leaseIdForPrefix(run.prefix(), "client-cancel");
         CommitState renewed;
+        LeaseState renewedLease;
+        long checkpointBeforeRestart;
         try (RuntimeServer server = RuntimeServer.startM3(configuration, firstActivation)) {
           assertTrue(server.dataReady());
-          Rpc.LeaseGrantResponse granted = grantThrough(server, leaseId, 30);
+          Rpc.LeaseGrantResponse granted = grantThrough(server, leaseId, 180);
           assertEquals(initialized.clusterId(), granted.getHeader().getClusterId());
           CommitState before = controlSnapshot(plan, initializer, identity).state();
           LeaseState leaseBeforeRenewal = leaseStateAt(plan, initializer, identity, leaseId,
@@ -686,9 +781,12 @@ class M4LeaseRpcIT {
           var closed = new CountDownLatch(1);
           var closeStatus = new AtomicReference<Status>();
           try {
+            // Force unrelated durable progress after the baseline, before the renewal is sent.
+            awaitExpiryCheckpoint(plan, initializer, identity,
+                before.finalizedSequence() + 1);
             ClientCall<Rpc.LeaseKeepAliveRequest, Rpc.LeaseKeepAliveResponse> call = channel.newCall(
                 LeaseGrpc.getLeaseKeepAliveMethod(),
-                CallOptions.DEFAULT.withDeadlineAfter(30, TimeUnit.SECONDS));
+                CallOptions.DEFAULT.withDeadlineAfter(90, TimeUnit.SECONDS));
             call.start(new ClientCall.Listener<>() {
               @Override public void onMessage(Rpc.LeaseKeepAliveResponse response) {
                 responseReceived.set(true);
@@ -700,19 +798,21 @@ class M4LeaseRpcIT {
             }, new Metadata());
             call.sendMessage(Rpc.LeaseKeepAliveRequest.newBuilder().setID(leaseId).build());
 
-            renewed = awaitFinalizedSequence(plan, initializer, identity,
-                before.publishedSequence() + 1, Duration.ofSeconds(30));
+            RenewalObservation observation = awaitRenewedLease(plan, initializer, identity,
+                leaseId, leaseBeforeRenewal, Duration.ofSeconds(30));
+            renewed = observation.control();
+            renewedLease = observation.lease();
             assertEquals(before.publishedRevision(), renewed.publishedRevision(),
                 "KeepAlive must not change the KV revision");
-            LeaseState leaseAfterRenewal = leaseStateAt(plan, initializer, identity, leaseId,
-                renewed.publishedSequence());
             assertEquals(leaseBeforeRenewal.renewalGeneration() + 1,
-                leaseAfterRenewal.renewalGeneration(),
+                renewedLease.renewalGeneration(),
                 "the durable renewal must advance the persisted generation before response delivery");
-            assertTrue(leaseAfterRenewal.deadlineEpochMillis()
+            assertTrue(renewedLease.deadlineEpochMillis()
                 > leaseBeforeRenewal.deadlineEpochMillis(),
                 "the durable renewal must persist a later deadline before response delivery");
-            assertEquals(renewed.publishedSequence(), leaseAfterRenewal.sequence());
+            assertTrue(renewedLease.sequence() <= renewed.finalizedSequence());
+            LeaseExpiryCheckpoint beforeCancellationCheckpoint = awaitExpiryCheckpoint(
+                plan, initializer, identity, renewed.finalizedSequence() + 1);
 
             // Manual ClientCall flow control is intentionally left at zero demand. The server may
             // persist and queue its response, but the client cancels before consuming that response.
@@ -720,10 +820,14 @@ class M4LeaseRpcIT {
             assertTrue(closed.await(10, TimeUnit.SECONDS), "client cancellation did not close the RPC");
             assertEquals(Status.Code.CANCELLED, closeStatus.get().getCode());
             assertFalse(responseReceived.get(), "the cancelled client must not consume a success response");
+            LeaseExpiryCheckpoint afterCancellationCheckpoint = awaitExpiryCheckpoint(
+                plan, initializer, identity, beforeCancellationCheckpoint.sequence() + 1);
             CommitState afterCancel = controlSnapshot(plan, initializer, identity).state();
-            assertEquals(renewed.publishedSequence(), afterCancel.publishedSequence(),
-                "cancelling the public RPC must not undo or duplicate a selected renewal");
             assertEquals(renewed.publishedRevision(), afterCancel.publishedRevision());
+            assertEquals(renewedLease, leaseStateAt(plan, initializer, identity, leaseId,
+                afterCancel.finalizedSequence()),
+                "cancellation must not undo or duplicate the selected renewal");
+            checkpointBeforeRestart = afterCancellationCheckpoint.sequence();
           } finally {
             channel.shutdownNow();
             assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
@@ -733,17 +837,16 @@ class M4LeaseRpcIT {
         M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
         try (RuntimeServer restarted = RuntimeServer.startM3(configuration, activation("2"))) {
           assertTrue(restarted.dataReady());
+          awaitExpiryCheckpoint(plan, initializer, identity, checkpointBeforeRestart + 1);
           CommitState recovered = controlSnapshot(plan, initializer, identity).state();
-          assertEquals(renewed.publishedSequence(), recovered.publishedSequence());
           assertEquals(renewed.publishedRevision(), recovered.publishedRevision());
-          assertEquals(leaseStateAt(plan, initializer, identity, leaseId,
-                  renewed.publishedSequence()),
-              leaseStateAt(plan, initializer, identity, leaseId, recovered.publishedSequence()),
+          assertEquals(renewedLease,
+              leaseStateAt(plan, initializer, identity, leaseId, recovered.finalizedSequence()),
               "restart must retain the exact renewed Lease version selected before cancellation");
           Rpc.LeaseTimeToLiveResponse ttl = timeToLive(restarted, leaseId, true);
           assertEquals(leaseId, ttl.getID());
           assertTrue(ttl.getTTL() > 0, "the durable renewal must survive client cancellation and restart");
-          assertEquals(30, ttl.getGrantedTTL());
+          assertEquals(180, ttl.getGrantedTTL());
           assertEquals(0, ttl.getKeysCount());
           assertEquals(initialized.clusterId(), ttl.getHeader().getClusterId());
           assertEquals(renewed.publishedRevision(), ttl.getHeader().getRevision());
@@ -752,16 +855,20 @@ class M4LeaseRpcIT {
     }
   }
 
-  private static CommitState awaitFinalizedSequence(M3TableGroupPlan plan,
+  private record RenewalObservation(CommitState control, LeaseState lease) {}
+
+  private static RenewalObservation awaitRenewedLease(M3TableGroupPlan plan,
       HBaseBackendIdentityProvider provider,
       io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
-      long expectedSequence, Duration timeout) throws Exception {
+      long leaseId, LeaseState before, Duration timeout) throws Exception {
     long deadline = Math.addExact(System.nanoTime(), timeout.toNanos());
     while (System.nanoTime() < deadline) {
       CommitState state = controlSnapshot(plan, provider, identity).state();
-      if (state.publishedSequence() == expectedSequence
-          && state.finalizedSequence() == expectedSequence) return state;
-      if (state.publishedSequence() > expectedSequence || state.finalizedSequence() > expectedSequence) {
+      LeaseState lease = leaseStateAt(plan, provider, identity, leaseId, state.finalizedSequence());
+      if (lease.renewalGeneration() == before.renewalGeneration() + 1) {
+        return new RenewalObservation(state, lease);
+      }
+      if (lease.renewalGeneration() > before.renewalGeneration() + 1) {
         throw new AssertionError("more than one KeepAlive decision was published before cancellation");
       }
       TimeUnit.MILLISECONDS.sleep(25);
@@ -778,11 +885,179 @@ class M4LeaseRpcIT {
       var entry = records.latestAtOrBefore(SystemRecordType.LEASE_STATE,
           LeaseRecordIdentity.routePrefix(leaseId), sequence, scope).join().orElseThrow();
       assertEquals(leaseId, LeaseRecordIdentity.leaseId(entry.identity()));
-      assertEquals(sequence, LeaseRecordIdentity.sequence(entry.identity()));
+      long versionSequence = LeaseRecordIdentity.sequence(entry.identity());
+      assertTrue(versionSequence <= sequence,
+          "the visible Lease version cannot come from a future M2 sequence");
       LeaseState state = LeaseStateMessages.decode(entry.value());
       assertEquals(leaseId, state.identity().leaseId());
-      assertEquals(sequence, state.sequence());
+      assertEquals(versionSequence, state.sequence(),
+          "the Lease payload sequence must match its versioned record identity");
       return state;
+    }
+  }
+
+  private static LeaseState latestLeaseStateAtOrBefore(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider provider,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      long leaseId, long sequence) throws Exception {
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+      var records = HBaseSystemRecordStore.open(provider, identity, plan.system(), scope).join();
+      var entry = records.latestAtOrBefore(SystemRecordType.LEASE_STATE,
+          LeaseRecordIdentity.routePrefix(leaseId), sequence, scope).join().orElseThrow();
+      assertEquals(leaseId, LeaseRecordIdentity.leaseId(entry.identity()));
+      return LeaseStateMessages.decode(entry.value());
+    }
+  }
+
+  private static CommitState awaitLeaseRevoked(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider provider,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      long leaseId, long afterSequence, Duration timeout) throws Exception {
+    return awaitLeaseRevoked(plan, provider, identity, leaseId, afterSequence, timeout, null);
+  }
+
+  private static CommitState awaitLeaseRevoked(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider provider,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      long leaseId, long afterSequence, Duration timeout,
+      AtomicReference<Throwable> abortOnFailure) throws Exception {
+    long deadline = Math.addExact(System.nanoTime(), timeout.toNanos());
+    while (System.nanoTime() < deadline) {
+      if (abortOnFailure != null) {
+        Throwable workerFailure = abortOnFailure.get();
+        if (workerFailure != null) {
+          throw new AssertionError("mixed-load worker failed before Lease expiry completed",
+              workerFailure);
+        }
+      }
+      CommitState state = controlSnapshot(plan, provider, identity).state();
+      if (state.finalizedSequence() > afterSequence) {
+        LeaseState lease = latestLeaseStateAtOrBefore(plan, provider, identity, leaseId,
+            state.finalizedSequence());
+        if (lease.status() == LeaseState.Status.REVOKED) return state;
+      }
+      TimeUnit.MILLISECONDS.sleep(50);
+    }
+    throw new AssertionError("ExpiryWorker did not durably revoke the expired Lease before timeout");
+  }
+
+  private static LeaseExpiryCheckpoint awaitExpiryCheckpoint(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider provider,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      long minimumSequence) throws Exception {
+    long deadline = Math.addExact(System.nanoTime(), Duration.ofSeconds(30).toNanos());
+    while (System.nanoTime() < deadline) {
+      CommitState state = controlSnapshot(plan, provider, identity).state();
+      if (state.finalizedSequence() >= minimumSequence) {
+        Optional<LeaseExpiryCheckpoint> checkpoint = expiryCheckpointAtOrBefore(
+            plan, provider, identity, state.finalizedSequence());
+        if (checkpoint.isPresent() && checkpoint.orElseThrow().sequence() >= minimumSequence) {
+          return checkpoint.orElseThrow();
+        }
+      }
+      TimeUnit.MILLISECONDS.sleep(50);
+    }
+    throw new AssertionError("ExpiryWorker did not persist the required checkpoint before timeout");
+  }
+
+  private static LeaseExpiryCheckpoint latestExpiryCheckpoint(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider provider,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      long sequence) throws Exception {
+    return expiryCheckpointAtOrBefore(plan, provider, identity, sequence)
+        .orElseThrow(() -> new AssertionError("no durable Lease expiry checkpoint was found"));
+  }
+
+  private static Optional<LeaseExpiryCheckpoint> expiryCheckpointAtOrBefore(M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider provider,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity,
+      long sequence) throws Exception {
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+      var records = HBaseSystemRecordStore.open(provider, identity, plan.system(), scope).join();
+      var entry = records.latestAtOrBefore(SystemRecordType.LEASE_EXPIRY_CHECKPOINT,
+          LeaseExpiryCheckpoint.routePrefix(), sequence, scope).join();
+      if (entry.isEmpty()) return Optional.empty();
+      var checkpointEntry = entry.orElseThrow();
+      LeaseExpiryCheckpoint checkpoint = LeaseExpiryCheckpoint.decode(checkpointEntry.value());
+      assertEquals(LeaseExpiryCheckpoint.sequence(checkpointEntry.identity()), checkpoint.sequence());
+      return Optional.of(checkpoint);
+    }
+  }
+
+  private static Rpc.PutResponse putLeaseBoundKey(RuntimeServer server, byte[] key, long leaseId)
+      throws Exception {
+    var channel = NettyChannelBuilder.forAddress(
+        "127.0.0.1", server.boundListeners().getFirst().port()).usePlaintext().build();
+    try {
+      Rpc.PutRequest request = Rpc.PutRequest.newBuilder()
+          .setKey(ByteString.copyFrom(key))
+          .setValue(ByteString.copyFromUtf8("expiry-checkpoint"))
+          .setLease(leaseId)
+          .build();
+      return KVGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS).put(request);
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+    }
+  }
+
+  private static void awaitKeysAbsent(RuntimeServer server, byte[]... keys) throws Exception {
+    var channel = NettyChannelBuilder.forAddress(
+        "127.0.0.1", server.boundListeners().getFirst().port()).usePlaintext().build();
+    try {
+      var stub = KVGrpc.newBlockingStub(channel);
+      long deadline = Math.addExact(System.nanoTime(), Duration.ofSeconds(30).toNanos());
+      while (System.nanoTime() < deadline) {
+        boolean allAbsent = true;
+        for (byte[] key : keys) {
+          Rpc.RangeResponse response = stub.withDeadlineAfter(5, TimeUnit.SECONDS)
+              .range(Rpc.RangeRequest.newBuilder().setKey(ByteString.copyFrom(key)).build());
+          allAbsent &= response.getKvsCount() == 0;
+        }
+        if (allAbsent) return;
+        TimeUnit.MILLISECONDS.sleep(50);
+      }
+      throw new AssertionError("Lease expiry did not remove every bound key before timeout");
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+    }
+  }
+
+  private static Rpc.RangeResponse rangeKey(RuntimeServer server, byte[] key) throws Exception {
+    var channel = NettyChannelBuilder.forAddress(
+        "127.0.0.1", server.boundListeners().getFirst().port()).usePlaintext().build();
+    try {
+      return KVGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS)
+          .range(Rpc.RangeRequest.newBuilder().setKey(ByteString.copyFrom(key)).build());
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+    }
+  }
+
+  private static void deleteKey(RuntimeServer server, byte[] key) throws Exception {
+    var channel = NettyChannelBuilder.forAddress(
+        "127.0.0.1", server.boundListeners().getFirst().port()).usePlaintext().build();
+    try {
+      KVGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS)
+          .deleteRange(Rpc.DeleteRangeRequest.newBuilder().setKey(ByteString.copyFrom(key)).build());
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+    }
+  }
+
+  private static void putUnleasedKey(RuntimeServer server, byte[] key, String value) throws Exception {
+    var channel = NettyChannelBuilder.forAddress(
+        "127.0.0.1", server.boundListeners().getFirst().port()).usePlaintext().build();
+    try {
+      KVGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS)
+          .put(Rpc.PutRequest.newBuilder().setKey(ByteString.copyFrom(key))
+              .setValue(ByteString.copyFromUtf8(value)).build());
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
     }
   }
 
@@ -814,6 +1089,38 @@ class M4LeaseRpcIT {
     }
     compareKeepAlive(run, "HISTORY");
     compareKeepAlive(run, "NATIVE");
+  }
+
+  static void verifyGoLeaseRevokeMatchesNativeAcrossLayouts() throws Exception {
+    RunContext run = prepareRevokeRun();
+    prepareNativeRevokeEvidence(run);
+    try (var cluster = TemporaryHBaseClusterProcess.start()) {
+      int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
+      for (int index = 0; index < LAYOUT_FILES.size(); index++) {
+        String layoutFile = LAYOUT_FILES.get(index);
+        String layout = index == 0 ? "HISTORY" : "NATIVE";
+        runRevokeLayout(cluster, clientPort, layoutFile, layout, run);
+      }
+    }
+    compareRevoke(run, "HISTORY");
+    compareRevoke(run, "NATIVE");
+  }
+
+  static void verifyExpiryCheckpointResumesAfterRuntimeRestart() throws Exception {
+    RunContext parent = prepareRun();
+    Path artifacts = parent.artifacts().resolve("j43/checkpoint-restart");
+    Files.createDirectories(artifacts);
+    RunContext run = new RunContext(parent.root(), artifacts, parent.runId(),
+        parent.prefix() + "checkpoint-restart/", artifacts.resolve("unused-trace.jsonl"));
+
+    try (var cluster = TemporaryHBaseClusterProcess.start()) {
+      int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
+      for (int index = 0; index < LAYOUT_FILES.size(); index++) {
+        String layoutFile = LAYOUT_FILES.get(index);
+        String layout = index == 0 ? "HISTORY" : "NATIVE";
+        verifyExpiryCheckpointResumesInLayout(cluster, clientPort, layoutFile, layout, run);
+      }
+    }
   }
 
   private static void verifyKeepAliveMetrics(
@@ -869,7 +1176,7 @@ class M4LeaseRpcIT {
     report.append(' ').append(name).append('=').append(value);
   }
 
-  static void verifyExpiredActiveLeaseCannotRenewBeforeDurableRevocation() throws Exception {
+  static void verifyExpiredLeaseIsDurablyRevokedBeforeKeepAliveRetry() throws Exception {
     RunContext run = prepareRun();
     try (var cluster = TemporaryHBaseClusterProcess.start()) {
       int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
@@ -899,19 +1206,729 @@ class M4LeaseRpcIT {
           long leaseId = leaseIdForPrefix(run.prefix(), "expired-active");
           Rpc.LeaseGrantResponse granted = grantThrough(server, leaseId, 5);
           assertEquals(initialized.clusterId(), granted.getHeader().getClusterId());
+          byte[] boundKey = (run.prefix() + "expired-active/role").getBytes(StandardCharsets.UTF_8);
+          putLeaseBoundKey(server, boundKey, leaseId);
           CommitState before = controlSnapshot(plan, initializer, identity).state();
+          LeaseState active = leaseStateAt(plan, initializer, identity, leaseId,
+              before.finalizedSequence());
+          long lowerBoundExpiry = Math.addExact(active.deadlineEpochMillis(),
+              activation.leaseClockUncertaintyMs());
+          long remainingMillis = lowerBoundExpiry - System.currentTimeMillis() + 10;
+          if (remainingMillis > 0) TimeUnit.MILLISECONDS.sleep(remainingMillis);
 
-          TimeUnit.SECONDS.sleep(7);
+          List<Rpc.LeaseKeepAliveResponse> expiredResponses = keepAliveThrough(server, leaseId);
+          assertEquals(1, expiredResponses.size());
+          Rpc.LeaseKeepAliveResponse expiredResponse = expiredResponses.getFirst();
+          assertEquals(leaseId, expiredResponse.getID());
+          assertEquals(0, expiredResponse.getTTL(),
+              "an expired Lease must not be extended before its durable revoke is selected");
 
-          assertEquals(Status.Code.NOT_FOUND, keepAliveFailureCode(server, leaseId),
-              "an expired ACTIVE Lease must fail instead of returning a KeepAlive success");
-          CommitState after = controlSnapshot(plan, initializer, identity).state();
-          assertEquals(before.publishedSequence(), after.publishedSequence(),
-              "a rejected renewal must not select an empty auxiliary commit");
-          assertEquals(before.publishedRevision(), after.publishedRevision());
+          CommitState after = awaitLeaseRevoked(plan, initializer, identity, leaseId,
+              before.publishedSequence(), Duration.ofSeconds(30));
+          assertEquals(before.publishedRevision() + 1, after.publishedRevision(),
+              "revoking the bound key must advance the KV revision exactly once");
+          awaitKeysAbsent(server, boundKey);
+          LeaseState revoked = leaseStateAt(plan, initializer, identity, leaseId,
+              after.finalizedSequence());
+          assertEquals(LeaseState.Status.REVOKED, revoked.status(),
+              "expiry must persist the authoritative terminal Lease state");
+          assertEquals(-1, timeToLive(server, leaseId, true).getTTL(),
+              "TimeToLive must report the durably expired Lease as missing");
+          assertEquals(after.publishedRevision(), expiredResponse.getHeader().getRevision());
+
+          List<Rpc.LeaseKeepAliveResponse> retryResponses = keepAliveThrough(server, leaseId);
+          assertEquals(1, retryResponses.size());
+          assertEquals(0, retryResponses.getFirst().getTTL(),
+              "KeepAlive for an already revoked Lease must use the native TTL-zero response");
+          CommitState afterRetry = controlSnapshot(plan, initializer, identity).state();
+          assertEquals(after.publishedRevision(), afterRetry.publishedRevision(),
+              "a repeated KeepAlive must not change the KV revision");
         }
       }
     }
+  }
+
+  static void verifyRevokeAndKeepAliveRaceHasOneDurableTerminalOutcome() throws Exception {
+    RunContext run = prepareRevokeRun();
+    try (var cluster = TemporaryHBaseClusterProcess.start()) {
+      int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
+      for (int index = 0; index < LAYOUT_FILES.size(); index++) {
+        String layoutFile = LAYOUT_FILES.get(index);
+        String layout = index == 0 ? "HISTORY" : "NATIVE";
+        withRunningLayout(cluster, clientPort, layoutFile, "m4-revoke-race-" + layout,
+            (plan, initializer, identity, server) -> {
+              long leaseId = leaseIdForPrefix(run.prefix(), "revoke-race-" + layout);
+              byte[] key = (run.prefix() + layout.toLowerCase(java.util.Locale.ROOT)
+                  + "/race/role").getBytes(StandardCharsets.UTF_8);
+              grantThrough(server, leaseId, 30);
+              putLeaseBoundKey(server, key, leaseId);
+              CommitState before = controlSnapshot(plan, initializer, identity).state();
+
+              var ready = new CountDownLatch(2);
+              var start = new CountDownLatch(1);
+              var executor = java.util.concurrent.Executors.newFixedThreadPool(2);
+              try {
+                var revoke = executor.submit(() -> {
+                  ready.countDown();
+                  if (!start.await(10, TimeUnit.SECONDS)) {
+                    throw new AssertionError("Revoke race barrier did not open");
+                  }
+                  return revokeThrough(server, leaseId);
+                });
+                var keepAlive = executor.submit(() -> {
+                  ready.countDown();
+                  if (!start.await(10, TimeUnit.SECONDS)) {
+                    throw new AssertionError("KeepAlive race barrier did not open");
+                  }
+                  return keepAliveThrough(server, leaseId);
+                });
+                assertTrue(ready.await(10, TimeUnit.SECONDS), "both Lease operations must reach the barrier");
+                start.countDown();
+
+                Rpc.LeaseRevokeResponse revokeResponse = revoke.get(60, TimeUnit.SECONDS);
+                List<Rpc.LeaseKeepAliveResponse> responses = keepAlive.get(60, TimeUnit.SECONDS);
+                assertEquals(1, responses.size());
+                assertEquals(leaseId, responses.getFirst().getID());
+                assertTrue(responses.getFirst().getTTL() >= 0,
+                    "KeepAlive may win before Revoke or observe the committed revoke, but cannot fail as an unknown outcome");
+
+                CommitState after = awaitLeaseRevoked(plan, initializer, identity, leaseId,
+                    before.finalizedSequence(), Duration.ofSeconds(30));
+                assertEquals(before.publishedRevision() + 1, after.publishedRevision(),
+                    "the serialized race must publish exactly the one key deletion revision");
+                assertEquals(after.publishedRevision(), revokeResponse.getHeader().getRevision(),
+                    "Revoke must return the revision selected for its deletion");
+                awaitKeysAbsent(server, key);
+                assertEquals(LeaseState.Status.REVOKED,
+                    leaseStateAt(plan, initializer, identity, leaseId, after.finalizedSequence()).status());
+              } finally {
+                executor.shutdownNow();
+                assertTrue(executor.awaitTermination(10, TimeUnit.SECONDS),
+                    "Lease race workers must be terminated before the table group closes");
+              }
+            });
+      }
+    }
+  }
+
+  static void verifyStaleExpiryCandidatesPreserveReboundAndUnleasedRecreatedKeys() throws Exception {
+    RunContext run = prepareRevokeRun();
+    try (var cluster = TemporaryHBaseClusterProcess.start()) {
+      int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
+      for (int index = 0; index < LAYOUT_FILES.size(); index++) {
+        String layoutFile = LAYOUT_FILES.get(index);
+        String layout = index == 0 ? "HISTORY" : "NATIVE";
+        withRunningLayout(cluster, clientPort, layoutFile, "m4-stale-expiry-" + layout,
+            (plan, initializer, identity, server) -> {
+              long oldLeaseId = leaseIdForPrefix(run.prefix(), "rebind-old-" + layout);
+              long newLeaseId = leaseIdForPrefix(run.prefix(), "rebind-new-" + layout);
+              byte[] reboundKey = (run.prefix() + layout.toLowerCase(java.util.Locale.ROOT)
+                  + "/rebound/role").getBytes(StandardCharsets.UTF_8);
+              grantThrough(server, oldLeaseId, 5);
+              grantThrough(server, newLeaseId, 30);
+              putLeaseBoundKey(server, reboundKey, oldLeaseId);
+              putLeaseBoundKey(server, reboundKey, newLeaseId);
+              CommitState beforeOldExpiry = controlSnapshot(plan, initializer, identity).state();
+              CommitState oldLeaseRevoked = awaitLeaseRevoked(plan, initializer, identity, oldLeaseId,
+                  beforeOldExpiry.finalizedSequence(), Duration.ofSeconds(30));
+              assertEquals(beforeOldExpiry.publishedRevision(), oldLeaseRevoked.publishedRevision(),
+                  "an empty old Lease revoke must not publish a KV revision");
+              Rpc.RangeResponse rebound = rangeKey(server, reboundKey);
+              assertEquals(1, rebound.getKvsCount(), "the rebound key must survive its old expiry candidate");
+              assertTrue(timeToLive(server, newLeaseId, true).getKeysList()
+                  .contains(ByteString.copyFrom(reboundKey)),
+                  "the surviving key must remain bound to the new Lease");
+
+              long deletedLeaseId = leaseIdForPrefix(run.prefix(), "delete-recreate-" + layout);
+              byte[] recreatedKey = (run.prefix() + layout.toLowerCase(java.util.Locale.ROOT)
+                  + "/recreated/role").getBytes(StandardCharsets.UTF_8);
+              grantThrough(server, deletedLeaseId, 5);
+              putLeaseBoundKey(server, recreatedKey, deletedLeaseId);
+              deleteKey(server, recreatedKey);
+              putUnleasedKey(server, recreatedKey, "recreated-without-lease");
+              CommitState beforeDeletedExpiry = controlSnapshot(plan, initializer, identity).state();
+              CommitState deletedLeaseRevoked = awaitLeaseRevoked(plan, initializer, identity,
+                  deletedLeaseId, beforeDeletedExpiry.finalizedSequence(), Duration.ofSeconds(30));
+              assertEquals(beforeDeletedExpiry.publishedRevision(), deletedLeaseRevoked.publishedRevision(),
+                  "expiry of an already unbound Lease must not mutate the recreated KV");
+              var recreated = rangeKey(server, recreatedKey).getKvs(0);
+              assertEquals(ByteString.copyFromUtf8("recreated-without-lease"), recreated.getValue());
+              assertEquals(0, recreated.getLease(),
+                  "a stale candidate must not attach or remove the unleased replacement");
+            });
+      }
+    }
+  }
+
+  static void verifyLargeLeaseRevokeDeletesEveryBindingInOneRevision() throws Exception {
+    RunContext run = prepareRevokeRun();
+    try (var cluster = TemporaryHBaseClusterProcess.start()) {
+      int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
+      for (int index = 0; index < LAYOUT_FILES.size(); index++) {
+        String layoutFile = LAYOUT_FILES.get(index);
+        String layout = index == 0 ? "HISTORY" : "NATIVE";
+        withRunningLayout(cluster, clientPort, layoutFile, "m4-large-revoke-" + layout,
+            (plan, initializer, identity, server) -> {
+              long leaseId = leaseIdForPrefix(run.prefix(), "large-revoke-" + layout);
+              grantThrough(server, leaseId, 30);
+              List<byte[]> keys = new ArrayList<>(128);
+              for (int indexInLease = 0; indexInLease < 128; indexInLease++) {
+                keys.add((run.prefix() + layout.toLowerCase(java.util.Locale.ROOT)
+                    + "/large/role/" + indexInLease).getBytes(StandardCharsets.UTF_8));
+              }
+              int registrationBatchSize = 8;
+              for (int offset = 0; offset < keys.size(); offset += registrationBatchSize) {
+                int end = Math.min(keys.size(), offset + registrationBatchSize);
+                Rpc.TxnResponse registered = putLeaseBoundKeysInOneTransaction(
+                    server, leaseId, keys.subList(offset, end));
+                assertTrue(registered.getSucceeded(),
+                    "each bounded registration batch must bind every requested key");
+              }
+              CommitState before = controlSnapshot(plan, initializer, identity).state();
+              revokeThrough(server, leaseId);
+              CommitState after = awaitLeaseRevoked(plan, initializer, identity, leaseId,
+                  before.finalizedSequence(), Duration.ofSeconds(30));
+              assertEquals(before.publishedRevision() + 1, after.publishedRevision(),
+                  "a large Lease revoke must publish one revision for the complete binding set");
+              awaitKeysAbsent(server, keys.toArray(byte[][]::new));
+              LeaseState revoked = leaseStateAt(plan, initializer, identity, leaseId,
+                  after.finalizedSequence());
+              assertEquals(LeaseState.Status.REVOKED, revoked.status());
+
+              long largeKeyLeaseId = leaseIdForPrefix(run.prefix(), "large-key-bytes-" + layout);
+              grantThrough(server, largeKeyLeaseId, 30);
+              List<byte[]> largeKeys = new ArrayList<>(64);
+              for (int indexInLease = 0; indexInLease < 64; indexInLease++) {
+                byte[] prefix = (run.prefix() + layout.toLowerCase(java.util.Locale.ROOT)
+                    + "/large/key-bytes/" + indexInLease + "/").getBytes(StandardCharsets.UTF_8);
+                byte[] key = new byte[30 * 1024];
+                System.arraycopy(prefix, 0, key, 0, prefix.length);
+                java.util.Arrays.fill(key, prefix.length, key.length, (byte) 'x');
+                largeKeys.add(key);
+              }
+              for (int offset = 0; offset < largeKeys.size(); offset += registrationBatchSize) {
+                int end = Math.min(largeKeys.size(), offset + registrationBatchSize);
+                Rpc.TxnResponse registered = putLeaseBoundKeysInOneTransaction(
+                    server, largeKeyLeaseId, largeKeys.subList(offset, end));
+                assertTrue(registered.getSucceeded(),
+                    "each bounded batch of large keys must bind successfully");
+              }
+              assertTrue(largeKeys.stream().mapToInt(key -> key.length).sum()
+                      > activation("1").maxEtcdRequestBytes(),
+                  "the total binding key bytes must exceed the per-request size limit");
+              StatusRuntimeException ttlFailure = assertThrows(StatusRuntimeException.class,
+                  () -> timeToLive(server, largeKeyLeaseId, true));
+              assertEquals(Status.Code.RESOURCE_EXHAUSTED, ttlFailure.getStatus().getCode(),
+                  "the oversized TimeToLive response must respect the RPC output limit");
+
+              CommitState beforeLargeRevoke = controlSnapshot(plan, initializer, identity).state();
+              revokeThrough(server, largeKeyLeaseId);
+              CommitState afterLargeRevoke = awaitLeaseRevoked(plan, initializer, identity,
+                  largeKeyLeaseId, beforeLargeRevoke.finalizedSequence(), Duration.ofSeconds(30));
+              assertEquals(beforeLargeRevoke.publishedRevision() + 1,
+                  afterLargeRevoke.publishedRevision(),
+                  "an admitted Lease must be revocable even when its total key bytes exceed one request");
+              awaitKeysAbsent(server, largeKeys.toArray(byte[][]::new));
+              assertEquals(LeaseState.Status.REVOKED,
+                  leaseStateAt(plan, initializer, identity, largeKeyLeaseId,
+                      afterLargeRevoke.finalizedSequence()).status());
+            });
+      }
+    }
+  }
+
+  static void verifyMixedLeaseLoadEvidence(Path takeoverTestDirectory) throws Exception {
+    RunContext run = prepareRun();
+    Path evidencePath = run.artifacts().resolve("j43/mixed-lease-load.json");
+    Files.createDirectories(evidencePath.getParent());
+    ObjectMapper mapper = new ObjectMapper();
+    ObjectNode evidence = mapper.createObjectNode();
+    evidence.put("schema", "etcd-hbase-m4-j29.4/v1");
+    evidence.put("status", "passed");
+    evidence.put("run_id", run.runId());
+    evidence.put("source_commit", gitHead(run.root()));
+    ObjectNode sourceFiles = sourceFileHashes(mapper, run.root());
+    evidence.set("source_files", sourceFiles);
+    evidence.put("source_sha256", sourceFilesSha256(sourceFiles));
+    evidence.put("scope", "public-local-minicluster");
+    evidence.put("protocol", "etcd-v3.5.23");
+    evidence.put("target_capacity_accepted", false);
+    evidence.put("physical_hbase_rpc_bytes_collected", false);
+    evidence.put("recovery_reserve_usage_measured", false);
+    evidence.put("listener_max_concurrent_requests", MIXED_LOAD_RESOURCES.maxConcurrentRequests());
+    evidence.put("listener_max_queued_requests", MIXED_LOAD_RESOURCES.maxQueuedRequests());
+    evidence.put("latency_sampling", "successful-client-rpcs");
+    evidence.set("recovery_reserve", recoveryReserveEvidence(mapper,
+        activation("1").maxEtcdRequestBytes()));
+
+    ArrayNode layouts = evidence.putArray("layouts");
+    try (var cluster = TemporaryHBaseClusterProcess.start()) {
+      int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
+      for (int index = 0; index < LAYOUT_FILES.size(); index++) {
+        String layoutFile = LAYOUT_FILES.get(index);
+        String layout = index == 0 ? "HISTORY" : "NATIVE";
+        ObjectNode layoutEvidence = mapper.createObjectNode();
+        layoutEvidence.put("layout", layout);
+        ArrayNode concurrencyRows = layoutEvidence.putArray("concurrency");
+        withRunningLayout(cluster, clientPort, layoutFile,
+            "m4-j29-mixed-" + layout.toLowerCase(java.util.Locale.ROOT), MIXED_LOAD_RESOURCES,
+            (plan, initializer, identity, server) -> {
+              concurrencyRows.add(runFixedMixedLoad(mapper, run, layout, 1, plan,
+                  initializer, identity, server));
+              concurrencyRows.add(runFixedMixedLoad(mapper, run, layout, 2, plan,
+                  initializer, identity, server));
+              concurrencyRows.add(runExpiryMixedLoad(mapper, run, layout, 4, plan,
+                  initializer, identity, server));
+            });
+        layouts.add(layoutEvidence);
+      }
+    }
+
+    Files.createDirectories(takeoverTestDirectory);
+    OwnerTakeoverEvidence takeover = verifyDualRuntimeForwardsKeepAliveOverMtlsAndFencesTheOldOwner(
+        takeoverTestDirectory.resolve("owner-takeover"));
+    ObjectNode takeoverEvidence = evidence.putObject("owner_takeover");
+    takeoverEvidence.put("scenario", "two-runtime-mtls-owner-takeover");
+    takeoverEvidence.put("old_owner_epoch", takeover.oldOwnerEpoch());
+    takeoverEvidence.put("new_owner_epoch", takeover.newOwnerEpoch());
+    takeoverEvidence.put("new_owner", "owner-b");
+    takeoverEvidence.put("new_owner_instance", takeover.newOwner());
+    takeoverEvidence.put("elapsed_millis", takeover.elapsedMillis());
+    mapper.writerWithDefaultPrettyPrinter().writeValue(evidencePath.toFile(), evidence);
+  }
+
+  private static ObjectNode runFixedMixedLoad(ObjectMapper mapper, RunContext run, String layout,
+      int concurrency, M3TableGroupPlan plan, HBaseBackendIdentityProvider initializer,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity, RuntimeServer server)
+      throws Exception {
+    List<Long> leaseIds = prepareMixedLoadLeases(server, run, layout, concurrency, "fixed");
+    var metrics = server.metrics().getFirst();
+    var before = metrics.leaseRenewals();
+    MixedLoadResult workload = runMixedLoadWorkers(server, run, layout, concurrency, 24,
+        leaseIds, 0, 0, plan, initializer, identity);
+    var after = metrics.leaseRenewals();
+    return mixedLoadRow(mapper, layout, concurrency, "fixed-iterations", 24,
+        workload, before, after);
+  }
+
+  private static ObjectNode runExpiryMixedLoad(ObjectMapper mapper, RunContext run, String layout,
+      int concurrency, M3TableGroupPlan plan, HBaseBackendIdentityProvider initializer,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity, RuntimeServer server)
+      throws Exception {
+    List<Long> leaseIds = prepareMixedLoadLeases(server, run, layout, concurrency, "expiry-overlap");
+    var metrics = server.metrics().getFirst();
+    var expiryBefore = metrics.leaseExpiry();
+    long expiringLeaseId = leaseIdForPrefix(run.prefix(), "mixed-expiry-" + layout);
+    grantThrough(server, expiringLeaseId, 5);
+    byte[] boundKey = (run.prefix() + "mixed/" + layout.toLowerCase(java.util.Locale.ROOT)
+        + "/expiry/role").getBytes(StandardCharsets.UTF_8);
+    putLeaseBoundKey(server, boundKey, expiringLeaseId);
+    CommitState beforeRenewal = controlSnapshot(plan, initializer, identity).state();
+    LeaseState initialLease = leaseStateAt(plan, initializer, identity, expiringLeaseId,
+        beforeRenewal.finalizedSequence());
+    List<Rpc.LeaseKeepAliveResponse> initialRenewal = keepAliveThrough(server, expiringLeaseId);
+    assertEquals(1, initialRenewal.size());
+    assertTrue(initialRenewal.getFirst().getTTL() > 0,
+        "the renewal that creates a stale expiry candidate must succeed");
+    CommitState afterRenewal = controlSnapshot(plan, initializer, identity).state();
+    LeaseState renewedLease = leaseStateAt(plan, initializer, identity, expiringLeaseId,
+        afterRenewal.finalizedSequence());
+    assertTrue(renewedLease.deadlineEpochMillis() > initialLease.deadlineEpochMillis(),
+        "the first expiry candidate must be older than the authoritative renewed deadline");
+
+    var renewalBefore = metrics.leaseRenewals();
+    MixedLoadResult workload = runMixedLoadWorkers(server, run, layout, concurrency, 0,
+        leaseIds, expiringLeaseId, afterRenewal.finalizedSequence(), plan, initializer, identity);
+    var renewalAfter = metrics.leaseRenewals();
+    var expiryAfter = awaitExpiryMetrics(metrics, expiryBefore, Duration.ofSeconds(10));
+    CommitState revokedState = workload.expiryState();
+    LeaseState revokedLease = leaseStateAt(plan, initializer, identity, expiringLeaseId,
+        revokedState.finalizedSequence());
+    assertEquals(LeaseState.Status.REVOKED, revokedLease.status());
+    long observedDelayMillis = Math.max(0,
+        workload.expiryObservedEpochMillis() - revokedLease.deadlineEpochMillis());
+
+    ObjectNode row = mixedLoadRow(mapper, layout, concurrency, "until-expiry-revocation", 0,
+        workload, renewalBefore, renewalAfter);
+    ObjectNode expiry = row.putObject("expiry");
+    long revocationCount = expiryAfter.revocations() - expiryBefore.revocations();
+    long staleCandidateCount = expiryAfter.staleCandidates() - expiryBefore.staleCandidates();
+    long missingDelaySamples = expiryAfter.missingDelaySamples() - expiryBefore.missingDelaySamples();
+    assertTrue(workload.activeWorkersAtExpiry() > 0,
+        "the expiry must be selected while Lease renewals and business puts are still running");
+    assertTrue(revocationCount > 0, "the mixed workload must include a committed expiry");
+    assertTrue(staleCandidateCount > 0, "the renewed Lease must leave a measured stale candidate");
+    assertTrue(expiryAfter.scanRows() > expiryBefore.scanRows(),
+        "expiry evidence must include bounded system-index scan rows");
+    assertTrue(expiryAfter.checkpointSequence() > 0,
+        "expiry evidence must include a durable checkpoint sequence");
+    expiry.put("expired_during_mixed_load", true);
+    expiry.put("active_workers_at_revoke", workload.activeWorkersAtExpiry());
+    expiry.put("revocations", revocationCount);
+    expiry.put("stale_candidates", staleCandidateCount);
+    expiry.put("candidates", expiryAfter.candidates() - expiryBefore.candidates());
+    expiry.put("scan_rows", expiryAfter.scanRows() - expiryBefore.scanRows());
+    expiry.put("scan_bytes", expiryAfter.scanBytes() - expiryBefore.scanBytes());
+    expiry.put("retries", expiryAfter.retries() - expiryBefore.retries());
+    expiry.put("trusted_delay_samples", revocationCount - missingDelaySamples);
+    expiry.put("missing_trusted_delay_samples", missingDelaySamples);
+    expiry.put("trusted_delay_total_millis",
+        expiryAfter.totalDelayMillis() - expiryBefore.totalDelayMillis());
+    expiry.put("observed_deadline_to_revoke_millis", observedDelayMillis);
+    expiry.put("owner_epoch", expiryAfter.ownerEpoch());
+    expiry.put("checkpoint_sequence", expiryAfter.checkpointSequence());
+    expiry.put("window_stop_exclusive", expiryAfter.windowStopExclusive());
+    return row;
+  }
+
+  private static List<Long> prepareMixedLoadLeases(RuntimeServer server, RunContext run,
+      String layout, int concurrency, String phase) throws Exception {
+    List<Long> leaseIds = new ArrayList<>(concurrency);
+    for (int worker = 0; worker < concurrency; worker++) {
+      long leaseId = leaseIdForPrefix(run.prefix(),
+          "mixed-" + layout + "-" + phase + "-concurrency-" + concurrency + "-worker-" + worker);
+      grantThrough(server, leaseId, 120);
+      byte[] key = (run.prefix() + "mixed/" + layout.toLowerCase(java.util.Locale.ROOT)
+          + "/" + phase + "/concurrency/" + concurrency + "/role/" + worker)
+          .getBytes(StandardCharsets.UTF_8);
+      putLeaseBoundKey(server, key, leaseId);
+      leaseIds.add(leaseId);
+    }
+    return List.copyOf(leaseIds);
+  }
+
+  private static MixedLoadResult runMixedLoadWorkers(RuntimeServer server, RunContext run,
+      String layout, int concurrency, int fixedIterations, List<Long> leaseIds,
+      long expiringLeaseId, long afterExpirySequence, M3TableGroupPlan plan,
+      HBaseBackendIdentityProvider initializer,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity) throws Exception {
+    boolean runUntilExpiry = expiringLeaseId != 0;
+    CountDownLatch clientsReady = new CountDownLatch(concurrency);
+    CountDownLatch startGate = new CountDownLatch(1);
+    CountDownLatch workersStarted = new CountDownLatch(concurrency);
+    AtomicBoolean keepRunning = new AtomicBoolean(true);
+    AtomicInteger activeWorkers = new AtomicInteger();
+    AtomicLong putSequence = new AtomicLong();
+    AtomicLong keepAliveAttempts = new AtomicLong();
+    AtomicLong keepAliveResourceExhausted = new AtomicLong();
+    AtomicLong putAttempts = new AtomicLong();
+    AtomicLong putResourceExhausted = new AtomicLong();
+    AtomicReference<Throwable> firstFailure = new AtomicReference<>();
+    ConcurrentLinkedQueue<Long> keepAliveLatencies = new ConcurrentLinkedQueue<>();
+    ConcurrentLinkedQueue<Long> putLatencies = new ConcurrentLinkedQueue<>();
+    ExecutorService executor = Executors.newFixedThreadPool(concurrency);
+    List<Future<?>> workers = new ArrayList<>(concurrency);
+    long startedNanos = 0;
+    long expiryObservedEpochMillis = 0;
+    int activeWorkersAtExpiry = 0;
+    CommitState expiryState = null;
+
+    try {
+      for (int worker = 0; worker < concurrency; worker++) {
+        int workerIndex = worker;
+        workers.add(executor.submit(() -> {
+          boolean signaledReady = false;
+          boolean enteredLoad = false;
+          String currentOperation = "connect";
+          int iteration = 0;
+          try (MixedLoadClient client = new MixedLoadClient(server)) {
+            clientsReady.countDown();
+            signaledReady = true;
+            if (!startGate.await(30, TimeUnit.SECONDS)) {
+              throw new AssertionError("mixed-load start gate did not open");
+            }
+            activeWorkers.incrementAndGet();
+            enteredLoad = true;
+            workersStarted.countDown();
+            while (keepRunning.get() && (runUntilExpiry || iteration < fixedIterations)) {
+              currentOperation = "KeepAlive";
+              long keepAliveStarted = System.nanoTime();
+              keepAliveAttempts.incrementAndGet();
+              try {
+                Rpc.LeaseKeepAliveResponse renewal = client.keepAlive(leaseIds.get(workerIndex));
+                keepAliveLatencies.add(System.nanoTime() - keepAliveStarted);
+                if (renewal.getTTL() <= 0) {
+                  throw new AssertionError("active mixed-load Lease returned a zero TTL");
+                }
+              } catch (StatusRuntimeException failure) {
+                if (failure.getStatus().getCode() != Status.Code.RESOURCE_EXHAUSTED) throw failure;
+                keepAliveResourceExhausted.incrementAndGet();
+                client.reopenKeepAliveAfterResourceExhaustion();
+              }
+
+              currentOperation = "business Put";
+              long sequence = putSequence.incrementAndGet();
+              byte[] key = (run.prefix() + "mixed/" + layout.toLowerCase(java.util.Locale.ROOT)
+                  + "/c" + concurrency + "/worker/" + workerIndex + "/" + sequence)
+                  .getBytes(StandardCharsets.UTF_8);
+              byte[] value = ("mixed-value-" + sequence).getBytes(StandardCharsets.UTF_8);
+              long putStarted = System.nanoTime();
+              putAttempts.incrementAndGet();
+              try {
+                client.put(key, value);
+                putLatencies.add(System.nanoTime() - putStarted);
+              } catch (StatusRuntimeException failure) {
+                if (failure.getStatus().getCode() != Status.Code.RESOURCE_EXHAUSTED) throw failure;
+                putResourceExhausted.incrementAndGet();
+              }
+              iteration++;
+            }
+          } catch (Throwable failure) {
+            firstFailure.compareAndSet(null, failure);
+            keepRunning.set(false);
+            throw new RuntimeException("mixed Lease and business workload failed for worker "
+                + workerIndex + " at iteration " + iteration + " during " + currentOperation
+                + "; runtime_ready=" + server.dataReady()
+                + "; keepalive_metrics=" + server.metrics().getFirst().leaseRenewals()
+                + "; expiry_metrics=" + server.metrics().getFirst().leaseExpiry(), failure);
+          } finally {
+            if (!signaledReady) clientsReady.countDown();
+            if (enteredLoad) activeWorkers.decrementAndGet();
+          }
+        }));
+      }
+
+      assertTrue(clientsReady.await(60, TimeUnit.SECONDS),
+          "all mixed-load gRPC clients must be ready before the run starts");
+      startedNanos = System.nanoTime();
+      startGate.countDown();
+      if (runUntilExpiry) {
+        assertTrue(workersStarted.await(30, TimeUnit.SECONDS),
+            "all mixed-load workers must start before waiting for expiry");
+        try {
+          expiryState = awaitLeaseRevoked(plan, initializer, identity, expiringLeaseId,
+              afterExpirySequence, Duration.ofSeconds(45), firstFailure);
+        } catch (AssertionError timeoutOrFailure) {
+          Throwable workerFailure = firstFailure.get();
+          if (workerFailure != null) {
+            throw new AssertionError("mixed-load worker failed before expiry completed", workerFailure);
+          }
+          throw timeoutOrFailure;
+        }
+        expiryObservedEpochMillis = System.currentTimeMillis();
+        activeWorkersAtExpiry = activeWorkers.get();
+        assertTrue(activeWorkersAtExpiry > 0,
+            "the expiry must finish before the mixed-load workers are stopped");
+        keepRunning.set(false);
+      }
+
+      long workerTimeoutSeconds = Math.min(MIXED_LOAD_WORKER_MAX_TIMEOUT_SECONDS,
+          Math.max(MIXED_LOAD_WORKER_BASE_TIMEOUT_SECONDS
+                  + MIXED_LOAD_WORKER_TIMEOUT_PER_ITERATION_SECONDS * fixedIterations,
+              MIXED_LOAD_KEEPALIVE_RESPONSE_TIMEOUT_SECONDS + 15L));
+      for (Future<?> worker : workers) worker.get(workerTimeoutSeconds, TimeUnit.SECONDS);
+      keepRunning.set(false);
+      Throwable workerFailure = firstFailure.get();
+      if (workerFailure != null) throw new AssertionError("mixed-load worker failed", workerFailure);
+      return new MixedLoadResult(System.nanoTime() - startedNanos,
+          List.copyOf(keepAliveLatencies), List.copyOf(putLatencies),
+          keepAliveAttempts.get(), keepAliveResourceExhausted.get(),
+          putAttempts.get(), putResourceExhausted.get(), activeWorkersAtExpiry,
+          expiryObservedEpochMillis, expiryState);
+    } finally {
+      keepRunning.set(false);
+      startGate.countDown();
+      executor.shutdownNow();
+      assertTrue(executor.awaitTermination(60, TimeUnit.SECONDS),
+          "mixed-load worker threads must finish before the runtime closes");
+    }
+  }
+
+  private static ObjectNode mixedLoadRow(ObjectMapper mapper, String layout, int concurrency,
+      String runMode, int iterationsPerWorker, MixedLoadResult workload,
+      io.etcdhbase.server.observability.RequestMetrics.LeaseRenewalSnapshot before,
+      io.etcdhbase.server.observability.RequestMetrics.LeaseRenewalSnapshot after) {
+    long requests = after.requests() - before.requests();
+    long responses = after.responses() - before.responses();
+    long selected = after.selected() - before.selected();
+    long hbaseOperations = after.hbaseClientOperations() - before.hbaseClientOperations();
+    long payloadBytes = after.logicalHBaseRequestPayloadBytes()
+        - before.logicalHBaseRequestPayloadBytes();
+    var queueBefore = before.stages().get(
+        io.etcdhbase.server.observability.RequestMetrics.LeaseRenewalStage.QUEUE);
+    var queueAfter = after.stages().get(
+        io.etcdhbase.server.observability.RequestMetrics.LeaseRenewalStage.QUEUE);
+    long queueSamples = queueAfter.count() - queueBefore.count();
+    long queueTotalNanos = queueAfter.totalNanos() - queueBefore.totalNanos();
+    assertTrue(requests > 0, "the mixed phase must issue real KeepAlive RPCs");
+    assertTrue(responses > 0 && selected >= responses && selected <= requests);
+    assertTrue(queueSamples > 0 && queueSamples <= requests);
+    assertEquals(responses, workload.keepAliveLatencies().size());
+    assertEquals(workload.keepAliveAttempts(), responses + workload.keepAliveResourceExhausted());
+    assertEquals(workload.putAttempts(),
+        workload.putLatencies().size() + workload.putResourceExhausted());
+    assertEquals(workload.keepAliveAttempts(), workload.putAttempts());
+    assertTrue(requests <= workload.keepAliveAttempts());
+    if (runMode.equals("fixed-iterations")) {
+      assertEquals(concurrency * iterationsPerWorker, workload.putAttempts(),
+          "fixed load phases must attempt the same operation count per worker");
+    }
+    assertTrue(hbaseOperations > 0, "KeepAlive must account owner-side logical HBase operations");
+    assertTrue(payloadBytes > 0, "KeepAlive must account encoded HBase request payload bytes");
+
+    ObjectNode row = mapper.createObjectNode();
+    row.put("layout", layout);
+    row.put("concurrency", concurrency);
+    row.put("run_mode", runMode);
+    row.put("iterations_per_worker", iterationsPerWorker);
+    row.put("elapsed_nanos", workload.elapsedNanos());
+    row.put("keepalive_requests", requests);
+    row.put("keepalive_client_attempts", workload.keepAliveAttempts());
+    row.put("keepalive_client_resource_exhausted", workload.keepAliveResourceExhausted());
+    row.put("keepalive_responses", responses);
+    row.put("selected_renewals", selected);
+    row.put("business_puts", workload.putLatencies().size());
+    row.put("business_put_attempts", workload.putAttempts());
+    row.put("business_put_resource_exhausted", workload.putResourceExhausted());
+    row.put("combined_operations", responses + workload.putLatencies().size());
+    row.put("keepalive_client_rpc_p99_samples", workload.keepAliveLatencies().size());
+    row.set("keepalive_client_rpc_latency_nanos",
+        latencySummary(mapper, workload.keepAliveLatencies()));
+    row.set("business_put_client_rpc_latency_nanos", latencySummary(mapper, workload.putLatencies()));
+    row.put("owner_queue_wait_samples", queueSamples);
+    row.put("owner_queue_wait_total_nanos", queueTotalNanos);
+    row.put("owner_queue_wait_mean_nanos", queueTotalNanos / queueSamples);
+    row.put("renewal_logical_hbase_client_operations", hbaseOperations);
+    row.put("renewal_logical_hbase_request_payload_bytes", payloadBytes);
+    row.put("logical_hbase_operations_per_server_keepalive_request", (double) hbaseOperations / requests);
+    row.put("logical_hbase_request_payload_bytes_per_server_keepalive_request", (double) payloadBytes / requests);
+    row.put("unknown_outcomes", after.unknownOutcomes() - before.unknownOutcomes());
+    row.put("request_proto_bytes", after.requestBytes() - before.requestBytes());
+    row.put("response_proto_bytes", after.responseBytes() - before.responseBytes());
+    return row;
+  }
+
+  private static ObjectNode latencySummary(ObjectMapper mapper, List<Long> samples) {
+    if (samples.isEmpty()) throw new AssertionError("latency evidence requires at least one sample");
+    List<Long> sorted = new ArrayList<>(samples);
+    Collections.sort(sorted);
+    ObjectNode summary = mapper.createObjectNode();
+    summary.put("samples", sorted.size());
+    summary.put("p50_nanos", percentile(sorted, 50));
+    summary.put("p95_nanos", percentile(sorted, 95));
+    summary.put("p99_nanos", percentile(sorted, 99));
+    return summary;
+  }
+
+  private static long percentile(List<Long> sorted, int percentile) {
+    int index = Math.max(0, (int) Math.ceil(percentile * sorted.size() / 100.0) - 1);
+    return sorted.get(index);
+  }
+
+  private static io.etcdhbase.server.observability.RequestMetrics.LeaseExpirySnapshot awaitExpiryMetrics(
+      io.etcdhbase.server.observability.RequestMetrics metrics,
+      io.etcdhbase.server.observability.RequestMetrics.LeaseExpirySnapshot before,
+      Duration timeout) throws InterruptedException {
+    long deadline = Math.addExact(System.nanoTime(), timeout.toNanos());
+    io.etcdhbase.server.observability.RequestMetrics.LeaseExpirySnapshot observed;
+    while (System.nanoTime() < deadline) {
+      observed = metrics.leaseExpiry();
+      if (observed.revocations() > before.revocations()
+          && observed.staleCandidates() > before.staleCandidates()
+          && observed.checkpointSequence() > 0) {
+        return observed;
+      }
+      TimeUnit.MILLISECONDS.sleep(25);
+    }
+    observed = metrics.leaseExpiry();
+    throw new AssertionError("expiry metrics did not record a stale candidate, revocation, and checkpoint: "
+        + observed);
+  }
+
+  private static ObjectNode recoveryReserveEvidence(ObjectMapper mapper,
+      int maximumEtcdRequestBytes) {
+    var capacity = LeaseBudgetProfile.perGroupCapacity(maximumEtcdRequestBytes);
+    var mutationReservation = LeaseBudgetProfile.ownerMutationReservation(maximumEtcdRequestBytes);
+    ObjectNode reserve = mapper.createObjectNode();
+    reserve.put("scope", "configured-per-table-group");
+    reserve.put("requests", capacity.requests());
+    reserve.put("queued", capacity.queued());
+    reserve.put("operations", capacity.operations());
+    reserve.put("scanners", capacity.scanners());
+    reserve.put("cleanup", capacity.cleanup());
+    reserve.put("queued_bytes", capacity.queuedBytes());
+    reserve.put("memory_bytes", capacity.memoryBytes());
+    reserve.put("lease_owner_mutation_page_bytes", mutationReservation.page());
+    reserve.put("expiry_worker_memory_bytes", LeaseBudgetProfile.EXPIRY_WORKER_MEMORY.total());
+    reserve.put("expiry_worker_read_physical_rows",
+        LeaseBudgetProfile.EXPIRY_WORKER_READ_LIMITS.physicalRows());
+    reserve.put("expiry_worker_read_cell_bytes",
+        LeaseBudgetProfile.EXPIRY_WORKER_READ_LIMITS.cellBytes());
+    reserve.put("runtime_usage_peak_measured", false);
+    return reserve;
+  }
+
+  private static ObjectNode sourceFileHashes(ObjectMapper mapper, Path repositoryRoot) throws Exception {
+    ObjectNode hashes = mapper.createObjectNode();
+    for (String relativePath : MIXED_EVIDENCE_SOURCE_FILES) {
+      hashes.put(relativePath, java.util.HexFormat.of().formatHex(
+          MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(repositoryRoot.resolve(relativePath)))));
+    }
+    return hashes;
+  }
+
+  private static String sourceFilesSha256(ObjectNode sourceFiles) throws Exception {
+    MessageDigest digest = MessageDigest.getInstance("SHA-256");
+    for (String relativePath : MIXED_EVIDENCE_SOURCE_FILES) {
+      digest.update(relativePath.getBytes(StandardCharsets.UTF_8));
+      digest.update((byte) 0);
+      digest.update(sourceFiles.get(relativePath).asText().getBytes(StandardCharsets.US_ASCII));
+      digest.update((byte) 0);
+    }
+    return java.util.HexFormat.of().formatHex(digest.digest());
+  }
+
+  private static String gitHead(Path repositoryRoot) throws Exception {
+    Process process = new ProcessBuilder("git", "-C", repositoryRoot.toString(), "rev-parse", "HEAD")
+        .redirectErrorStream(true).start();
+    String head = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).strip();
+    if (!process.waitFor(10, TimeUnit.SECONDS) || process.exitValue() != 0
+        || !head.matches("[0-9a-f]{40}")) {
+      process.destroyForcibly();
+      throw new IOException("could not bind mixed-load evidence to the source commit");
+    }
+    return head;
+  }
+
+  private static void withRunningLayout(TemporaryHBaseClusterProcess cluster, int clientPort,
+      String layoutFile, String listenerName, M4RuntimeAction action) throws Exception {
+    withRunningLayout(cluster, clientPort, layoutFile, listenerName, RESOURCES, action);
+  }
+
+  private static void withRunningLayout(TemporaryHBaseClusterProcess cluster, int clientPort,
+      String layoutFile, String listenerName, RuntimeConfiguration.ResourceBudgets resources,
+      M4RuntimeAction action) throws Exception {
+    InitializationConfiguration initialization = initialization(layoutFile, clientPort);
+    var source = TableGroupPlanFactory.create(initialization, "local", null);
+    M3TableGroupPlan plan = M3TableGroupPlan.from(source);
+    var authScope = new io.etcdhbase.spi.identity.AuthenticationScope(
+        source.tableGroupId(), source.hbaseProfile().id());
+    try (var initializer = new HBaseBackendIdentityProvider(source.identityProviderId(), authScope,
+            cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+            (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+            1, 1, Duration.ofSeconds(30));
+         var credentials = new io.etcdhbase.spi.identity.BackendCredentials(listenerName, new char[0])) {
+      var identity = initializer.authenticate(credentials, authScope).toCompletableFuture()
+          .get(30, TimeUnit.SECONDS);
+      M3RuntimeConfiguration activation = activation("1");
+      M3TableGroupInitializer.initializeFresh(plan,
+          "sha256:" + source.fingerprint(), identity, initializer, activation.pinConfiguration());
+      RuntimeConfiguration configuration = new RuntimeConfiguration(initialization.schemaVersion(),
+          List.of(new RuntimeConfiguration.Listener(listenerName, "127.0.0.1", 0,
+              source.tableGroupId())), initialization.hbaseProfiles(), initialization.saltProfiles(),
+          initialization.tableGroups(), resources);
+      try (RuntimeServer server = RuntimeServer.startM3(configuration, activation)) {
+        assertTrue(server.dataReady(), "M4 Lease test runtime must be ready before requests are sent");
+        action.run(plan, initializer, identity, server);
+      }
+    }
+  }
+
+  @FunctionalInterface
+  private interface M4RuntimeAction {
+    void run(M3TableGroupPlan plan, HBaseBackendIdentityProvider initializer,
+        io.etcdhbase.spi.identity.AuthorizedBackendIdentity identity, RuntimeServer server)
+        throws Exception;
   }
 
   private static void runKeepAliveLayout(TemporaryHBaseClusterProcess cluster, int clientPort,
@@ -967,6 +1984,109 @@ class M4LeaseRpcIT {
         }
       }
       verifyClockReadiness(plan, initializer, identity, configuration, activation("3"));
+    }
+  }
+
+  private static void runRevokeLayout(TemporaryHBaseClusterProcess cluster, int clientPort,
+      String layoutFile, String layout, RunContext run) throws Exception {
+    InitializationConfiguration initialization = initialization(layoutFile, clientPort);
+    var source = TableGroupPlanFactory.create(initialization, "local", null);
+    M3TableGroupPlan plan = M3TableGroupPlan.from(source);
+    var authScope = new io.etcdhbase.spi.identity.AuthenticationScope(
+        source.tableGroupId(), source.hbaseProfile().id());
+    try (var initializer = new HBaseBackendIdentityProvider(source.identityProviderId(), authScope,
+            cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+            (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+            1, 1, Duration.ofSeconds(30));
+         var credentials = new io.etcdhbase.spi.identity.BackendCredentials("m4-revoke", new char[0])) {
+      var identity = initializer.authenticate(credentials, authScope).toCompletableFuture()
+          .get(30, TimeUnit.SECONDS);
+      M3RuntimeConfiguration firstActivation = activation("1");
+      var initialized = M3TableGroupInitializer.initializeFresh(plan,
+          "sha256:" + source.fingerprint(), identity, initializer, firstActivation.pinConfiguration());
+      RuntimeConfiguration configuration = new RuntimeConfiguration(initialization.schemaVersion(),
+          List.of(new RuntimeConfiguration.Listener("m4-revoke", "127.0.0.1", 0,
+              source.tableGroupId())), initialization.hbaseProfiles(), initialization.saltProfiles(),
+          initialization.tableGroups(), RESOURCES);
+
+      try (RuntimeServer server = RuntimeServer.startM3(configuration, firstActivation)) {
+        assertTrue(server.dataReady());
+        runRevokeTargetDriver(run, layout, server.boundListeners().getFirst().port());
+        CommitState selected = controlSnapshot(plan, initializer, identity).state();
+        assertEquals(7, selected.publishedRevision(),
+            "two bound-key Revoke transactions must each use one KV revision");
+        assertTrue(selected.supportsLeaseExpiryCheckpoints());
+        var expiry = server.metrics().getFirst().leaseExpiry();
+        assertTrue(expiry.revocations() > 0, "automatic expiry must commit through the worker");
+        assertTrue(expiry.scanRows() > 0, "expiry must scan the bounded system index");
+        assertTrue(expiry.checkpointSequence() > 0, "expiry progress must be durable");
+        assertEquals(initialized.clusterId(), timeToLive(server,
+            leaseIdForPrefix(run.prefix(), "expiry-bound"), false).getHeader().getClusterId());
+      }
+    }
+  }
+
+  private static void verifyExpiryCheckpointResumesInLayout(TemporaryHBaseClusterProcess cluster,
+      int clientPort, String layoutFile, String layout, RunContext run) throws Exception {
+    InitializationConfiguration initialization = initialization(layoutFile, clientPort);
+    var source = TableGroupPlanFactory.create(initialization, "local", null);
+    M3TableGroupPlan plan = M3TableGroupPlan.from(source);
+    var authScope = new io.etcdhbase.spi.identity.AuthenticationScope(
+        source.tableGroupId(), source.hbaseProfile().id());
+    try (var initializer = new HBaseBackendIdentityProvider(source.identityProviderId(), authScope,
+            cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+            (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+            1, 1, Duration.ofSeconds(30));
+         var credentials = new io.etcdhbase.spi.identity.BackendCredentials("m4-expiry-restart", new char[0])) {
+      var identity = initializer.authenticate(credentials, authScope).toCompletableFuture()
+          .get(30, TimeUnit.SECONDS);
+      RuntimeConfiguration configuration = new RuntimeConfiguration(initialization.schemaVersion(),
+          List.of(new RuntimeConfiguration.Listener("m4-expiry-restart", "127.0.0.1", 0,
+              source.tableGroupId())), initialization.hbaseProfiles(), initialization.saltProfiles(),
+          initialization.tableGroups(), RESOURCES);
+      M3RuntimeConfiguration firstActivation = activation("1");
+      var initialized = M3TableGroupInitializer.initializeFresh(plan,
+          "sha256:" + source.fingerprint(), identity, initializer, firstActivation.pinConfiguration());
+
+      long leaseId = leaseIdForPrefix(run.prefix(), "restart-" + layout);
+      byte[] firstKey = (run.prefix() + layout.toLowerCase(java.util.Locale.ROOT) + "/role/a")
+          .getBytes(StandardCharsets.UTF_8);
+      byte[] secondKey = (run.prefix() + layout.toLowerCase(java.util.Locale.ROOT) + "/role/b")
+          .getBytes(StandardCharsets.UTF_8);
+      CommitState beforeRestart;
+      RuntimeServer first = RuntimeServer.startM3(configuration, firstActivation);
+      try {
+        assertTrue(first.dataReady());
+        LeaseExpiryCheckpoint initialCheckpoint = awaitExpiryCheckpoint(
+            plan, initializer, identity, 1);
+        assertTrue(initialCheckpoint.sequence() > 0);
+        assertEquals(initialized.clusterId(), grantThrough(first, leaseId, 5).getHeader().getClusterId());
+        putLeaseBoundKey(first, firstKey, leaseId);
+        putLeaseBoundKey(first, secondKey, leaseId);
+        beforeRestart = controlSnapshot(plan, initializer, identity).state();
+        awaitExpiryCheckpoint(plan, initializer, identity, beforeRestart.finalizedSequence());
+      } finally {
+        first.close();
+      }
+
+      M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
+      M3RuntimeConfiguration secondActivation = activation("2");
+      try (RuntimeServer restarted = RuntimeServer.startM3(configuration, secondActivation)) {
+        assertTrue(restarted.dataReady());
+        awaitKeysAbsent(restarted, firstKey, secondKey);
+        CommitState afterExpiry = controlSnapshot(plan, initializer, identity).state();
+        assertEquals(beforeRestart.publishedRevision() + 1, afterExpiry.publishedRevision(),
+            "a resumed expiry scan must atomically delete the full Lease binding set");
+        assertTrue(afterExpiry.publishedSequence() > beforeRestart.publishedSequence());
+        assertEquals(-1, timeToLive(restarted, leaseId, true).getTTL());
+        LeaseExpiryCheckpoint checkpoint = latestExpiryCheckpoint(plan, initializer, identity,
+            afterExpiry.finalizedSequence());
+        assertTrue(checkpoint.sequence() <= afterExpiry.finalizedSequence());
+        assertTrue(checkpoint.ownerEpoch() > 0);
+        assertTrue((layout.equals("HISTORY") && layoutFile.equals("history-table.json"))
+            || (layout.equals("NATIVE") && layoutFile.equals("native-cell-versions.json")),
+            "checkpoint recovery must exercise the named HBase history layout");
+      }
     }
   }
 
@@ -1070,9 +2190,12 @@ class M4LeaseRpcIT {
       RuntimeConfiguration configuration, M3RuntimeConfiguration activation) throws Exception {
     M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, initializer, identity);
     var clockHealthy = new AtomicBoolean(true);
-    LeaseTimeSource timeSource = () -> clockHealthy.get()
-        ? new LeaseTimeObservation(10_000, 12_000, true)
-        : new LeaseTimeObservation(0, 0, false);
+    LeaseTimeSource timeSource = () -> {
+      if (!clockHealthy.get()) return new LeaseTimeObservation(0, 0, false);
+      long currentTimeMillis = System.currentTimeMillis();
+      return new LeaseTimeObservation(currentTimeMillis,
+          Math.addExact(currentTimeMillis, 2_000), true);
+    };
     LongFunction<LeaseTimeSource> factory = ignored -> timeSource;
 
     try (RuntimeServer runtime = RuntimeServer.startM3WithLeaseTimeSource(
@@ -1364,8 +2487,8 @@ class M4LeaseRpcIT {
         base.startupTimeoutMs(), base.shutdownTimeoutMs(), base.memoryBytes(),
         base.maxEtcdRequestBytes(), base.pinShards(), base.pinSlotsPerShard(), base.pinLeaseMs(),
         base.readCacheEnabled(), base.m4LeaseApiEnabled(), base.leaseMinTtlSeconds(),
-        base.leaseClockUncertaintyMs(), base.leaseMaximumBindings(), base.leaseMaximumKeyBytes(),
-        base.leaseMaximumRevokeCostBytes(), instanceId, forwarding);
+        base.leaseClockUncertaintyMs(), base.leaseClockMaxDriftPpm(), base.leaseMaximumBindings(),
+        base.leaseMaximumKeyBytes(), base.leaseMaximumRevokeCostBytes(), instanceId, forwarding);
   }
 
   private static Rpc.PutResponse putThrough(RuntimeServer server, String key, long expectedMemberId)
@@ -1399,12 +2522,48 @@ class M4LeaseRpcIT {
 
   private static Rpc.LeaseGrantResponse grantThrough(RuntimeServer server, long leaseId, int ttl)
       throws Exception {
-    var channel = NettyChannelBuilder.forAddress(
-            "127.0.0.1", server.boundListeners().getFirst().port())
+    return grantThrough(server.boundListeners().getFirst().port(), leaseId, ttl);
+  }
+
+  private static Rpc.LeaseGrantResponse grantThrough(int port, long leaseId, int ttl)
+      throws Exception {
+    var channel = NettyChannelBuilder.forAddress("127.0.0.1", port)
         .usePlaintext().build();
     try {
       return LeaseGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS)
           .leaseGrant(Rpc.LeaseGrantRequest.newBuilder().setID(leaseId).setTTL(ttl).build());
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+    }
+  }
+
+  private static Rpc.LeaseRevokeResponse revokeThrough(RuntimeServer server, long leaseId)
+      throws Exception {
+    var channel = NettyChannelBuilder.forAddress(
+        "127.0.0.1", server.boundListeners().getFirst().port()).usePlaintext().build();
+    try {
+      return LeaseGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS)
+          .leaseRevoke(Rpc.LeaseRevokeRequest.newBuilder().setID(leaseId).build());
+    } finally {
+      channel.shutdownNow();
+      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
+    }
+  }
+
+  private static Rpc.TxnResponse putLeaseBoundKeysInOneTransaction(
+      RuntimeServer server, long leaseId, List<byte[]> keys) throws Exception {
+    var channel = NettyChannelBuilder.forAddress(
+        "127.0.0.1", server.boundListeners().getFirst().port()).usePlaintext().build();
+    try {
+      Rpc.TxnRequest.Builder request = Rpc.TxnRequest.newBuilder();
+      for (byte[] key : keys) {
+        Rpc.PutRequest put = Rpc.PutRequest.newBuilder().setKey(ByteString.copyFrom(key))
+            .setValue(ByteString.copyFromUtf8("large-lease-value")).setLease(leaseId).build();
+        request.addSuccess(Rpc.RequestOp.newBuilder().setRequestPut(put));
+      }
+      return KVGrpc.newBlockingStub(channel).withDeadlineAfter(60, TimeUnit.SECONDS)
+          .txn(request.build());
     } finally {
       channel.shutdownNow();
       assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
@@ -1441,37 +2600,6 @@ class M4LeaseRpcIT {
       assertTrue(terminated.await(60, TimeUnit.SECONDS), "KeepAlive stream did not terminate");
       if (failure.get() != null) throw new AssertionError("KeepAlive stream failed", failure.get());
       return List.copyOf(responses);
-    } finally {
-      channel.shutdownNow();
-      assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
-    }
-  }
-
-  private static Status.Code keepAliveFailureCode(RuntimeServer server, long leaseId)
-      throws Exception {
-    var channel = NettyChannelBuilder.forAddress(
-            "127.0.0.1", server.boundListeners().getFirst().port())
-        .usePlaintext().build();
-    var responses = new CopyOnWriteArrayList<Rpc.LeaseKeepAliveResponse>();
-    var failure = new AtomicReference<Throwable>();
-    var terminated = new CountDownLatch(1);
-    try {
-      StreamObserver<Rpc.LeaseKeepAliveRequest> sender = LeaseGrpc.newStub(channel)
-          .withDeadlineAfter(30, TimeUnit.SECONDS).leaseKeepAlive(new StreamObserver<>() {
-            @Override public void onNext(Rpc.LeaseKeepAliveResponse response) { responses.add(response); }
-            @Override public void onError(Throwable cause) {
-              failure.set(cause);
-              terminated.countDown();
-            }
-            @Override public void onCompleted() { terminated.countDown(); }
-          });
-      sender.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(leaseId).build());
-      sender.onCompleted();
-      assertTrue(terminated.await(30, TimeUnit.SECONDS), "KeepAlive failure stream did not terminate");
-      assertTrue(responses.isEmpty(), "an expired ACTIVE Lease must not return a successful response");
-      Throwable observed = failure.get();
-      assertTrue(observed != null, "an expired ACTIVE Lease must terminate with a failure");
-      return Status.fromThrowable(observed).getCode();
     } finally {
       channel.shutdownNow();
       assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS));
@@ -1771,6 +2899,14 @@ class M4LeaseRpcIT {
         parent.prefix() + "dual-process/" + phase + "/", artifacts.resolve("native-trace.jsonl"));
   }
 
+  private static RunContext prepareRevokeRun() throws IOException {
+    RunContext parent = prepareRun();
+    Path artifacts = parent.artifacts().resolve("j43");
+    Files.createDirectories(artifacts);
+    return new RunContext(parent.root(), artifacts, parent.runId(),
+        parent.prefix() + "revoke/", artifacts.resolve("native-trace.jsonl"));
+  }
+
   private static void prepareNativeEvidence(RunContext run) throws Exception {
     if (!Files.exists(run.nativeTrace())) {
       runDriver(run, run.artifacts().resolve("native.log"), "run",
@@ -1795,6 +2931,16 @@ class M4LeaseRpcIT {
     if (!Files.exists(run.nativeTrace())) {
       runDriverWithScenario(run, run.artifacts().resolve("native.log"),
           "m4-lease-keepalive.yaml", "run", "--native-data-dir",
+          run.artifacts().resolve("native-data").toString(), "--scope", "native-etcd",
+          "--prefix", run.prefix(), "--trace", run.nativeTrace().toString(), "--metadata",
+          run.artifacts().resolve("native-metadata.json").toString());
+    }
+  }
+
+  private static void prepareNativeRevokeEvidence(RunContext run) throws Exception {
+    if (!Files.exists(run.nativeTrace())) {
+      runDriverWithScenario(run, run.artifacts().resolve("native.log"),
+          "m4-lease-revoke.yaml", "run", "--native-data-dir",
           run.artifacts().resolve("native-data").toString(), "--scope", "native-etcd",
           "--prefix", run.prefix(), "--trace", run.nativeTrace().toString(), "--metadata",
           run.artifacts().resolve("native-metadata.json").toString());
@@ -1859,6 +3005,16 @@ class M4LeaseRpcIT {
     }
   }
 
+  private static void runRevokeTargetDriver(RunContext run, String layout, int port)
+      throws Exception {
+    String suffix = layout.toLowerCase(java.util.Locale.ROOT);
+    runDriverWithScenario(run, run.artifacts().resolve("target-" + suffix + ".log"),
+        "m4-lease-revoke.yaml", "run", "--endpoint", "127.0.0.1:" + port,
+        "--scope", "target-hbase", "--layout", layout, "--prefix", run.prefix(), "--trace",
+        run.artifacts().resolve("target-" + suffix + "-trace.jsonl").toString(), "--metadata",
+        run.artifacts().resolve("target-" + suffix + "-metadata.json").toString());
+  }
+
   private static void compare(RunContext run, String layout) throws Exception {
     String suffix = layout.toLowerCase(java.util.Locale.ROOT);
     runDriver(run, run.artifacts().resolve("compare-" + suffix + ".log"), "compare",
@@ -1877,6 +3033,13 @@ class M4LeaseRpcIT {
     String suffix = layout.toLowerCase(java.util.Locale.ROOT);
     runDriverWithScenario(run, run.artifacts().resolve("keepalive-" + suffix + ".log"),
         "m4-lease-keepalive.yaml", "compare-keepalive", "--left", run.nativeTrace().toString(),
+        "--right", run.artifacts().resolve("target-" + suffix + "-trace.jsonl").toString());
+  }
+
+  private static void compareRevoke(RunContext run, String layout) throws Exception {
+    String suffix = layout.toLowerCase(java.util.Locale.ROOT);
+    runDriverWithScenario(run, run.artifacts().resolve("revoke-" + suffix + ".log"),
+        "m4-lease-revoke.yaml", "compare-revoke", "--left", run.nativeTrace().toString(),
         "--right", run.artifacts().resolve("target-" + suffix + "-trace.jsonl").toString());
   }
 
@@ -1936,6 +3099,132 @@ class M4LeaseRpcIT {
       return "driver log unavailable (" + failure.getClass().getSimpleName() + ")";
     }
   }
+
+  private static final class MixedLoadClient implements AutoCloseable {
+    private final ManagedChannel channel;
+    private final KVGrpc.KVBlockingStub keyValue;
+    private MixedKeepAliveStream keepAlive;
+
+    private MixedLoadClient(RuntimeServer server) {
+      channel = NettyChannelBuilder.forAddress(
+              "127.0.0.1", server.boundListeners().getFirst().port())
+          .usePlaintext().disableRetry().build();
+      keyValue = KVGrpc.newBlockingStub(channel);
+      keepAlive = new MixedKeepAliveStream(channel);
+    }
+
+    private Rpc.LeaseKeepAliveResponse keepAlive(long leaseId) throws Exception {
+      return keepAlive.send(leaseId);
+    }
+
+    private void reopenKeepAliveAfterResourceExhaustion() throws Exception {
+      keepAlive.close(true);
+      keepAlive = new MixedKeepAliveStream(channel);
+    }
+
+    private Rpc.PutResponse put(byte[] key, byte[] value) {
+      return keyValue.withDeadlineAfter(60, TimeUnit.SECONDS).put(Rpc.PutRequest.newBuilder()
+          .setKey(ByteString.copyFrom(key)).setValue(ByteString.copyFrom(value)).build());
+    }
+
+    @Override
+    public void close() throws Exception {
+      try {
+        keepAlive.close(false);
+      } finally {
+        channel.shutdownNow();
+        assertTrue(channel.awaitTermination(10, TimeUnit.SECONDS),
+            "benchmark gRPC channel must terminate after the worker finishes");
+      }
+    }
+  }
+
+  private static final class MixedKeepAliveStream {
+    private final ArrayBlockingQueue<Rpc.LeaseKeepAliveResponse> responses = new ArrayBlockingQueue<>(1);
+    private final AtomicReference<Throwable> streamFailure = new AtomicReference<>();
+    private final CountDownLatch streamClosed = new CountDownLatch(1);
+    private final StreamObserver<Rpc.LeaseKeepAliveRequest> keepAliveRequests;
+
+    private MixedKeepAliveStream(ManagedChannel channel) {
+      keepAliveRequests = LeaseGrpc.newStub(channel).withDeadlineAfter(300, TimeUnit.SECONDS)
+          .leaseKeepAlive(new StreamObserver<>() {
+            @Override
+            public void onNext(Rpc.LeaseKeepAliveResponse response) {
+              if (!responses.offer(response)) {
+                streamFailure.compareAndSet(null,
+                    new IllegalStateException("KeepAlive response queue exceeded its one-item bound"));
+              }
+            }
+
+            @Override
+            public void onError(Throwable failure) {
+              streamFailure.compareAndSet(null, failure);
+              streamClosed.countDown();
+            }
+
+            @Override
+            public void onCompleted() {
+              streamClosed.countDown();
+            }
+          });
+    }
+
+    private Rpc.LeaseKeepAliveResponse send(long leaseId) throws Exception {
+      checkStreamState();
+      keepAliveRequests.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(leaseId).build());
+      long deadlineNanos = System.nanoTime()
+          + TimeUnit.SECONDS.toNanos(MIXED_LOAD_KEEPALIVE_RESPONSE_TIMEOUT_SECONDS);
+      while (true) {
+        checkStreamState();
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        if (remainingNanos <= 0) {
+          throw new AssertionError("KeepAlive response was not received before the benchmark deadline");
+        }
+        Rpc.LeaseKeepAliveResponse response = responses.poll(
+            Math.min(remainingNanos, TimeUnit.MILLISECONDS.toNanos(100)), TimeUnit.NANOSECONDS);
+        if (response != null) {
+          if (response.getID() != leaseId) {
+            throw new AssertionError("KeepAlive response ID differed from the requested Lease");
+          }
+          return response;
+        }
+      }
+    }
+
+    private void checkStreamState() {
+      Throwable failure = streamFailure.get();
+      if (failure instanceof StatusRuntimeException statusFailure) throw statusFailure;
+      if (failure != null) throw new AssertionError("KeepAlive stream failed", failure);
+      if (streamClosed.getCount() == 0) {
+        throw new AssertionError("KeepAlive stream closed before returning a response");
+      }
+    }
+
+    private void close(boolean resourceExhaustionExpected) throws InterruptedException {
+      if (streamClosed.getCount() != 0) keepAliveRequests.onCompleted();
+      if (!streamClosed.await(10, TimeUnit.SECONDS)) {
+        throw new AssertionError("KeepAlive benchmark stream did not close after client completion");
+      }
+      Throwable failure = streamFailure.get();
+      if (failure != null && !(resourceExhaustionExpected
+          && Status.fromThrowable(failure).getCode() == Status.Code.RESOURCE_EXHAUSTED)) {
+        throw new AssertionError("KeepAlive benchmark stream failed", failure);
+      }
+    }
+  }
+
+  private record MixedLoadResult(long elapsedNanos, List<Long> keepAliveLatencies,
+      List<Long> putLatencies, long keepAliveAttempts, long keepAliveResourceExhausted,
+      long putAttempts, long putResourceExhausted, int activeWorkersAtExpiry,
+      long expiryObservedEpochMillis, CommitState expiryState) {
+    private MixedLoadResult {
+      keepAliveLatencies = List.copyOf(keepAliveLatencies);
+      putLatencies = List.copyOf(putLatencies);
+    }
+  }
+
+  record OwnerTakeoverEvidence(long oldOwnerEpoch, long newOwnerEpoch,
+      long elapsedMillis, String newOwner) {}
 
   private record RunContext(Path root, Path artifacts, String runId, String prefix, Path nativeTrace) {}
 

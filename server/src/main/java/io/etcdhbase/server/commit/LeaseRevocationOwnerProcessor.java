@@ -1,6 +1,7 @@
 package io.etcdhbase.server.commit;
 
-import io.etcdhbase.core.bytes.ByteKey;
+import com.google.protobuf.InvalidProtocolBufferException;
+import etcdserverpb.Rpc;
 import io.etcdhbase.core.commit.CommitOutcomeResolver;
 import io.etcdhbase.core.commit.CommitOwnerService;
 import io.etcdhbase.core.commit.InvocationBinding;
@@ -11,7 +12,7 @@ import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.error.CompletionFailures;
-import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
+import io.etcdhbase.core.lease.LeaseFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
@@ -22,28 +23,20 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
-/** Processes the bounded on-demand resolution of an expired empty Lease on the owner lane. */
-public final class LeaseEmptyExpiryOwnerProcessor implements MutationForwardReceiver.MutationProcessor {
+/** Executes Lease Revoke under the same serialized owner lane and durable invocation as KV writes. */
+public final class LeaseRevocationOwnerProcessor implements MutationForwardReceiver.MutationProcessor {
   private final String tableGroup;
   private final Supplier<Optional<CommitOwnerService.OwnerToken>> owner;
   private final BudgetManager budgets;
   private final BudgetManager.Reservation reservation;
-  private final LeaseEmptyExpiryExecutor executor;
+  private final LeaseRevocationExecutor executor;
   private final CommitOutcomeResolver outcomes;
   private final LeaseOwnerRejectionRecorder rejections;
 
-  public LeaseEmptyExpiryOwnerProcessor(String tableGroup, CommitOwnerService.OwnerToken owner,
-      BudgetManager budgets, BudgetManager.Reservation reservation,
-      LeaseEmptyExpiryExecutor executor, CommitOutcomeResolver outcomes,
-      InvocationService invocations, Clock clock) {
-    this(tableGroup, () -> Optional.of(Objects.requireNonNull(owner, "owner")), budgets,
-        reservation, executor, outcomes, invocations, clock);
-  }
-
-  public LeaseEmptyExpiryOwnerProcessor(String tableGroup,
+  public LeaseRevocationOwnerProcessor(String tableGroup,
       Supplier<Optional<CommitOwnerService.OwnerToken>> owner,
       BudgetManager budgets, BudgetManager.Reservation reservation,
-      LeaseEmptyExpiryExecutor executor, CommitOutcomeResolver outcomes,
+      LeaseRevocationExecutor executor, CommitOutcomeResolver outcomes,
       InvocationService invocations, Clock clock) {
     this.tableGroup = Objects.requireNonNull(tableGroup, "tableGroup");
     this.owner = Objects.requireNonNull(owner, "owner");
@@ -51,7 +44,9 @@ public final class LeaseEmptyExpiryOwnerProcessor implements MutationForwardRece
     this.reservation = Objects.requireNonNull(reservation, "reservation");
     this.executor = Objects.requireNonNull(executor, "executor");
     this.outcomes = Objects.requireNonNull(outcomes, "outcomes");
-    this.rejections = new LeaseOwnerRejectionRecorder(outcomes, invocations, owner, clock);
+    this.rejections = new LeaseOwnerRejectionRecorder(outcomes,
+        Objects.requireNonNull(invocations, "invocations"), owner,
+        Objects.requireNonNull(clock, "clock"));
     if (tableGroup.isBlank()) throw new IllegalArgumentException("table group is required");
   }
 
@@ -65,7 +60,8 @@ public final class LeaseEmptyExpiryOwnerProcessor implements MutationForwardRece
     Optional<CommitOwnerService.OwnerToken> currentOwner = owner.get();
     if (currentOwner.isEmpty()) return unknown(BackendFailure.Category.UNAVAILABLE);
     CommitOwnerService.OwnerToken activeOwner = currentOwner.orElseThrow();
-    if (!tableGroup.equals(request.tableGroupId()) || request.expectedOwnerEpoch() != activeOwner.epoch()
+    if (!tableGroup.equals(request.tableGroupId())
+        || request.expectedOwnerEpoch() != activeOwner.epoch()
         || !request.invocationId().equals(binding.invocationId())
         || !request.requestDigest().equals(binding.requestDigest())
         || !request.authorizationScopeDigest().equals(binding.authorizationScopeDigest())
@@ -77,11 +73,11 @@ public final class LeaseEmptyExpiryOwnerProcessor implements MutationForwardRece
       return unknown(scope.isDeadlineExceeded()
           ? BackendFailure.Category.TIMEOUT : BackendFailure.Category.CANCELLED);
     }
-    final ExpiryCandidateIdentity candidate;
+    final Rpc.LeaseRevokeRequest command;
     try {
-      candidate = ExpiryCandidateIdentity.decode(ByteKey.copyOf(
-          MutationOperationEnvelope.leaseExpireEmptyBytes(request.operationBytes())));
-    } catch (IllegalArgumentException malformed) {
+      command = Rpc.LeaseRevokeRequest.parseFrom(
+          MutationOperationEnvelope.leaseRevokeBytes(request.operationBytes()));
+    } catch (InvalidProtocolBufferException | IllegalArgumentException malformed) {
       return unknown(BackendFailure.Category.UNKNOWN);
     }
     if (binding.state() == InvocationBinding.State.SELECTED
@@ -95,30 +91,27 @@ public final class LeaseEmptyExpiryOwnerProcessor implements MutationForwardRece
     }
     final BudgetManager.Account account;
     try {
-      account = budgets.admit(tableGroup, scope, reservation);
+      account = budgets.admitReserved(tableGroup, scope, reservation);
     } catch (BackendFailure failure) {
       return unknown(failure.category());
     }
-    return executor.executeNew(candidate, binding, activeOwner, identity, scope, account)
-        .handle((id, failure) -> handleOutcome(request, binding, id, failure, scope))
+    return executor.executeNew(command.getID(), binding, activeOwner, identity, scope, account)
+        .handle((invocation, failure) -> handleOutcome(request, binding, invocation, failure, scope))
         .thenCompose(result -> result);
   }
 
-  private CompletableFuture<OwnerForwarding.Reply> handleOutcome(
-      MutationForwardRequest request, InvocationBinding binding, InvocationId id,
-      Throwable failure, RequestScope scope) {
+  private CompletableFuture<OwnerForwarding.Reply> handleOutcome(MutationForwardRequest request,
+      InvocationBinding binding, InvocationId invocation, Throwable failure, RequestScope scope) {
     if (failure == null) {
-      return CompletableFuture.completedFuture(request.invocationId().equals(id)
+      return CompletableFuture.completedFuture(request.invocationId().equals(invocation)
           ? receipt(request) : new OwnerForwarding.Unknown(BackendFailure.Category.UNKNOWN));
     }
     Throwable cause = CompletionFailures.unwrapCompletion(failure);
-    if (cause instanceof LeaseEmptyExpiryExecutor.RejectedBeforePreparation rejected) {
-      return rejections.persist(binding, scope).<OwnerForwarding.Reply>thenApply(persisted -> {
-        if (!persisted) return new OwnerForwarding.Unknown(BackendFailure.Category.UNKNOWN);
-        return rejected.rejection() == LeaseEmptyExpiryExecutor.Rejection.RECHECK
-            ? new OwnerForwarding.LeaseRejected(io.etcdhbase.core.lease.LeaseFailure.Reason.NOT_FOUND)
-            : new OwnerForwarding.Rejected(BackendFailure.Category.UNAVAILABLE);
-      }).exceptionally(LeaseEmptyExpiryOwnerProcessor::unknownReply);
+    if (cause instanceof LeaseFailure semantic) {
+      return rejections.persist(binding, scope).<OwnerForwarding.Reply>thenApply(persisted -> persisted
+          ? new OwnerForwarding.LeaseRejected(semantic.reason())
+          : new OwnerForwarding.Unknown(BackendFailure.Category.UNKNOWN))
+          .exceptionally(ignored -> unknownReply(cause));
     }
     return CompletableFuture.completedFuture(unknownReply(cause));
   }

@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.lease.LeaseExpiryStepCommand;
 import org.junit.jupiter.api.Test;
 
 class MutationOperationEnvelopeTest {
@@ -28,13 +29,6 @@ class MutationOperationEnvelopeTest {
     assertEquals(MutationOperationEnvelope.Kind.LEASE_GRANT, MutationOperationEnvelope.kind(grant));
     assertArrayEquals(new byte[] {0, (byte) 0xff}, MutationOperationEnvelope.leaseGrantBytes(grant));
     assertThrows(IllegalArgumentException.class, () -> MutationOperationEnvelope.leaseGrantBytes(delete));
-    byte[] expiry = new byte[Long.BYTES * 4];
-    ByteKey expiryOperation = MutationOperationEnvelope.leaseExpireEmpty(expiry);
-    assertEquals(MutationOperationEnvelope.Kind.LEASE_EXPIRE_EMPTY,
-        MutationOperationEnvelope.kind(expiryOperation));
-    assertArrayEquals(expiry, MutationOperationEnvelope.leaseExpireEmptyBytes(expiryOperation));
-    assertThrows(IllegalArgumentException.class,
-        () -> MutationOperationEnvelope.leaseExpireEmpty(new byte[Long.BYTES]));
     var keepAlivePayload = new byte[] {8, 3};
     ByteKey keepAlive = MutationOperationEnvelope.leaseKeepAlive(keepAlivePayload);
     assertEquals(MutationOperationEnvelope.Kind.LEASE_KEEP_ALIVE,
@@ -42,10 +36,24 @@ class MutationOperationEnvelopeTest {
     assertArrayEquals(keepAlivePayload, MutationOperationEnvelope.leaseKeepAliveBytes(keepAlive));
     assertThrows(IllegalArgumentException.class,
         () -> MutationOperationEnvelope.leaseKeepAliveBytes(grant));
+    var revoke = MutationOperationEnvelope.leaseRevoke(new byte[] {8, 3});
+    assertEquals(MutationOperationEnvelope.Kind.LEASE_REVOKE, MutationOperationEnvelope.kind(revoke));
+    assertArrayEquals(new byte[] {8, 3}, MutationOperationEnvelope.leaseRevokeBytes(revoke));
+
+    var expiryStepCommand = new LeaseExpiryStepCommand(10);
+    ByteKey expiryStep = MutationOperationEnvelope.leaseExpiryStep(expiryStepCommand.encode().bytes());
+    assertEquals(MutationOperationEnvelope.Kind.LEASE_EXPIRY_STEP,
+        MutationOperationEnvelope.kind(expiryStep));
+    assertArrayEquals(expiryStepCommand.encode().bytes(),
+        MutationOperationEnvelope.leaseExpiryStepBytes(expiryStep));
+    assertThrows(IllegalArgumentException.class,
+        () -> MutationOperationEnvelope.kind(ByteKey.copyOf(new byte[] {0, 'L', 'X', 1})));
   }
 
   @Test
   void malformedTaggedOrOversizeEnvelopesFailClosed() {
+    assertThrows(IllegalArgumentException.class,
+        () -> MutationOperationEnvelope.kind(ByteKey.copyOf(new byte[] {0, 'L', 'E', 1})));
     assertThrows(IllegalArgumentException.class,
         () -> MutationOperationEnvelope.isTransaction(ByteKey.copyOf(new byte[] {0, 'T'})));
     assertThrows(IllegalArgumentException.class,
