@@ -1,6 +1,7 @@
 package io.etcdhbase.hbase.codec;
 
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.commit.EventIndexBackfillCheckpoint;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.LeaseBindingIdentity;
@@ -173,16 +174,18 @@ public final class SystemRecordKeyCodec {
     return new ScanBounds(start, startInclusive, prefixEnd(prefix), false, false);
   }
 
-  /** Reverse-seeks one Lease state or expiry-checkpoint history at the requested sequence. */
+  /** Reverse-seeks a fixed-route versioned system record at the requested sequence. */
   public ScanBounds leaseVersionBounds(SystemRecordType type, ByteKey routePrefix, long sequence) {
     int routeBytes = switch (type) {
       case LEASE_STATE -> LeaseRecordIdentity.ROUTE_BYTES;
       case LEASE_EXPIRY_CHECKPOINT -> LeaseExpiryCheckpoint.ROUTE_BYTES;
+      case EVENT_INDEX_BACKFILL_CHECKPOINT -> EventIndexBackfillCheckpoint.ROUTE_BYTES;
       default -> -1;
     };
     int identityBytes = switch (type) {
       case LEASE_STATE -> LeaseRecordIdentity.IDENTITY_BYTES;
       case LEASE_EXPIRY_CHECKPOINT -> LeaseExpiryCheckpoint.IDENTITY_BYTES;
+      case EVENT_INDEX_BACKFILL_CHECKPOINT -> EventIndexBackfillCheckpoint.IDENTITY_BYTES;
       default -> -1;
     };
     if (routeBytes < 0 || routePrefix.length() != routeBytes || sequence <= 0) {
@@ -251,6 +254,27 @@ public final class SystemRecordKeyCodec {
     ByteKey route = LeaseBindingIdentity.routePrefix(leaseId, incarnation);
     byte[] prefix = checkedPrefix(salt.salt(saltIdentifier(SystemRecordType.LEASE_BINDING, route.bytes())));
     return bucketNumber(prefix);
+  }
+
+  /** Seeks ordered positive event revisions independently in each salt bucket. */
+  public ScanBounds eventRevisionBounds(int bucket, long minimumRevision,
+      java.util.Optional<ByteKey> afterIdentity) {
+    Objects.requireNonNull(afterIdentity, "afterIdentity");
+    if (minimumRevision <= 0) throw new IllegalArgumentException("revision must be positive");
+    byte[] prefix = typeBucketPrefix(SystemRecordType.EVENT_REVISION_INDEX, bucket);
+    byte[] identityPrefix = ByteBuffer.allocate(prefix.length + Integer.BYTES)
+        .put(prefix).putInt(Long.BYTES).array();
+    byte[] start = ByteBuffer.allocate(identityPrefix.length + Long.BYTES)
+        .put(identityPrefix).putLong(minimumRevision).array();
+    if (afterIdentity.isPresent()) {
+      ByteKey identity = afterIdentity.orElseThrow();
+      if (identity.length() != Long.BYTES || ByteBuffer.wrap(identity.bytes()).getLong() < minimumRevision
+          || bucket(SystemRecordType.EVENT_REVISION_INDEX, identity) != bucket) {
+        throw new IllegalArgumentException("event revision resume identity is outside the requested range");
+      }
+      start = encode(SystemRecordType.EVENT_REVISION_INDEX, identity);
+    }
+    return new ScanBounds(start, afterIdentity.isEmpty(), prefixEnd(identityPrefix), false, false);
   }
 
   /** Bounds an ordered expiration scan to a half-open deadline interval in one salt bucket. */
@@ -372,6 +396,10 @@ public final class SystemRecordKeyCodec {
       long sequence = LeaseExpiryCheckpoint.sequence(ByteKey.copyOf(identity));
       if (sequence <= 0) throw new IllegalArgumentException("invalid Lease expiry checkpoint sequence");
       return Arrays.copyOf(identity, LeaseExpiryCheckpoint.ROUTE_BYTES);
+    }
+    if (type == SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT) {
+      EventIndexBackfillCheckpoint.sequence(ByteKey.copyOf(identity));
+      return Arrays.copyOf(identity, EventIndexBackfillCheckpoint.ROUTE_BYTES);
     }
     if (type != SystemRecordType.CANDIDATE) return identity;
     if (identity.length <= 16 + Integer.BYTES) {

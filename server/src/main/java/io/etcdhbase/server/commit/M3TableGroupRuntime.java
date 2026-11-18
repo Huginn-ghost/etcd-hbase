@@ -9,6 +9,9 @@ import io.etcdhbase.core.commit.CommitPublisher;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.AuxiliaryFormatUpgrade;
 import io.etcdhbase.core.commit.AuxiliaryLeasePlanVerifier;
+import io.etcdhbase.core.commit.EventIndexFormatUpgrade;
+import io.etcdhbase.core.commit.EventHistoryPinManager;
+import io.etcdhbase.core.commit.EventHistoryRegistryUpgrade;
 import io.etcdhbase.core.commit.LeaseBindingFormatUpgrade;
 import io.etcdhbase.core.commit.LeaseExpiryFormatUpgrade;
 import io.etcdhbase.core.commit.InvocationService;
@@ -22,6 +25,7 @@ import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.commit.RecoveryManager;
 import io.etcdhbase.core.commit.ResultPreparation;
+import io.etcdhbase.core.commit.SharedEventTailer;
 import io.etcdhbase.core.commit.UnchangedRangeProof;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.lease.LeaseIdAllocator;
@@ -77,7 +81,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private static final BudgetManager.Reservation LEASE_REQUEST_MEMORY =
       LeaseBudgetProfile.LEASE_REQUEST_MEMORY;
   private static final BudgetManager.Reservation RECOVERY_MEMORY =
-      M3MemoryReservations.RECOVERY;
+      LeaseBudgetProfile.RECOVERY_MEMORY;
   private static final Executor CLEANUP = task -> Thread.ofVirtual().name("m3-runtime-cleanup").start(task);
   private static final BiFunction<Long, Integer, LeaseTimeSource> SYSTEM_LEASE_TIME_SOURCE =
       (uncertaintyMillis, maximumDriftPpm) -> new BoundedSystemLeaseTimeSource(
@@ -217,9 +221,11 @@ public final class M3TableGroupRuntime implements AutoCloseable {
         if (owner.isOwner()) {
           ensureM4LeaseBindingFormat(plan, connections, identity, stores, owner, startup);
           ensureM4LeaseExpiryFormat(plan, connections, identity, owner, startup);
+          ensureM4EventIndexFormat(plan, connections, identity, owner, startup);
           stores = await(TableGroupStores.openConfigured(connections, identity, plan,
               activation.pinConfiguration(), startup), startup);
           verifyLeaseExpiryFormat(stores, startup);
+          verifyEventIndexFormat(stores, startup);
           invocations = new InvocationService(stores.invocations());
           owners = new CommitOwnerService(stores.control());
           recovery = new RecoveryManager(plan.system().profileFingerprint(), stores.control(), owners,
@@ -227,7 +233,9 @@ public final class M3TableGroupRuntime implements AutoCloseable {
           await(owner.refreshServices(owners, recovery, startup), startup);
         } else {
           verifyLeaseExpiryFormat(stores, startup);
+          verifyEventIndexFormat(stores, startup);
         }
+        pending.eventPins = openEventRegistry(stores, activation, owner, startup);
       }
       ByteKey authorization = authorizationDigest(identity);
       var business = assembleBusiness(plan, activation, connections, budgets, scans, pending, stores,
@@ -244,7 +252,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       await(CompletableFuture.allOf(startup.cleanupCompletion().toCompletableFuture(),
           startup.physicalProducersCompletion().toCompletableFuture()), startup);
       if (!runtimeReady(owner.isReady(), leaseTime) || !pending.isReady()) {
-        throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+        throw new java.util.concurrent.CompletionException(
+            new BackendFailure(BackendFailure.Category.UNAVAILABLE));
       }
       return new M3TableGroupRuntime(pending, services.kvService(), services.leaseService(),
           leaseTime, stores.clusterId(), activation.memberIdBits(), business.metrics());
@@ -447,8 +456,91 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     }
   }
 
+  /** The owner fences old writers before finalizers require an index for each new KV revision. */
+  private static void ensureM4EventIndexFormat(M3TableGroupPlan plan,
+      HBaseConnectionFactory connections, AuthorizedBackendIdentity identity,
+      M3OwnerLease ownerLease, RequestScope startup) throws Exception {
+    if (!ownerLease.isReady()) throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+    await(ensureEventIndexDescriptor(plan, connections, identity, startup), startup);
+    HBaseCommitControlStore control = await(
+        HBaseCommitControlStore.open(connections, identity, plan.system(), startup), startup);
+    if (!control.supportsEventRevisionIndex()) {
+      throw new IllegalStateException("J44 event index descriptor capability is not available");
+    }
+    var owners = new CommitOwnerService(control);
+    CommitState state = await(control.read(startup), startup)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized"))
+        .state();
+    if (state.formatVersion() == CommitState.LEASE_EXPIRY_FORMAT_VERSION) {
+      await(ownerLease.transitionFence(owners,
+          owner -> new EventIndexFormatUpgrade(control)
+              .upgrade(owner, Clock.systemUTC().millis(), startup), startup), startup);
+    } else if (state.supportsEventRevisionIndex()) {
+      await(ownerLease.transitionFence(owners, CompletableFuture::completedFuture, startup), startup);
+    } else {
+      throw new IllegalStateException("table-group control format cannot be activated for J44");
+    }
+    CommitState verified = await(control.read(startup), startup)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized"))
+        .state();
+    CommitOwnerService.OwnerToken owner = ownerLease.token();
+    if (!verified.supportsEventRevisionIndex()
+        || verified.ownerInstance().filter(owner.instance()::equals).isEmpty()
+        || verified.ownerEpoch() != owner.epoch()
+        || verified.ownerLeaseExpired(Clock.systemUTC().millis()) || !ownerLease.isReady()) {
+      throw new IllegalStateException("J44 event index format upgrade lost its owner fence");
+    }
+  }
+
+  private static CompletableFuture<Void> ensureEventIndexDescriptor(M3TableGroupPlan plan,
+      HBaseConnectionFactory connections, AuthorizedBackendIdentity identity, RequestScope scope) {
+    var request = new HBaseRequestContext(scope);
+    return request.borrowConnection(connections, identity).thenCompose(connection -> {
+      var admin = connection.getAdmin();
+      return request.execute(() -> admin.getDescriptor(plan.system().table())).thenCompose(descriptor -> {
+        if (plan.system().supportsEventRevisionIndex(descriptor)) return CompletableFuture.completedFuture(null);
+        var replacement = plan.system().withEventRevisionIndexCapability(descriptor);
+        return request.execute(() -> admin.modifyTable(replacement))
+            .thenCompose(ignored -> request.execute(() -> admin.getDescriptor(plan.system().table())))
+            .thenAccept(verified -> {
+              if (!plan.system().supportsEventRevisionIndex(verified)) {
+                throw new IllegalStateException("J44 event index descriptor was not persisted");
+              }
+            });
+      });
+    }).exceptionallyCompose(failure -> CompletableFuture.failedFuture(HBaseFailures.classify(failure)));
+  }
+
+  private static void verifyEventIndexFormat(TableGroupStores stores, RequestScope scope) throws Exception {
+    CommitState state = await(stores.control().read(scope), scope)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized")).state();
+    if (!state.supportsEventRevisionIndex() || !stores.control().supportsEventRevisionIndex()
+        || !stores.records().supportsEventRevisionIndex()) {
+      throw new IllegalStateException("J44 event index format is not fenced and available");
+    }
+  }
+
+  /** Selects a fully staged protection registry before the runtime can consume event history. */
+  private static EventHistoryPinManager openEventRegistry(TableGroupStores stores,
+      M3RuntimeConfiguration activation, M3OwnerLease owner, RequestScope scope) throws Exception {
+    CommitState state = await(stores.control().read(scope), scope)
+        .orElseThrow(() -> new IllegalStateException("table-group control state is not initialized")).state();
+    if (state.eventRegistryNamespace().isEmpty()) {
+      if (!owner.isOwner()) throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+      var owners = new CommitOwnerService(stores.control());
+      var upgrade = new EventHistoryRegistryUpgrade(stores.records(), stores.control(),
+          activation.pinConfiguration(), Clock.systemUTC());
+      await(owner.transitionFence(owners,
+          token -> upgrade.upgrade(token, scope).thenApply(EventHistoryRegistryUpgrade.Selection::owner),
+          scope), scope);
+    }
+    return await(EventHistoryPinManager.openSelected(stores.records(), stores.control(),
+        activation.pinConfiguration(), Clock.systemUTC(), scope), scope);
+  }
+
   private record BusinessComponents(PutOwnerProcessor putProcessor, TxnOwnerProcessor txnProcessor,
-      TxnReadExecutor txnReads, RequestMetrics metrics, Optional<LeaseComponents> lease) {}
+      TxnReadExecutor txnReads, RequestMetrics metrics, Optional<LeaseComponents> lease,
+      CommitPublisher publisher) {}
 
   private record LeaseComponents(LeaseGrantOwnerProcessor grantProcessor,
       LeaseRenewalOwnerProcessor renewalProcessor,
@@ -513,7 +605,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     if (cacheLimits.isPresent()) pending.createCache(plan, stores, budgets, cacheLimits.orElseThrow());
     var txnReads = new TxnReadExecutor(plan.source().tableGroupId(), stores.views(), stores.manifests(),
         connections, plan.primary(), pending.worker, scans, txnLimits, metrics, Optional.ofNullable(pending.cache));
-    return new BusinessComponents(putProcessor, txnProcessor, txnReads, metrics, lease);
+    return new BusinessComponents(putProcessor, txnProcessor, txnReads, metrics, lease, publisher);
   }
 
   private static LeaseComponents assembleLease(M3TableGroupPlan plan,
@@ -590,10 +682,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   private static void verifyExistingLeaseLimits(M3TableGroupPlan plan,
       M3RuntimeConfiguration activation, BudgetManager budgets, TableGroupStores stores,
       ByteKey authorization, LeaseComponents lease, RequestScope startup) throws Exception {
-    BudgetManager.Reservation scanReservation = new BudgetManager.Reservation(
-        LEASE_REQUEST_MEMORY.heads(), LEASE_REQUEST_MEMORY.page(), LEASE_REQUEST_MEMORY.io(),
-        32L << 20, LEASE_REQUEST_MEMORY.candidates());
-    var account = budgets.admit(plan.source().tableGroupId(), startup, scanReservation,
+    var account = budgets.admit(plan.source().tableGroupId(), startup, LeaseBudgetProfile.startupLeaseScanMemory(),
         new BudgetManager.ReadLimits(100_000, 64L << 20, 100_000, 100_000, 100_000));
     try {
       var proof = new ManifestCatalog.ProofReadBudget(startup, account, 100_000, 64L << 20);
@@ -678,6 +767,18 @@ public final class M3TableGroupRuntime implements AutoCloseable {
           LeaseBudgetProfile.EXPIRY_WORKER_MEMORY, pending.worker, pending.leaseTimers, Clock.systemUTC(),
           business.metrics());
       pending.startExpiryWorker(expiryWorker);
+      var backfillPreparation = new EventBackfillPreparation(new LeaseAuxiliaryMutationPreparation(
+          new ResultPreparation(stores.resultRepository()), stores.results(),
+          new ManifestPreparation(stores.manifestRepository(), new ManifestPreparation.Limits(0, 0, 0, 0)),
+          invocations));
+      var backfill = new EventBackfillCycle(plan.source().tableGroupId(), pending.queue, stores, pending.eventPins,
+          invocations, backfillPreparation, business.publisher(), budgets, authorization, Clock.systemUTC());
+      var tailer = new EventTailerCycle(plan.source().tableGroupId(), pending.queue,
+          owner::currentToken, stores, pending.eventPins, budgets, authorization,
+          pending, business.metrics());
+      var history = new EventHistoryCycle(backfill, tailer, business.metrics());
+      pending.installEventHistoryWorker(new EventHistoryWorker(
+          pending.leaseTimers, owner::currentToken, history::run, business.metrics()));
     }
     return new ServiceComponents(new KvService(gateway, txnGateway, txnGateway::deleteRange,
         txnGateway::range), leaseService);
@@ -704,6 +805,8 @@ public final class M3TableGroupRuntime implements AutoCloseable {
 
   public KvService kvService() { return kvService; }
   public LeaseService leaseService() { return leaseService; }
+  public CompletableFuture<SharedEventTailer> eventTailerReady() { return resources.eventTailerReady(); }
+  public Optional<SharedEventTailer> eventTailer() { return resources.eventTailer(); }
   public long clusterId() { return clusterId; }
   public long memberId() { return memberId; }
   public RequestMetrics metrics() { return metrics; }
@@ -795,7 +898,7 @@ public final class M3TableGroupRuntime implements AutoCloseable {
   }
 
   /** Owns all lanes until their real producers, timers, workers, and reserved recovery capacity drain. */
-  private static final class Pending {
+  static final class Pending {
     private final RequestScope startup;
     private final RequestScope recoveryScope = RequestScope.withoutDeadline();
     private final CompletableFuture<Void> ownerResolved = new CompletableFuture<>();
@@ -808,14 +911,26 @@ public final class M3TableGroupRuntime implements AutoCloseable {
     private BoundedPublicationHandoff handoff;
     private ThreadPoolExecutor worker;
     private RangeReadCache cache;
+    private volatile EventHistoryPinManager eventPins;
+    private volatile BudgetManager.Account eventTailerMemory;
+    private volatile SharedEventTailer eventTailer;
+    private CompletableFuture<SharedEventTailer> eventTailerReady = new CompletableFuture<>();
     private ScheduledExecutorService leaseTimers;
     private ScheduledThreadPoolExecutor ownedLeaseTimers;
     private volatile LeaseExpiryWorker expiryWorker;
+    private volatile EventHistoryWorker eventHistoryWorker;
     private volatile boolean leaseEnabled;
+    private boolean eventHistoryWorkerStarted;
+    private boolean ownerLost;
 
-    private Pending(RequestScope startup, ScheduledExecutorService leaseTimers) {
+    Pending(RequestScope startup, ScheduledExecutorService leaseTimers) {
+      this(startup, leaseTimers, false);
+    }
+
+    Pending(RequestScope startup, ScheduledExecutorService leaseTimers, boolean leaseEnabled) {
       this.startup = startup;
       this.leaseTimers = leaseTimers;
+      this.leaseEnabled = leaseEnabled;
     }
 
     private void createCache(M3TableGroupPlan plan, TableGroupStores stores, BudgetManager budgets,
@@ -876,13 +991,78 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       if (!ownerStarted) ownerResolved.complete(null);
     }
 
-    private synchronized void startExpiryWorker(LeaseExpiryWorker worker) {
+    synchronized void startExpiryWorker(LeaseExpiryWorker worker) {
       Objects.requireNonNull(worker, "worker");
-      if (closing.get() || expiryWorker != null) {
+      if (closing.get() || ownerLost || expiryWorker != null) {
         throw new IllegalStateException("Lease expiry worker cannot be installed now");
       }
       expiryWorker = worker;
       worker.start();
+    }
+
+    synchronized void installEventHistoryWorker(EventHistoryWorker worker) {
+      Objects.requireNonNull(worker, "worker");
+      if (closing.get() || ownerLost || eventHistoryWorker != null) {
+        throw new IllegalStateException("event history worker cannot be installed now");
+      }
+      eventHistoryWorker = worker;
+    }
+
+    private void startEventHistoryWorkerOnDemand() {
+      if (closing.get() || ownerLost || eventTailer != null || eventHistoryWorkerStarted
+          || eventHistoryWorker == null) return;
+      eventHistoryWorkerStarted = true;
+      try {
+        eventHistoryWorker.start();
+      } catch (RuntimeException | Error failure) {
+        eventHistoryWorkerStarted = false;
+        throw failure;
+      }
+    }
+
+    synchronized BudgetManager.Account eventTailerMemory(BudgetManager budgets, String tableGroup)
+        throws BackendFailure {
+      if (closing.get() || ownerLost || !leaseEnabled) {
+        throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+      }
+      if (eventTailerMemory == null) {
+        eventTailerMemory = budgets.admitReserved(tableGroup, recoveryScope,
+            LeaseBudgetProfile.EVENT_TAILER_MEMORY, LeaseBudgetProfile.EVENT_TAILER_READ_LIMITS);
+      }
+      return eventTailerMemory;
+    }
+
+    synchronized SharedEventTailer installEventTailer(SharedEventTailer candidate) {
+      Objects.requireNonNull(candidate, "candidate");
+      if (closing.get() || ownerLost || !leaseEnabled) {
+        candidate.close();
+        throw new java.util.concurrent.CompletionException(
+            new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      }
+      if (eventTailer != null) {
+        candidate.close();
+        return eventTailer;
+      }
+      eventTailer = candidate;
+      eventTailerReady.complete(candidate);
+      return candidate;
+    }
+
+    synchronized Optional<SharedEventTailer> eventTailer() {
+      return Optional.ofNullable(eventTailer);
+    }
+
+    synchronized boolean detachClosedEventTailer(SharedEventTailer expected) {
+      Objects.requireNonNull(expected, "expected");
+      if (closing.get() || ownerLost || eventTailer != expected || !expected.isClosed()) return false;
+      eventTailer = null;
+      eventTailerReady = new CompletableFuture<>();
+      return true;
+    }
+
+    synchronized CompletableFuture<SharedEventTailer> eventTailerReady() {
+      startEventHistoryWorkerOnDemand();
+      return eventTailerReady.copy();
     }
 
     private CompletableFuture<Void> initialReadiness() {
@@ -895,9 +1075,15 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       return current.initialReadiness();
     }
 
-    private void ownerLost() {
+    synchronized void ownerLost() {
+      ownerLost = true;
       LeaseExpiryWorker current = expiryWorker;
       if (current != null) current.stop();
+      EventHistoryWorker history = eventHistoryWorker;
+      if (history != null) history.stop();
+      SharedEventTailer tailer = eventTailer;
+      if (tailer != null) tailer.close();
+      else eventTailerReady.completeExceptionally(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
       SerialMutationQueue currentQueue = queue;
       if (currentQueue != null) currentQueue.close();
     }
@@ -906,21 +1092,30 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       M3OwnerLease current = owner;
       if (closing.get() || current == null || !current.isReady()) return false;
       LeaseExpiryWorker expiry = expiryWorker;
-      return !leaseEnabled || expiry != null && expiry.isReady();
+      return !leaseEnabled || eventPins != null && expiry != null && expiry.isReady();
     }
 
     private void close() {
-      if (!closing.compareAndSet(false, true)) return;
-      try {
-        LeaseExpiryWorker expiry = expiryWorker;
-        if (expiry != null) expiry.stop();
-      } catch (RuntimeException | Error failure) {
-        shutdownFailure = failure;
-      }
-      try {
-        if (queue != null) queue.close();
-      } catch (RuntimeException | Error failure) {
-        shutdownFailure = merge(shutdownFailure, failure);
+      synchronized (this) {
+        if (!closing.compareAndSet(false, true)) return;
+        try {
+          if (expiryWorker != null) expiryWorker.stop();
+        } catch (RuntimeException | Error failure) {
+          shutdownFailure = failure;
+        }
+        try {
+          if (eventHistoryWorker != null) eventHistoryWorker.stop();
+        } catch (RuntimeException | Error failure) {
+          shutdownFailure = merge(shutdownFailure, failure);
+        }
+        if (eventTailer == null) {
+          eventTailerReady.completeExceptionally(new BackendFailure(BackendFailure.Category.CANCELLED));
+        }
+        try {
+          if (queue != null) queue.close();
+        } catch (RuntimeException | Error failure) {
+          shutdownFailure = merge(shutdownFailure, failure);
+        }
       }
       try {
         Thread.ofVirtual().name("m3-runtime-drain").start(this::drain);
@@ -935,6 +1130,13 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       Throwable failure = shutdownFailure;
       try {
         if (expiryWorker != null) expiryWorker.drained().join();
+      } catch (RuntimeException | Error problem) { failure = merge(failure, problem); }
+      try {
+        if (eventHistoryWorker != null) eventHistoryWorker.drained().join();
+      } catch (RuntimeException | Error problem) { failure = merge(failure, problem); }
+      try {
+        SharedEventTailer tailer = eventTailer;
+        if (tailer != null) tailer.close();
       } catch (RuntimeException | Error problem) { failure = merge(failure, problem); }
       try {
         if (queue != null) queue.drained().join();

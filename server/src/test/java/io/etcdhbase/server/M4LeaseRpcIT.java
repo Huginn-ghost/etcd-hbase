@@ -26,6 +26,8 @@ import io.etcdhbase.core.commit.InvocationId;
 import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.MutationOperationEnvelope;
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.bytes.KeyRange;
+import io.etcdhbase.core.commit.SharedEventTailer;
 import io.etcdhbase.core.commit.SystemRecordType;
 import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
 import io.etcdhbase.core.lease.LeaseRecordIdentity;
@@ -34,18 +36,23 @@ import io.etcdhbase.grpc.internal.v1.ForwardMutationRequest;
 import io.etcdhbase.grpc.internal.v1.ForwardMutationResponse;
 import io.etcdhbase.grpc.internal.v1.InternalOwnerServiceGrpc;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.hbase.identity.HBaseAuthenticators;
 import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
 import io.etcdhbase.hbase.codec.LeaseStateMessages;
 import io.etcdhbase.hbase.probe.TemporaryHBaseClusterProcess;
 import io.etcdhbase.hbase.storage.HBaseCommitControlStore;
+import io.etcdhbase.hbase.storage.HBaseCommitDecisionRepository;
+import io.etcdhbase.hbase.storage.HBaseEventRevisionIndexRepository;
 import io.etcdhbase.hbase.storage.HBaseInvocationRepository;
+import io.etcdhbase.hbase.storage.HBaseManifestRepository;
 import io.etcdhbase.hbase.storage.HBaseSystemRecordStore;
 import io.etcdhbase.server.config.M3RuntimeConfiguration;
 import io.etcdhbase.server.config.M3RuntimeConfigurationLoader;
 import io.etcdhbase.server.config.M3MemoryReservations;
 import io.etcdhbase.server.config.RuntimeConfiguration;
 import io.etcdhbase.server.commit.ServiceAuthorizationContextReference;
+import io.etcdhbase.server.commit.M3TableGroupRuntime;
 import io.etcdhbase.server.commit.LeaseBudgetProfile;
 import io.grpc.CallOptions;
 import io.grpc.Channel;
@@ -76,9 +83,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.time.Duration;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -109,6 +118,8 @@ class M4LeaseRpcIT {
   private static final int MIXED_LOAD_WORKER_MAX_TIMEOUT_SECONDS = 180;
   private static final int TEST_OWNER_LEASE_MILLIS = 6_000;
   private static final int TEST_HEARTBEAT_MILLIS = 1_000;
+  private static final int EVENT_INDEX_OWNER_LEASE_MILLIS = 15_000;
+  private static final int EVENT_INDEX_HEARTBEAT_MILLIS = 2_500;
   private static final List<String> LAYOUT_FILES =
       List.of("history-table.json", "native-cell-versions.json");
   private static final List<String> MIXED_EVIDENCE_SOURCE_FILES = List.of(
@@ -128,6 +139,179 @@ class M4LeaseRpcIT {
       new RuntimeConfiguration.ResourceBudgets(65_536, 8, 30_000,
           4 << 20, 4 << 20, 16, 0);
   @TempDir Path testDirectory;
+
+  @Test
+  void runtimeFencesEventIndexFormatAndPersistsSelectedPutAcrossLayouts() throws Exception {
+    try (var cluster = TemporaryHBaseClusterProcess.start()) {
+      int clientPort = cluster.clientConfiguration().getInt("hbase.zookeeper.property.clientPort", -1);
+      for (String layoutFile : LAYOUT_FILES) {
+        InitializationConfiguration initialization = initialization(layoutFile, clientPort);
+        var source = TableGroupPlanFactory.create(initialization, "local", null);
+        M3TableGroupPlan plan = M3TableGroupPlan.from(source);
+        var authScope = new io.etcdhbase.spi.identity.AuthenticationScope(
+            source.tableGroupId(), source.hbaseProfile().id());
+        try (var provider = new HBaseBackendIdentityProvider(source.identityProviderId(), authScope,
+                cluster.clientConfiguration(), HBaseAuthenticators.simpleDevelopment(),
+                (connection, ignored) -> connection.getAdmin().listNamespaces().thenApply(names -> null),
+                1, 1, Duration.ofSeconds(30));
+             var credentials = new io.etcdhbase.spi.identity.BackendCredentials("j44-test", new char[0])) {
+          var identity = authenticate(provider, credentials, authScope);
+          var activation = activation("1");
+          M3TableGroupInitializer.initializeFresh(plan, "sha256:" + source.fingerprint(),
+              identity, provider, activation.pinConfiguration());
+          var configuration = new RuntimeConfiguration(initialization.schemaVersion(),
+              List.of(new RuntimeConfiguration.Listener("j44", "127.0.0.1", 0, source.tableGroupId())),
+              initialization.hbaseProfiles(), initialization.saltProfiles(), initialization.tableGroups(), RESOURCES);
+          long legacyRevision;
+          try (var legacy = RuntimeServer.startM3(configuration, activation("1", false))) {
+            legacyRevision = putThrough(legacy, "j44-legacy-key", 1).getHeader().getRevision();
+          }
+          M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, provider, identity);
+          long revision;
+          io.etcdhbase.core.bytes.ByteKey registryNamespace;
+          try (var runtime = RuntimeServer.startM3(configuration,
+              activation("2", true, EVENT_INDEX_OWNER_LEASE_MILLIS, EVENT_INDEX_HEARTBEAT_MILLIS))) {
+            assertTrue(runtime.dataReady());
+            assertEquals(1, rangeKey(runtime, "j44-legacy-key".getBytes(StandardCharsets.UTF_8)).getKvsCount());
+            var response = putAndReadSharedTailer(runtime, plan);
+            revision = response.getHeader().getRevision();
+            assertEquals(legacyRevision + 1, revision);
+            try (var scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+              var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope).join();
+              assertTrue(control.supportsEventRevisionIndex());
+              var state = control.read(scope).join().orElseThrow().state();
+              assertTrue(state.supportsEventRevisionIndex());
+              registryNamespace = state.eventRegistryNamespace().orElseThrow();
+              var records = HBaseSystemRecordStore.open(provider, identity, plan.system(), scope).join();
+              var legacyIndex = awaitBackfilledIndex(records, legacyRevision, scope);
+              var legacyDecision = new HBaseCommitDecisionRepository(records)
+                  .read(legacyIndex.decision().sequence(), scope).join().orElseThrow();
+              var legacyRoot = new HBaseManifestRepository(records)
+                  .readRoot(legacyDecision.manifestRoot(), scope).join().orElseThrow();
+              legacyIndex.verifySelected(legacyDecision, legacyRoot);
+              var index = new HBaseEventRevisionIndexRepository(records)
+                  .read(revision, scope).join().orElseThrow();
+              var decision = new HBaseCommitDecisionRepository(records)
+                  .read(index.decision().sequence(), scope).join().orElseThrow();
+              var root = new HBaseManifestRepository(records)
+                  .readRoot(decision.manifestRoot(), scope).join().orElseThrow();
+              index.verifySelected(decision, root);
+            }
+          }
+          M3TableGroupRuntimeIT.waitForLeaseExpiry(plan, provider, identity);
+          try (var restarted = RuntimeServer.startM3(configuration,
+                   activation("3", true, EVENT_INDEX_OWNER_LEASE_MILLIS, EVENT_INDEX_HEARTBEAT_MILLIS));
+               var scope = RequestScope.withTimeout(Duration.ofSeconds(30))) {
+            assertTrue(restarted.dataReady());
+            assertEquals(1, rangeKey(restarted, "j44-legacy-key".getBytes(StandardCharsets.UTF_8)).getKvsCount());
+            var records = HBaseSystemRecordStore.open(provider, identity, plan.system(), scope).join();
+            var control = HBaseCommitControlStore.open(provider, identity, plan.system(), scope).join();
+            assertEquals(registryNamespace,
+                control.read(scope).join().orElseThrow().state().eventRegistryNamespace().orElseThrow());
+            var index = new HBaseEventRevisionIndexRepository(records)
+                .read(revision, scope).join().orElseThrow();
+            var decision = new HBaseCommitDecisionRepository(records)
+                .read(index.decision().sequence(), scope).join().orElseThrow();
+            var root = new HBaseManifestRepository(records)
+                .readRoot(decision.manifestRoot(), scope).join().orElseThrow();
+            index.verifySelected(decision, root);
+          }
+        }
+      }
+    }
+  }
+
+  private static Rpc.PutResponse putAndReadSharedTailer(RuntimeServer runtime,
+      M3TableGroupPlan plan) throws Exception {
+    ByteKey key = ByteKey.copyOf("j44-index-key".getBytes(StandardCharsets.UTF_8));
+    var limits = new BudgetManager.Limits(8, 8, 8, 8, 8, 1L << 20, 1L << 30);
+    var budgets = new BudgetManager(limits, Map.of("events", limits), limits);
+    var retained = new BudgetManager.Reservation(0, 1, 1, 1L << 20, 0);
+    M3TableGroupRuntime groupRuntime = runtime.tableGroupRuntime(plan.source().tableGroupId());
+    SharedEventTailer tailer;
+    try {
+      tailer = groupRuntime.eventTailerReady().get(60, TimeUnit.SECONDS);
+    } catch (java.util.concurrent.TimeoutException timeout) {
+      throw new AssertionError("shared event tailer did not become ready: backfill="
+          + groupRuntime.metrics().eventBackfill() + ", historyFailures="
+          + groupRuntime.metrics().eventHistoryFailures() + ", tailer="
+          + groupRuntime.metrics().eventTailer(), timeout);
+    }
+    try (var exactScope = RequestScope.withTimeout(Duration.ofSeconds(30));
+         var intervalScope = RequestScope.withTimeout(Duration.ofSeconds(30));
+         var exactMemory = budgets.admit("events", exactScope, retained);
+         var intervalMemory = budgets.admit("events", intervalScope, retained);
+         var exact = tailer.subscribe(KeyRange.point(key), exactMemory, 64, 1L << 20);
+         var interval = tailer.subscribe(KeyRange.all(), intervalMemory, 64, 1L << 20)) {
+        var metrics = groupRuntime.metrics();
+        var metricsBefore = metrics.eventTailer();
+        Rpc.PutResponse response = putThrough(runtime, "j44-index-key", 2);
+        try {
+          try (var pointEvent = awaitDelivery(exact, Duration.ofSeconds(30));
+               var rangeEvent = awaitDelivery(interval, Duration.ofSeconds(30))) {
+            assertEquals(key, pointEvent.event().current().key());
+            assertEquals(key, rangeEvent.event().current().key());
+            assertEquals(response.getHeader().getRevision(), pointEvent.revision());
+            assertEquals(pointEvent.sequence(), rangeEvent.sequence());
+          }
+        } catch (AssertionError failure) {
+          throw new AssertionError("eventTailer=" + groupRuntime.metrics().eventTailer()
+              + ", capturedClosed=" + tailer.isClosed()
+              + ", currentInstalled=" + groupRuntime.eventTailer().isPresent()
+              + ", exactTermination=" + exact.termination()
+              + ", intervalTermination=" + interval.termination()
+              + ", cursor=" + tailer.completedSequence() + "/" + tailer.completedRevision()
+              + ", observedSequence=" + tailer.observedPublishedSequence(), failure);
+        }
+        assertTrue(exact.poll().isEmpty());
+        assertTrue(interval.poll().isEmpty());
+        awaitEventTailerMetrics(metrics, metricsBefore, response.getHeader().getRevision(),
+            Duration.ofSeconds(30));
+        return response;
+    }
+  }
+
+  private static SharedEventTailer.Delivery awaitDelivery(SharedEventTailer.Subscription subscription,
+      Duration timeout) throws Exception {
+    long deadline = System.nanoTime() + timeout.toNanos();
+    while (System.nanoTime() < deadline) {
+      var delivery = subscription.poll();
+      if (delivery.isPresent()) return delivery.orElseThrow();
+      if (subscription.termination().isPresent()) {
+        throw new AssertionError("runtime event tailer stopped subscription: " + subscription.termination());
+      }
+      Thread.sleep(10);
+    }
+    throw new AssertionError("runtime event tailer did not deliver the committed event");
+  }
+
+  private static io.etcdhbase.server.observability.RequestMetrics.EventTailerSnapshot awaitEventTailerMetrics(
+      io.etcdhbase.server.observability.RequestMetrics metrics,
+      io.etcdhbase.server.observability.RequestMetrics.EventTailerSnapshot before,
+      long expectedRevision, Duration timeout) throws InterruptedException {
+    long timeoutNanos = timeout.toNanos();
+    long startedAtNanos = System.nanoTime();
+    io.etcdhbase.server.observability.RequestMetrics.EventTailerSnapshot observed;
+    while (System.nanoTime() - startedAtNanos < timeoutNanos) {
+      observed = metrics.eventTailer();
+      if (observed.events() > before.events() && observed.revision() >= expectedRevision) return observed;
+      TimeUnit.MILLISECONDS.sleep(25);
+    }
+    observed = metrics.eventTailer();
+    throw new AssertionError("event tailer metrics did not record the delivered event revision "
+        + expectedRevision + ": before=" + before + ", observed=" + observed);
+  }
+
+  private static io.etcdhbase.core.commit.EventRevisionIndex awaitBackfilledIndex(
+      HBaseSystemRecordStore records, long revision, RequestScope scope) throws Exception {
+    var indexes = new HBaseEventRevisionIndexRepository(records);
+    while (!scope.isDeadlineExceeded()) {
+      var found = indexes.read(revision, scope).join();
+      if (found.isPresent()) return found.orElseThrow();
+      Thread.sleep(50);
+    }
+    throw new AssertionError("legacy event index was not backfilled before the deadline");
+  }
 
   @Test
   void realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts() throws Exception {
@@ -245,9 +429,13 @@ class M4LeaseRpcIT {
 
   private static M3RuntimeConfiguration minimumActivation() {
     int maxRequest = 1_572_864;
+    long reservedMemory = LeaseBudgetProfile.perGroupCapacity(maxRequest).memoryBytes();
+    long recoveryMemory = LeaseBudgetProfile.RECOVERY_MEMORY.total();
+    long startupMemory = Math.addExact(recoveryMemory, LeaseBudgetProfile.startupLeaseScanMemory().total());
+    long regularMemory = Math.max(M3MemoryReservations.minimumLeaseMemory(1, maxRequest), startupMemory);
+    long minimumMemory = Math.addExact(reservedMemory, regularMemory);
     return new M3RuntimeConfiguration("1", 6_000, 1_000, 60_000, 30_000,
-        Math.addExact(M3MemoryReservations.minimumLeaseMemory(1, maxRequest),
-            LeaseBudgetProfile.capacityForGroups(1, maxRequest).memoryBytes()), maxRequest,
+        minimumMemory, maxRequest,
         2, 16, 60_000, false, true, 5, 1_000, 1_000,
         LeaseCostAdmission.DEFAULT_LIMITS.maximumBindings(),
         LeaseCostAdmission.DEFAULT_LIMITS.maximumKeyBytes(),
@@ -2839,12 +3027,17 @@ class M4LeaseRpcIT {
 
   private static M3RuntimeConfiguration activation(String memberId, boolean enableLeaseApi)
       throws Exception {
+    return activation(memberId, enableLeaseApi, TEST_OWNER_LEASE_MILLIS, TEST_HEARTBEAT_MILLIS);
+  }
+
+  private static M3RuntimeConfiguration activation(String memberId, boolean enableLeaseApi,
+      int ownerLeaseMillis, int heartbeatMillis) throws Exception {
     ObjectMapper mapper = new ObjectMapper();
     Path path = WireProcesses.repositoryRoot().resolve("config/examples/m4/activation.json");
     ObjectNode tree = (ObjectNode) mapper.readTree(Files.readAllBytes(path));
     // MiniCluster admin procedures can exceed a 400 ms heartbeat timeout under Maven load.
-    tree.put("member_id", memberId).put("owner_lease_ms", TEST_OWNER_LEASE_MILLIS)
-        .put("heartbeat_ms", TEST_HEARTBEAT_MILLIS)
+    tree.put("member_id", memberId).put("owner_lease_ms", ownerLeaseMillis)
+        .put("heartbeat_ms", heartbeatMillis)
         .put("m4_lease_api_enabled", enableLeaseApi);
     return new M3RuntimeConfigurationLoader()
         .load(new ByteArrayInputStream(mapper.writeValueAsBytes(tree)));

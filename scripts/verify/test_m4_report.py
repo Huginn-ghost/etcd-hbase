@@ -84,6 +84,47 @@ class M4ReportTest(unittest.TestCase):
                 with self.assertRaisesRegex(m4_report.ReportError, "binding, TTL projection"):
                     m4_report.validate_registry_document(missing_case)
 
+    def test_j44_registry_requires_empty_replacement_index_regression(self) -> None:
+        class_name = "io.etcdhbase.core.commit.EventSubscriptionIndexTest"
+        method_name = "replacingRegistrationWithEmptyRangeRemovesPreviousPointOrInterval"
+
+        for missing_suite in (True, False):
+            changed = copy.deepcopy(self.registry)
+            task = next(item for item in changed["tasks"] if item["id"] == "J44")
+            if missing_suite:
+                task["maven_tests"] = [suite for suite in task["maven_tests"]
+                                        if suite["class"] != class_name]
+            else:
+                suite = next(item for item in task["maven_tests"] if item["class"] == class_name)
+                suite["tests"].remove(method_name)
+            with self.subTest(missing_suite=missing_suite):
+                with self.assertRaises(m4_report.ReportError):
+                    m4_report.validate_registry_document(changed)
+
+    def test_j44_registry_requires_pin_lifecycle_and_owner_lane_regressions(self) -> None:
+        required_cases = {
+            "io.etcdhbase.core.commit.SealedEventCursorTest": {
+                "measuredProofReadsChargeActualEncodedBytesAndAllowNinthSmallRead",
+                "measuredProofReadsStillRejectActualBytesBeyondTheirCumulativeLimit",
+                "sequenceReaderPersistsSelectedEventRootBeforeReadingItsIndex",
+                "synchronousSequenceOpenFailureClosesTailerAndSubscriptions",
+            },
+            "io.etcdhbase.server.commit.EventHistoryWorkerTest": {
+                "slowBackfillReadDoesNotBlockHeartbeatAndPublicationUsesOwnerLane",
+            },
+        }
+
+        for class_name, methods in required_cases.items():
+            for method_name in methods:
+                with self.subTest(class_name=class_name, method_name=method_name):
+                    changed = copy.deepcopy(self.registry)
+                    task = next(item for item in changed["tasks"] if item["id"] == "J44")
+                    suite = next(item for item in task["maven_tests"]
+                                 if item["class"] == class_name)
+                    suite["tests"].remove(method_name)
+                    with self.assertRaises(m4_report.ReportError):
+                        m4_report.validate_registry_document(changed)
+
     def test_both_registries_reject_malformed_or_duplicate_go_packages(self) -> None:
         for task_id in ("J40", "J41"):
             for invalid in (None, {"package": 1}, {"package": "extra", "tests": []},
@@ -119,6 +160,75 @@ class M4ReportTest(unittest.TestCase):
     def test_all_tasks_is_rejected_while_j41_to_j47_are_pending(self) -> None:
         with self.assertRaisesRegex(m4_report.ReportError, "not registered"):
             m4_report.validate_all_tasks_registered(self.registry)
+
+    def test_j44_registry_requires_tailer_backfill_and_layout_regressions(self) -> None:
+        missing_suite = copy.deepcopy(self.registry)
+        task = next(item for item in missing_suite["tasks"] if item["id"] == "J44")
+        task["maven_tests"] = [
+            suite for suite in task["maven_tests"]
+            if suite["class"] != "io.etcdhbase.hbase.storage.J44EventPinIT"
+        ]
+        with self.assertRaisesRegex(m4_report.ReportError, "suites are incomplete"):
+            m4_report.validate_registry_document(missing_suite)
+
+        missing_scan_suite = copy.deepcopy(self.registry)
+        task = next(item for item in missing_scan_suite["tasks"] if item["id"] == "J44")
+        task["maven_tests"] = [
+            suite for suite in task["maven_tests"]
+            if suite["class"] != "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT"
+        ]
+        with self.assertRaisesRegex(m4_report.ReportError, "suites are incomplete"):
+            m4_report.validate_registry_document(missing_scan_suite)
+
+        missing_scan_case = copy.deepcopy(self.registry)
+        task = next(item for item in missing_scan_case["tasks"] if item["id"] == "J44")
+        suite = next(item for item in task["maven_tests"]
+                     if item["class"] == "io.etcdhbase.hbase.storage.HBaseSystemRecordStoreScanIT")
+        suite["tests"].append("seeksLatestExpiryCheckpointAtTheReadBarrier")
+        suite["tests"].remove("seeksEventRevisionsWithinOneBucketAndResumesExclusively")
+        with self.assertRaisesRegex(m4_report.ReportError, "cursor, backfill, fairness, or layout"):
+            m4_report.validate_registry_document(missing_scan_case)
+
+        missing_fairness = copy.deepcopy(self.registry)
+        task = next(item for item in missing_fairness["tasks"] if item["id"] == "J44")
+        suite = next(item for item in task["maven_tests"]
+                     if item["class"] == "io.etcdhbase.server.commit.SerialMutationQueueTest")
+        suite["tests"].remove("backgroundWorkHasReservedCapacityAndRoundRobinsWithOtherLanes")
+        with self.assertRaisesRegex(m4_report.ReportError, "fairness"):
+            m4_report.validate_registry_document(missing_fairness)
+
+    def test_complete_j44_minicluster_artifact_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact = Path(temporary)
+            task = next(item for item in self.registry["tasks"] if item["id"] == "J44")
+            run_id = artifact.name
+            source_commit = "a" * 40
+            base_commit = "b" * 40
+            command_names = sorted(m4_report.J44_REQUIRED_COMMANDS)
+            commands = []
+            for name in command_names:
+                output = f"{name}.log"
+                error = f"{name}.stderr"
+                (artifact / output).write_text("completed\n", encoding="utf-8")
+                (artifact / error).write_text("", encoding="utf-8")
+                commands.append({
+                    "name": name,
+                    "argv": ["verification", name],
+                    "exit_code": 0,
+                    "started_at": "2026-11-14T00:00:00Z",
+                    "finished_at": "2026-11-14T00:00:01Z",
+                    "stdout_log": output,
+                    "stderr_log": error,
+                })
+            self._write_run_manifest(artifact, "J44", run_id, source_commit, base_commit, commands)
+            self._write_maven_test_reports(artifact, task)
+
+            summary = m4_report.validate_artifact(m4_report.REPO, artifact, self.registry)
+
+            self.assertEqual("J44", summary["task"])
+            self.assertEqual("real-HBase-MiniCluster-event-and-layout-tests", summary["evidence"])
+            self.assertEqual(0, summary["go_test_count"])
+            self.assertGreater(summary["java_test_count"], 0)
 
     def test_complete_j40_artifact_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

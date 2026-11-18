@@ -3,6 +3,7 @@ package io.etcdhbase.hbase.storage;
 import io.etcdhbase.core.commit.CommitControlStore;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
+import io.etcdhbase.core.commit.SystemRecordRead;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
 import io.etcdhbase.hbase.codec.CommitControlMessages;
@@ -33,20 +34,23 @@ public final class HBaseCommitControlStore implements CommitControlStore {
   private final boolean auxiliarySupported;
   private final boolean leaseBindingsSupported;
   private final boolean leaseExpiryCheckpointsSupported;
+  private final boolean eventRevisionIndexSupported;
 
   private HBaseCommitControlStore(AsyncConnection connection, SystemTableBinding binding,
       boolean auxiliarySupported, boolean leaseBindingsSupported,
-      boolean leaseExpiryCheckpointsSupported) {
+      boolean leaseExpiryCheckpointsSupported, boolean eventRevisionIndexSupported) {
     this.connection = connection;
     this.binding = binding;
     this.auxiliarySupported = auxiliarySupported;
     this.leaseBindingsSupported = leaseBindingsSupported;
     this.leaseExpiryCheckpointsSupported = leaseExpiryCheckpointsSupported;
+    this.eventRevisionIndexSupported = eventRevisionIndexSupported;
   }
 
   public boolean supportsAuxiliary() { return auxiliarySupported; }
   public boolean supportsLeaseBindings() { return leaseBindingsSupported; }
   public boolean supportsLeaseExpiryCheckpoints() { return leaseExpiryCheckpointsSupported; }
+  public boolean supportsEventRevisionIndex() { return eventRevisionIndexSupported; }
 
   public static CompletableFuture<HBaseCommitControlStore> open(
       HBaseConnectionFactory factory,
@@ -60,17 +64,28 @@ public final class HBaseCommitControlStore implements CommitControlStore {
               binding.validate(descriptor);
               return new HBaseCommitControlStore(connection, binding,
                   binding.supportsAuxiliary(descriptor), binding.supportsLeaseBindings(descriptor),
-                  binding.supportsLeaseExpiryCheckpoints(descriptor));
+                  binding.supportsLeaseExpiryCheckpoints(descriptor),
+                  binding.supportsEventRevisionIndex(descriptor));
             }))).exceptionallyCompose(failure -> failed(failure));
   }
 
   @Override
   public CompletableFuture<Optional<ControlSnapshot>> read(RequestScope scope) {
+    return readWithSize(scope).thenApply(SystemRecordRead::value);
+  }
+
+  @Override
+  public CompletableFuture<SystemRecordRead<ControlSnapshot>> readWithSize(RequestScope scope) {
     long requestPayloadBytes = (long) binding.controlRow().length + binding.family().length;
     return execute(scope, requestPayloadBytes, table -> {
       var get = new Get(binding.controlRow()).setConsistency(Consistency.STRONG)
           .addFamily(binding.family());
-      return table.get(get).thenApply(this::snapshot);
+      return table.get(get).thenApply(row -> {
+        Optional<ControlSnapshot> snapshot = snapshot(row);
+        long encodedBytes = snapshot.map(value -> Math.addExact((long) binding.controlRow().length,
+            value.comparisonToken().length)).orElse(0L);
+        return new SystemRecordRead<>(snapshot, encodedBytes);
+      });
     });
   }
 
@@ -83,6 +98,7 @@ public final class HBaseCommitControlStore implements CommitControlStore {
         || initialState.supportsAuxiliaryRecords() && !auxiliarySupported
         || initialState.supportsLeaseBindings() && !leaseBindingsSupported
         || initialState.supportsLeaseExpiryCheckpoints() && !leaseExpiryCheckpointsSupported
+        || initialState.supportsEventRevisionIndex() && !eventRevisionIndexSupported
         || initialState.publication().isPresent()) {
       return CompletableFuture.failedFuture(new IllegalArgumentException(
           "control initialization requires a fenced empty initial state"));
@@ -104,7 +120,8 @@ public final class HBaseCommitControlStore implements CommitControlStore {
     if (!Arrays.equals(CommitControlMessages.encode(observed.state()), observed.comparisonToken())
         || !observed.state().profileFingerprint().equals(binding.profileFingerprint())
         || !observed.state().profileFingerprint().equals(replacement.profileFingerprint())
-        || replacement.stateVersion() != Math.addExact(observed.state().stateVersion(), 1)) {
+        || replacement.stateVersion() != Math.addExact(observed.state().stateVersion(), 1)
+        || replacement.supportsEventRevisionIndex() && !eventRevisionIndexSupported) {
       return CompletableFuture.failedFuture(new IllegalArgumentException(
           "control replacement must advance the exact observed state"));
     }
@@ -128,7 +145,20 @@ public final class HBaseCommitControlStore implements CommitControlStore {
             && state.ownerInstance().isPresent()
             && Arrays.equals(CommitControlMessages.encode(replacement), CommitControlMessages.encode(
                 state.upgradeLeaseExpiryFormat(state.ownerInstance().orElseThrow(), state.ownerEpoch(), 0)));
-        if (!auxiliaryUpgrade && !leaseBindingUpgrade && !leaseExpiryUpgrade) {
+        boolean eventIndexUpgrade = state.formatVersion() == CommitState.LEASE_EXPIRY_FORMAT_VERSION
+            && replacement.formatVersion() == CommitState.EVENT_INDEX_FORMAT_VERSION
+            && eventRevisionIndexSupported && state.ownerInstance().isPresent()
+            && Arrays.equals(CommitControlMessages.encode(replacement), CommitControlMessages.encode(
+                state.upgradeEventIndexFormat(state.ownerInstance().orElseThrow(), state.ownerEpoch(), 0)));
+        boolean eventRegistryUpgrade = state.formatVersion() == CommitState.EVENT_INDEX_FORMAT_VERSION
+            && replacement.formatVersion() == CommitState.EVENT_REGISTRY_FORMAT_VERSION
+            && eventRevisionIndexSupported && state.ownerInstance().isPresent()
+            && state.pendingEventRegistryNamespace().isPresent()
+            && Arrays.equals(CommitControlMessages.encode(replacement), CommitControlMessages.encode(
+                state.upgradeEventRegistryFormat(state.ownerInstance().orElseThrow(), state.ownerEpoch(), 0,
+                    state.pendingEventRegistryNamespace().orElseThrow())));
+        if (!auxiliaryUpgrade && !leaseBindingUpgrade && !leaseExpiryUpgrade && !eventIndexUpgrade
+            && !eventRegistryUpgrade) {
           return CompletableFuture.failedFuture(new IllegalArgumentException("invalid control format upgrade"));
         }
       } catch (IllegalArgumentException | IllegalStateException | ArithmeticException failure) {
@@ -158,6 +188,9 @@ public final class HBaseCommitControlStore implements CommitControlStore {
       throw new IllegalArgumentException("control row is missing its state cell");
     }
     CommitState state = CommitControlMessages.decode(value);
+    if (state.supportsEventRevisionIndex() && !eventRevisionIndexSupported) {
+      throw new IllegalStateException("event index control format requires its table capability");
+    }
     if (!state.profileFingerprint().equals(binding.profileFingerprint())) {
       throw new IllegalArgumentException("control state profile differs from its system table binding");
     }

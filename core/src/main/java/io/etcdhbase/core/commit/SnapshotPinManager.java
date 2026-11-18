@@ -42,6 +42,8 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     this.registryId = registryId;
   }
 
+  ByteKey registryIdentity() { return registryId; }
+
   /** Opens an established registry or resumes an initialization with a durable witness. */
   public static CompletableFuture<SnapshotPinManager> open(SystemRecordStore records,
       SnapshotPinConfiguration configuration, RequestScope scope) {
@@ -52,6 +54,28 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
   public static CompletableFuture<SnapshotPinManager> open(SystemRecordStore records,
       SnapshotPinConfiguration configuration, Clock clock, RequestScope scope) {
     return start(records, configuration, clock, scope, false);
+  }
+
+  /** Opens a selected namespace without resuming or recreating initialization metadata. */
+  static CompletableFuture<SnapshotPinManager> openSealed(SystemRecordStore records,
+      SnapshotPinConfiguration configuration, Clock clock, RequestScope scope) {
+    Objects.requireNonNull(records, "records");
+    Objects.requireNonNull(configuration, "configuration");
+    Objects.requireNonNull(clock, "clock");
+    Objects.requireNonNull(scope, "scope");
+    var manager = new SnapshotPinManager(records, configuration, clock,
+        ByteKey.copyOf(TransactionId.create().bytes()));
+    return manager.readConfiguration(scope).thenCompose(configurationRecord ->
+        manager.readInitialization(scope).thenCompose(initialization -> {
+          StoredConfiguration stored = configurationRecord.orElseThrow(
+              () -> new IllegalStateException("selected snapshot pin configuration is missing"));
+          ByteKey selected = stored.value().registryId();
+          if (initialization.isEmpty()
+              || initialization.orElseThrow().value().sealedRegistryId().filter(selected::equals).isEmpty()) {
+            return failed(new IllegalStateException("selected snapshot pin witness is missing or unsealed"));
+          }
+          return manager.finishOpen(stored, scope);
+        }));
   }
 
   /**
@@ -97,13 +121,33 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     Objects.requireNonNull(scope, "scope");
     if (!active(scope)) return failed(inactive(scope));
     final PinRequirement requirement;
-    final ByteKey pinId;
     try {
       requirement = PinRequirement.from(view, auxiliary);
-      pinId = ByteKey.copyOf(TransactionId.create().bytes());
     } catch (RuntimeException failure) {
       return failed(failure);
     }
+    return registerRequirement(requirement, scope).thenApply(pin -> pin);
+  }
+
+  CompletableFuture<PinLease> registerProtected(long revision, long sequence, ByteKey digest,
+      Optional<TransactionId> transaction, Optional<ByteKey> eventRoot,
+      Optional<ByteKey> eventRootDigest, RequestScope scope) {
+    Objects.requireNonNull(scope, "scope");
+    if (!active(scope)) return failed(inactive(scope));
+    if (revision <= 0 || sequence <= 0 || digest == null || digest.length() != 32
+        || transaction == null || eventRoot == null || eventRootDigest == null
+        || transaction.isPresent() != eventRoot.isPresent()
+        || eventRoot.isPresent() != eventRootDigest.isPresent()
+        || eventRoot.filter(root -> root.length() == 0 || root.length() > 1024).isPresent()
+        || eventRootDigest.filter(value -> value.length() != 32).isPresent()) {
+      return failed(new IllegalArgumentException("invalid event history pin requirement"));
+    }
+    return registerRequirement(new PinRequirement(revision, sequence, digest, transaction,
+        eventRoot, eventRootDigest), scope);
+  }
+
+  private CompletableFuture<PinLease> registerRequirement(PinRequirement requirement, RequestScope scope) {
+    ByteKey pinId = ByteKey.copyOf(TransactionId.create().bytes());
     int shard = shardFor(pinId);
     return registerAttempt(shard, pinId, requirement, scope, 0);
   }
@@ -432,7 +476,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     });
   }
 
-  private CompletableFuture<Pin> registerAttempt(int shard, ByteKey pinId,
+  private CompletableFuture<PinLease> registerAttempt(int shard, ByteKey pinId,
       PinRequirement requirement, RequestScope scope, int attempt) {
     if (attempt >= MAX_CAS_ATTEMPTS) {
       return failed(new BackendFailure(BackendFailure.Category.UNKNOWN));
@@ -442,7 +486,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
         registerFromShard(stored, pinId, requirement, scope, attempt));
   }
 
-  private CompletableFuture<Pin> registerFromShard(StoredShard stored, ByteKey pinId,
+  private CompletableFuture<PinLease> registerFromShard(StoredShard stored, ByteKey pinId,
       PinRequirement requirement, RequestScope scope, int attempt) {
     SnapshotPinShard current = stored.shard();
     if (belowRegistrationFloor(current, requirement)) {
@@ -469,14 +513,14 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     return registerInReusableSlot(stored, pinId, requirement, scope, attempt, now);
   }
 
-  private CompletableFuture<Pin> expireAndRetry(StoredShard stored, int slot,
+  private CompletableFuture<PinLease> expireAndRetry(StoredShard stored, int slot,
       ByteKey pinId, PinRequirement requirement, RequestScope scope, int attempt) {
     return transitionExpiredSlot(stored, slot, scope, 0)
         .thenCompose(ignored -> registerAttempt(stored.shard().shard(), pinId,
             requirement, scope, attempt + 1));
   }
 
-  private CompletableFuture<Pin> registerInReusableSlot(StoredShard stored, ByteKey pinId,
+  private CompletableFuture<PinLease> registerInReusableSlot(StoredShard stored, ByteKey pinId,
       PinRequirement requirement, RequestScope scope, int attempt, long now) {
     SnapshotPinShard current = stored.shard();
     int slotIndex = reusableSlot(current);
@@ -526,7 +570,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     return -1;
   }
 
-  private CompletableFuture<Pin> resolveRegistration(int shard, ByteKey pinId,
+  private CompletableFuture<PinLease> resolveRegistration(int shard, ByteKey pinId,
       PinRequirement requirement, RequestScope scope, int attempt, Throwable priorFailure) {
     if (!active(scope)) return failed(inactive(scope));
     if (priorFailure != null && !outcomeUnknown(priorFailure)) {
@@ -540,7 +584,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
         : registerAttempt(shard, pinId, requirement, scope, attempt));
   }
 
-  private Pin resolveObservedRegistration(StoredShard stored, Throwable readFailure, int shard,
+  private PinLease resolveObservedRegistration(StoredShard stored, Throwable readFailure, int shard,
       ByteKey pinId, PinRequirement requirement, RequestScope scope, Throwable priorFailure) {
     if (readFailure != null) throw unknownReadFailure(priorFailure, readFailure);
     PinLease existing = findActivePin(stored.shard(), shard, pinId, requirement);
@@ -817,7 +861,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
   private record StoredConfiguration(SnapshotPinRecordCodec.RegistryConfiguration value, ByteKey encoded) {}
   private record StoredInitialization(SnapshotPinRecordCodec.Initialization value, ByteKey encoded) {}
   private record StoredShard(SnapshotPinShard shard, ByteKey encoded) {}
-  private record PinRequirement(long requiredRevision, long requiredSequence, ByteKey viewDigest,
+  record PinRequirement(long requiredRevision, long requiredSequence, ByteKey viewDigest,
       Optional<TransactionId> transactionId, Optional<ByteKey> rootIdentity,
       Optional<ByteKey> rootDigest) {
     private static PinRequirement from(ReadView view, boolean auxiliary) {
@@ -831,7 +875,7 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     }
   }
 
-  private final class PinLease implements Pin {
+  final class PinLease implements ReadViewPinRegistry.Pin {
     private final int shard;
     private final int slot;
     private final long generation;
@@ -852,6 +896,15 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
     public CompletableFuture<Void> renew(RequestScope scope) {
       if (closeStarted.get()) return failed(new BackendFailure(BackendFailure.Category.CANCELLED));
       return mutateLease(this, LeaseMutation.RENEW, scope, 0);
+    }
+
+    CompletableFuture<Void> promoteRoot(PinRequirement previous,
+        PinRequirement promoted, RequestScope scope) {
+      Objects.requireNonNull(previous, "previous");
+      Objects.requireNonNull(promoted, "promoted");
+      Objects.requireNonNull(scope, "scope");
+      if (closeStarted.get()) return failed(cancelled());
+      return promoteProtectedRootAttempt(this, previous, promoted, scope, 0);
     }
 
     @Override
@@ -896,6 +949,93 @@ public final class SnapshotPinManager implements ReadViewPinRegistry {
   }
 
   private enum LeaseMutation { RENEW, COMPLETE, RELEASE }
+
+  private CompletableFuture<Void> promoteProtectedRootAttempt(PinLease pin,
+      PinRequirement previous, PinRequirement promoted,
+      RequestScope scope, int attempt) {
+    if (attempt >= MAX_CAS_ATTEMPTS) return failed(new BackendFailure(BackendFailure.Category.UNKNOWN));
+    if (pin.closeStarted.get()) return failed(cancelled());
+    if (!active(scope)) return failed(inactive(scope));
+    return readShard(pin.shard, scope).thenCompose(stored ->
+        promoteObservedRoot(pin, previous, promoted, scope, attempt, stored));
+  }
+
+  private CompletableFuture<Void> promoteObservedRoot(PinLease pin,
+      PinRequirement previous, PinRequirement promoted,
+      RequestScope scope, int attempt, StoredShard stored) {
+    SnapshotPinShard.Slot slot = stored.shard().slots().get(pin.slot);
+    if (!slot.matches(pin.pinId, pin.generation) || slot.status() != SnapshotPinShard.Status.ACTIVE
+        || slot.expiresAtEpochMillis() <= clock.millis()
+        || slot.requiredRevision() != previous.requiredRevision()
+        || slot.requiredSequence() != previous.requiredSequence()) {
+      return failed(cancelled());
+    }
+    if (slot.transactionId().isPresent()) {
+      return matchesProtectedRoot(slot, promoted)
+          ? CompletableFuture.completedFuture(null)
+          : failed(new IllegalStateException("event-history pin is bound to another event root"));
+    }
+    if (!slot.viewDigest().equals(previous.viewDigest())) {
+      return failed(new IllegalStateException("event-history pin digest differs from its promotion source"));
+    }
+    TransactionId transactionId = promoted.transactionId().orElseThrow();
+    SnapshotPinShard.Slot promotedSlot = SnapshotPinShard.Slot.active(slot.generation(), slot.pinId(),
+        slot.requiredRevision(), slot.requiredSequence(), promoted.viewDigest(), slot.expiresAtEpochMillis(),
+        Optional.of(transactionId), promoted.rootIdentity(), promoted.rootDigest());
+    SnapshotPinShard replacement = replaceSlot(stored.shard(), pin.slot, promotedSlot);
+    return compareShard(stored, replacement, scope)
+        .handle((updated, failure) -> new StoreResult<>(updated, failure))
+        .thenCompose(result -> {
+          if (result.failure() == null && Boolean.TRUE.equals(result.value())) {
+            return CompletableFuture.completedFuture(null);
+          }
+          if (result.failure() != null && !outcomeUnknown(result.failure())) {
+            return failed(CompletionFailures.unwrapCompletion(result.failure()));
+          }
+          return resolveRootPromotion(pin, previous, promoted, scope, attempt + 1, result.failure());
+        });
+  }
+
+  private CompletableFuture<Void> resolveRootPromotion(PinLease pin,
+      PinRequirement previous, PinRequirement promoted,
+      RequestScope scope, int attempt, Throwable priorFailure) {
+    if (attempt >= MAX_CAS_ATTEMPTS) return failed(new BackendFailure(BackendFailure.Category.UNKNOWN));
+    if (!active(scope)) return failed(inactive(scope));
+    return readShard(pin.shard, scope).handle((stored, readFailure) -> {
+      if (readFailure != null) throw unknownReadFailure(priorFailure, readFailure);
+      SnapshotPinShard.Slot current = stored.shard().slots().get(pin.slot);
+      if (!current.matches(pin.pinId, pin.generation)
+          || current.status() != SnapshotPinShard.Status.ACTIVE
+          || current.expiresAtEpochMillis() <= clock.millis()
+          || current.requiredRevision() != previous.requiredRevision()
+          || current.requiredSequence() != previous.requiredSequence()
+          || pin.closeStarted.get()) {
+        throw new CompletionException(cancelled());
+      }
+      if (current.transactionId().isPresent()) {
+        if (matchesProtectedRoot(current, promoted)) return true;
+        throw new CompletionException(
+            new IllegalStateException("event-history pin is bound to another event root"));
+      }
+      if (!current.viewDigest().equals(previous.viewDigest())) {
+        throw new CompletionException(
+            new IllegalStateException("event-history pin digest differs from its promotion source"));
+      }
+      if (priorFailure != null && !outcomeUnknown(priorFailure)) {
+        throw new CompletionException(CompletionFailures.unwrapCompletion(priorFailure));
+      }
+      return false;
+    }).thenCompose(isPromoted -> isPromoted ? CompletableFuture.completedFuture(null)
+        : promoteProtectedRootAttempt(pin, previous, promoted, scope, attempt));
+  }
+
+  private static boolean matchesProtectedRoot(SnapshotPinShard.Slot slot,
+      PinRequirement promoted) {
+    return slot.viewDigest().equals(promoted.viewDigest())
+        && slot.transactionId().equals(promoted.transactionId())
+        && slot.rootIdentity().equals(promoted.rootIdentity())
+        && slot.rootDigest().equals(promoted.rootDigest());
+  }
 
   private CompletableFuture<Void> mutateLease(PinLease pin, LeaseMutation mutation,
       RequestScope scope, int attempt) {

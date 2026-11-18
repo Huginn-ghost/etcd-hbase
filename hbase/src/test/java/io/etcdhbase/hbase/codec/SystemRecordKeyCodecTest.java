@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.SystemRecordType;
+import io.etcdhbase.core.commit.EventIndexBackfillCheckpoint;
 import io.etcdhbase.core.lease.ExpiryCandidateIdentity;
 import io.etcdhbase.core.lease.LeaseBindingIdentity;
 import io.etcdhbase.core.lease.LeaseExpiryCheckpoint;
@@ -34,6 +35,7 @@ class SystemRecordKeyCodecTest {
         case LEASE_ENUMERATION -> LeaseRecordIdentity.enumeration(-7);
         case EXPIRY_CANDIDATE -> new ExpiryCandidateIdentity(1_700_000_000_000L, -7, 1, 0).encode();
         case LEASE_EXPIRY_CHECKPOINT -> LeaseExpiryCheckpoint.versionIdentity(1);
+        case EVENT_INDEX_BACKFILL_CHECKPOINT -> EventIndexBackfillCheckpoint.versionIdentity(1);
         case LEASE_BINDING -> new LeaseBindingIdentity(-7, 2, identity, 11).encode();
         default -> identity;
       };
@@ -41,6 +43,20 @@ class SystemRecordKeyCodecTest {
       assertEquals(type, decoded.type());
       assertEquals(encodedIdentity, decoded.identity());
     }
+  }
+
+  @Test
+  void backfillCheckpointVersionsHaveOneRouteAndBoundedReverseSeek() {
+    var type = SystemRecordType.EVENT_INDEX_BACKFILL_CHECKPOINT;
+    var earlier = EventIndexBackfillCheckpoint.versionIdentity(7);
+    var later = EventIndexBackfillCheckpoint.versionIdentity(23);
+    assertEquals(CODEC.bucket(type, earlier), CODEC.bucket(type, later));
+    var bounds = CODEC.leaseVersionBounds(type, EventIndexBackfillCheckpoint.routePrefix(), 11);
+    assertTrue(bounds.reversed());
+    assertArrayEquals(CODEC.encode(type, EventIndexBackfillCheckpoint.versionIdentity(11)), bounds.startRow());
+    assertTrue(bounds.startInclusive());
+    assertFalse(bounds.stopInclusive());
+    assertThrows(IllegalArgumentException.class, () -> CODEC.encode(type, ByteKey.copyOf(new byte[3])));
   }
 
   @Test
@@ -119,6 +135,29 @@ class SystemRecordKeyCodecTest {
     assertArrayEquals(exactKeyPrefix, bounds.stopRow());
     assertTrue(Arrays.compareUnsigned(bounds.stopRow(), bounds.startRow()) < 0,
         "a reverse seek must stop below its inclusive sequence row");
+  }
+
+  @Test
+  void eventRevisionSeekStartsAtRequestedRevisionInEveryBucket() {
+    ByteKey first = ByteKey.copyOf(ByteBuffer.allocate(Long.BYTES).putLong(7).array());
+    int bucket = CODEC.bucket(SystemRecordType.EVENT_REVISION_INDEX, first);
+    long nextRevision = 8;
+    ByteKey next = ByteKey.copyOf(ByteBuffer.allocate(Long.BYTES).putLong(nextRevision).array());
+    while (CODEC.bucket(SystemRecordType.EVENT_REVISION_INDEX, next) != bucket) {
+      next = ByteKey.copyOf(ByteBuffer.allocate(Long.BYTES).putLong(++nextRevision).array());
+    }
+    var bounds = CODEC.eventRevisionBounds(bucket, 7, java.util.Optional.empty());
+    assertArrayEquals(CODEC.encode(SystemRecordType.EVENT_REVISION_INDEX, first), bounds.startRow());
+    assertTrue(bounds.startInclusive());
+    assertTrue(Arrays.compareUnsigned(CODEC.encode(SystemRecordType.EVENT_REVISION_INDEX, next),
+        bounds.stopRow()) < 0);
+    var resumed = CODEC.eventRevisionBounds(bucket, 7, java.util.Optional.of(next));
+    assertArrayEquals(CODEC.encode(SystemRecordType.EVENT_REVISION_INDEX, next), resumed.startRow());
+    assertFalse(resumed.startInclusive());
+    assertThrows(IllegalArgumentException.class,
+        () -> CODEC.eventRevisionBounds(bucket, 8, java.util.Optional.of(first)));
+    assertThrows(IllegalArgumentException.class,
+        () -> CODEC.eventRevisionBounds(bucket, 0, java.util.Optional.empty()));
   }
 
   @Test
