@@ -123,15 +123,30 @@ public final class SharedEventTailer implements AutoCloseable {
   /** Installs the subscription and captures the live cursor under the same lock as publication. */
   public synchronized SubscriptionStart subscribeWithCheckpoint(KeyRange range, BudgetManager.Account account,
       int maximumEvents, long maximumBytes) throws BackendFailure {
+    return subscribeWithCheckpoint(range, account, maximumEvents, maximumBytes, 0);
+  }
+
+  /**
+   * Installs a subscription with an inclusive event floor. Zero means the live checkpoint captured
+   * under this lock; callers may raise the floor after reading the authoritative creation barrier.
+   */
+  public synchronized SubscriptionStart subscribeWithCheckpoint(KeyRange range, BudgetManager.Account account,
+      int maximumEvents, long maximumBytes, long minimumRevision) throws BackendFailure {
     Objects.requireNonNull(range, "range");
     Objects.requireNonNull(account, "account");
-    if (closed || subscriptions.size() >= maximumSubscriptions || maximumEvents < 1 || maximumBytes < 1) {
-      throw new IllegalStateException("shared tailer cannot admit another subscription");
+    if (closed) throw new BackendFailure(BackendFailure.Category.UNAVAILABLE);
+    if (subscriptions.size() >= maximumSubscriptions) {
+      throw new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT);
+    }
+    if (maximumEvents < 1 || maximumBytes < 1) {
+      throw new IllegalArgumentException("subscription limits must be positive");
     }
     long indexBytes = subscriptionIndexMemoryBytes(range);
     BudgetManager.Lease indexMemory = account.tryRetain(BudgetManager.Memory.OUTPUT, indexBytes)
         .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
-    var subscription = new Subscription(range, account, maximumEvents, maximumBytes, indexMemory);
+    long effectiveMinimum = minimumRevision == 0 ? nextRevision(revision) : minimumRevision;
+    var subscription = new Subscription(range, account, maximumEvents, maximumBytes,
+        indexMemory, effectiveMinimum);
     try {
       subscriptions.add(subscription);
       subscriptionIndex.add(subscription, range);
@@ -153,6 +168,10 @@ public final class SharedEventTailer implements AutoCloseable {
     return bytes;
   }
 
+  private static long nextRevision(long revision) {
+    return revision == Long.MAX_VALUE ? Long.MAX_VALUE : revision + 1;
+  }
+
   /** Reads at most one selected sequence or event without advancing shared tailer state. */
   public CompletableFuture<StepProposal> prepareStep(RequestScope scope,
       ManifestCatalog.ProofReadBudget budget) {
@@ -163,9 +182,12 @@ public final class SharedEventTailer implements AutoCloseable {
     long expectedRevision;
     CommitDecision decision;
     synchronized (this) {
-      if (closed || busy || !budget.belongsTo(scope) || active != null && activeScope != scope) {
+      if (closed) {
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+      }
+      if (busy || !budget.belongsTo(scope) || active != null && activeScope != scope) {
         return CompletableFuture.failedFuture(
-            new IllegalStateException("shared tailer is closed, busy, or has another scope"));
+            new IllegalStateException("shared tailer is busy or has another active scope"));
       }
       busy = true;
       inFlightScope = scope;
@@ -208,12 +230,13 @@ public final class SharedEventTailer implements AutoCloseable {
     if (proposal.owner != this || !proposal.consumed.compareAndSet(false, true)) {
       return CompletableFuture.failedFuture(new IllegalArgumentException("step proposal is foreign or consumed"));
     }
+    List<Runnable> wakeups = new ArrayList<>();
     ProtectedEventCursor completedCursor = null;
     Step result;
     try {
       synchronized (this) {
         requireCurrent(proposal);
-        result = apply(proposal);
+        result = apply(proposal, wakeups);
         if (proposal.step == Step.PUBLISHED) completedCursor = proposal.cursor;
         busy = false;
         inFlightScope = null;
@@ -223,9 +246,15 @@ public final class SharedEventTailer implements AutoCloseable {
     } catch (RuntimeException | Error failure) {
       return failApply(proposal, failure);
     }
-    if (completedCursor == null) return CompletableFuture.completedFuture(result);
+    if (completedCursor == null) {
+      notifyWakeups(wakeups);
+      return CompletableFuture.completedFuture(result);
+    }
     completedCursor.close();
-    return completedCursor.releaseCompletion().thenApply(ignored -> result).toCompletableFuture();
+    return completedCursor.releaseCompletion().thenApply(ignored -> {
+      notifyWakeups(wakeups);
+      return result;
+    }).toCompletableFuture();
   }
 
   private CompletableFuture<Step> failApply(StepProposal proposal, Throwable failure) {
@@ -326,7 +355,7 @@ public final class SharedEventTailer implements AutoCloseable {
     }
   }
 
-  private Step apply(StepProposal proposal) throws BackendFailure {
+  private Step apply(StepProposal proposal, List<Runnable> wakeups) throws BackendFailure {
     return switch (proposal.step) {
       case WAITING -> Step.WAITING;
       case METADATA -> {
@@ -367,7 +396,7 @@ public final class SharedEventTailer implements AutoCloseable {
         bufferedBytes += event.retainedBytes();
         yield Step.BUFFERED;
       }
-      case PUBLISHED -> finishRevision(proposal);
+      case PUBLISHED -> finishRevision(proposal, wakeups);
     };
   }
 
@@ -380,17 +409,23 @@ public final class SharedEventTailer implements AutoCloseable {
     }
   }
 
-  private Step finishRevision(StepProposal proposal) {
+  private Step finishRevision(StepProposal proposal, List<Runnable> wakeups) {
     requireOpen();
     if (proposal.cursor != active || proposal.decision != activeDecision) {
       throw new java.util.concurrent.CompletionException(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
     }
     try {
       List<Subscription> matches = new ArrayList<>();
+      Set<Subscription> changed = new HashSet<>();
       for (Buffered event : buffered) {
         matches.clear();
         subscriptionIndex.forEachMatch(event.event().current().key(), matches::add);
-        for (Subscription subscription : matches) subscription.offer(event, activeDecision);
+        for (Subscription subscription : matches) {
+          if (subscription.offer(event, activeDecision, wakeups)) changed.add(subscription);
+        }
+      }
+      for (Subscription subscription : changed) {
+        if (subscription.wakeup != null) wakeups.add(subscription.wakeup);
       }
     } catch (RuntimeException | Error failure) {
       close();
@@ -418,8 +453,33 @@ public final class SharedEventTailer implements AutoCloseable {
     close();
   }
 
+  private static void notifyWakeups(List<Runnable> wakeups) {
+    Throwable failure = null;
+    for (Runnable wakeup : wakeups) {
+      try {
+        wakeup.run();
+      } catch (RuntimeException | Error callbackFailure) {
+        if (failure == null) {
+          failure = callbackFailure;
+        } else if (callbackFailure != failure) {
+          if (callbackFailure instanceof Error && !(failure instanceof Error)) {
+            callbackFailure.addSuppressed(failure);
+            failure = callbackFailure;
+          } else {
+            failure.addSuppressed(callbackFailure);
+          }
+        }
+      }
+    }
+    if (failure instanceof Error fatal) throw fatal;
+    if (failure instanceof RuntimeException runtimeFailure) throw runtimeFailure;
+  }
+
   private void requireOpen() {
-    if (closed) throw new IllegalStateException("shared tailer is closed");
+    if (closed) {
+      throw new java.util.concurrent.CompletionException(
+          new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    }
   }
 
   private void releaseBuffered() {
@@ -428,13 +488,20 @@ public final class SharedEventTailer implements AutoCloseable {
     bufferedBytes = 0;
   }
 
-  @Override public synchronized void close() {
-    if (closed) return;
-    closed = true;
-    if (inFlightScope != null) inFlightScope.cancel();
-    if (active != null) active.close();
-    releaseBuffered();
-    for (Subscription subscription : List.copyOf(subscriptions)) subscription.stop(Termination.TAILER_CLOSED);
+  @Override public void close() {
+    List<Runnable> wakeups = new ArrayList<>();
+    synchronized (this) {
+      if (closed) return;
+      closed = true;
+      if (inFlightScope != null) inFlightScope.cancel();
+      if (active != null) active.close();
+      releaseBuffered();
+      for (Subscription subscription : List.copyOf(subscriptions)) {
+        Runnable wakeup = subscription.stop(Termination.TAILER_CLOSED);
+        if (wakeup != null) wakeups.add(wakeup);
+      }
+    }
+    notifyWakeups(wakeups);
   }
 
   private record Buffered(PreparedEvent event, BudgetManager.Lease memory) {}
@@ -446,32 +513,36 @@ public final class SharedEventTailer implements AutoCloseable {
     private final long maximumBytes;
     private final BudgetManager.Lease indexMemory;
     private final ArrayDeque<Delivery> pending = new ArrayDeque<>();
+    private long minimumRevision;
     private long pendingBytes;
     private Termination termination;
+    private Runnable wakeup;
 
     private Subscription(KeyRange range, BudgetManager.Account account, int maximumEvents, long maximumBytes,
-        BudgetManager.Lease indexMemory) {
+        BudgetManager.Lease indexMemory, long minimumRevision) {
       this.range = range;
       this.account = account;
       this.maximumEvents = maximumEvents;
       this.maximumBytes = maximumBytes;
       this.indexMemory = indexMemory;
+      this.minimumRevision = minimumRevision;
     }
 
-    private void offer(Buffered item, CommitDecision decision) {
+    private boolean offer(Buffered item, CommitDecision decision, List<Runnable> wakeups) {
+      if (decision.revision() < minimumRevision) return false;
       PreparedEvent event = item.event();
       long eventBytes = event.retainedBytes();
       if (pending.size() >= maximumEvents || eventBytes > maximumBytes - pendingBytes) {
-        stop(Termination.RESOURCE_LIMIT);
-        return;
+        stopForResourceLimit(wakeups);
+        return true;
       }
       BudgetManager.Lease retained;
       try {
         retained = account.tryRetain(BudgetManager.Memory.OUTPUT, eventBytes)
             .orElseThrow(() -> new BackendFailure(BackendFailure.Category.RESOURCE_LIMIT));
       } catch (BackendFailure failure) {
-        stop(Termination.RESOURCE_LIMIT);
-        return;
+        stopForResourceLimit(wakeups);
+        return true;
       }
       try {
         pending.addLast(new Delivery(decision.sequence(), decision.revision(), event, retained));
@@ -480,6 +551,48 @@ public final class SharedEventTailer implements AutoCloseable {
         throw failure;
       }
       pendingBytes += eventBytes;
+      return true;
+    }
+
+    private void stopForResourceLimit(List<Runnable> wakeups) {
+      Runnable listener = stop(Termination.RESOURCE_LIMIT);
+      if (listener != null) wakeups.add(listener);
+    }
+
+    /** Installs a bounded consumer wakeup and signals immediately if work is already available. */
+    public void setWakeup(Runnable listener) {
+      boolean notify;
+      synchronized (SharedEventTailer.this) {
+        if (termination == null) {
+          wakeup = listener;
+          notify = listener != null && !pending.isEmpty();
+        } else {
+          wakeup = null;
+          notify = listener != null;
+        }
+      }
+      if (notify) listener.run();
+    }
+
+    /** Raises the inclusive revision floor and releases any live events captured before the barrier. */
+    public void requireRevisionAtLeast(long revision) {
+      if (revision <= 0) throw new IllegalArgumentException("minimum event revision must be positive");
+      synchronized (SharedEventTailer.this) {
+        if (termination != null) return;
+        if (revision < minimumRevision) {
+          throw new IllegalArgumentException("minimum event revision cannot move backwards");
+        }
+        minimumRevision = revision;
+        var queued = pending.iterator();
+        while (queued.hasNext()) {
+          Delivery delivery = queued.next();
+          if (delivery.revision() < minimumRevision) {
+            queued.remove();
+            pendingBytes -= delivery.event().retainedBytes();
+            delivery.close();
+          }
+        }
+      }
     }
 
     /** The receiver owns the returned delivery and must close it after its last use. */
@@ -497,17 +610,22 @@ public final class SharedEventTailer implements AutoCloseable {
     }
 
     @Override public void close() {
-      synchronized (SharedEventTailer.this) { stop(Termination.CANCELLED); }
+      Runnable listener;
+      synchronized (SharedEventTailer.this) { listener = stop(Termination.CANCELLED); }
+      if (listener != null) listener.run();
     }
 
-    private void stop(Termination reason) {
-      if (termination != null) return;
+    private Runnable stop(Termination reason) {
+      if (termination != null) return null;
       termination = reason;
       subscriptions.remove(this);
       subscriptionIndex.remove(this, range);
+      Runnable listener = wakeup;
+      wakeup = null;
       while (!pending.isEmpty()) pending.removeFirst().close();
       pendingBytes = 0;
       indexMemory.close();
+      return listener;
     }
   }
 

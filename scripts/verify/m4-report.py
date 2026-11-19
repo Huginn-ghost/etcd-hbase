@@ -33,6 +33,22 @@ J42_COMPARE_SUCCESS = "M4 KeepAlive traces match the registered native compariso
 J43_COMPARE_SUCCESS = "M4 Revoke traces match the registered native comparison policy"
 REQUIRED_COMMANDS = {"go-module-lock", "go-tests", "maven-verify", "collect-maven-reports"}
 J44_REQUIRED_COMMANDS = {"registry-check", "report-tests", "maven-verify", "collect-maven-reports"}
+J45_REQUIRED_COMMANDS = {
+    "registry-check", "report-tests", "go-tests", "native-watch-oracle",
+    "maven-unit-tests", "collect-maven-reports",
+}
+J45_VERIFICATION_BOUNDARY = (
+    "J45 public protocol evidence covers negative/zero startRevision cases, negative watch ID "
+    "Create/Cancel, future startRevision Create/Cancel, and the Compact-boundary lifecycle. Future-event "
+    "delivery, positive historical startRevision behavior, and replay/live handoff are assigned to J46.1. "
+    "The native raw-proto event probe waits for etcd's synced progress marker as a harness barrier; this "
+    "does not claim Java progress-request support, which is assigned to J46.2. Native raw-proto and local-service "
+    "Go traces compare the registered start/cancel matrix; a separate Go-client lifecycle run exercises multiple "
+    "watch IDs, byte ranges, filters/PrevKV, and client-context cancellation cleanup against "
+    "Java WatchService, including two concurrently requested watchers sharing one pinned client stream. "
+    "Normal server-side request half-close semantics remain assigned to J47. "
+    "MiniCluster acceptance remains outside this unit evidence"
+)
 
 J44_JAVA_CLASS_MODULES = {
     "io.etcdhbase.core.commit.EventRevisionIndexSeekerTest": "core",
@@ -118,6 +134,132 @@ J44_CRITICAL_JAVA_TESTS = {
         "realGoLeaseCallsMatchNativeAndSurviveRestartAcrossLayouts",
     },
 }
+J45_JAVA_CLASS_MODULES = {
+    "io.etcdhbase.core.commit.SealedEventCursorTest": "core",
+    "io.etcdhbase.grpc.service.SkeletonServiceTest": "grpc",
+    "io.etcdhbase.server.commit.WatchGatewayTest": "server",
+    "io.etcdhbase.server.commit.WatchStreamTest": "server",
+    "io.etcdhbase.server.commit.WatchGoInteropTest": "server",
+}
+J45_CRITICAL_JAVA_TESTS = {
+    "io.etcdhbase.core.commit.SealedEventCursorTest": {
+        "sharedTailerAppliesInclusiveRevisionFloorsAndDropsEventsBeforeCreateBarrier",
+        "subscriptionCapacityIsResourceLimitAndClosedTailerIsUnavailable",
+    },
+    "io.etcdhbase.grpc.service.SkeletonServiceTest": {
+        "assembledWatchServiceDelegatesTheResponseObserverAndReturnsItsRequestHandler",
+    },
+    "io.etcdhbase.server.commit.WatchGatewayTest": {
+        "mapsEveryTailerTerminationToItsWatchCancellationReason",
+        "gatewayChargesRetainedRangeBytesAndReleasesThemOnClose",
+        "tailerShutdownRacePreservesUnavailableAndReleasesWatchReservation",
+        "passesNegativeStartRevisionAndCompactBoundaryAndReleasesBudgetsOnClose",
+        "currentRevisionReadsTheAuthoritativeControlSnapshotInsteadOfTheTailerCheckpoint",
+        "pollCancellationHandoffClosesTheDetachedDeliveryBeforeReleasingItsAccount",
+        "workerRejectionAfterWatchSubscriptionOpensReleasesTailerAndBudgetResources",
+        "workerErrorAfterWatchSubscriptionOpensReleasesTailerAndBudgetResources",
+    },
+    "io.etcdhbase.server.commit.WatchStreamTest": {
+        "emitsCreatedBeforeInclusiveLiveEventsAndAppliesFilterAndPrevKv",
+        "resourceLimitedCreateLeavesExistingWatchActive",
+        "duplicateIdDoesNotReplaceExistingWatchAndCancelClosesOnlyItsSubscription",
+        "emptyRequestAndUnknownCancelHaveNoResponseAndKeepActiveWatch",
+        "publishedSubscriptionWakeupDrainsWithoutPollingTimerAndCloseClearsListener",
+        "separateStreamsDrainPublishedEventsWithoutSchedulingPolls",
+        "zeroStartWaitsForCreatedBarrierAndExcludesEarlierEvents",
+        "initialNegativeStartWithNoHistoryUsesTheLiveBarrier",
+        "negativeStartWithUncompactedHistorySkipsOldEventsAndDeliversNewEvents",
+        "startBelowInitialCompactBoundaryCreatesThenCancelsAndKeepsIdUntilCancel",
+        "negativeStartsBelowAnAdvancedCompactBoundaryReportTheNativeBoundary",
+        "zeroStartUsesTheLiveBarrierEvenWhenTheCompactBoundaryIsPositive",
+        "cancellationDuringPollClosesTheEventBeforeItCanEscapeTheWatcher",
+        "cancelAcknowledgementWaitsForAndUsesTheCurrentSessionRevision",
+        "createsAndCancelsRawWatchIdMinusOne",
+        "createRejectionUsesTheCurrentSessionRevision",
+        "terminalFailureWaitsForTheCurrentResponseWriter",
+        "cancellingOneWatchKeepsOtherByteRangeSubscriptionActive",
+        "resourceLimitTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries",
+        "closedTailerTerminationCancelsOnlyItsWatchAndReleasesQueuedDeliveries",
+        "asynchronousTerminationRevisionFailureFailsStreamWithoutCanceledResponse",
+        "lateTerminationRevisionDoesNotWriteAfterStreamClose",
+        "processWideTombstonesFromOneStreamDoNotRejectAnotherStreamsActiveCreate",
+        "oversizedCompleteRevisionCancelsWatchWithoutSendingPartialEvents",
+        "watcherCloseStillClosesSubscriptionWhenPendingDeliveryCleanupThrowsError",
+        "outputReleaseAttemptsEveryDeliveryAndPrioritizesFatalCleanupFailure",
+    },
+    "io.etcdhbase.server.commit.WatchGoInteropTest": {
+        "pinnedGoClientMatchesStartAndLifecycleCasesAgainstJavaWatchService",
+    },
+}
+J45_GO_TESTS = {
+    "cmd/m4driver": {
+        "TestRunNativeWatchStartWritesFreshTraceAndVerifiableMetadata",
+        "TestParseRunOptionsPinsLocalWatchPhaseAndCheckpoint",
+        "TestOpenEvidenceWritesLocalWatchCheckpointMetadata",
+    },
+    "internal/scenario": {
+        "TestM4WatchStartScenarioMatchesPinnedNativeOracle",
+        "TestM4WatchLifecycleMatchesPinnedNativeOracle",
+        "TestLoadM4WatchStartSuiteRejectsMissingOrChangedCoverage",
+        "TestValidateM4LeaseAcceptsLocalServiceEvidenceScope",
+    },
+    "internal/trace": {"TestTraceAcceptsLocalServiceEvidenceScope"},
+}
+J45_LOCAL_SERVICE_PHASES = (("initial", 2, -1), ("compacted", 8, 4))
+J45_START_MATRIX = (
+    ("initial-minus-two", "initial", -2, True, -1),
+    ("initial-minus-one", "initial", -1, False, -1),
+    ("initial-zero", "initial", 0, False, -1),
+    ("initial-future", "initial", 3, False, -1),
+    ("compacted-minus-two", "compacted", -2, True, "fixture"),
+    ("compacted-minus-one", "compacted", -1, True, "fixture"),
+    ("compacted-zero", "compacted", 0, False, "fixture"),
+)
+J45_RAW_WATCH_ID_MATRIX = (
+    ("initial-watch-id-minus-one", "initial", -1, 0),
+    ("compacted-watch-id-minus-one", "compacted", -1, 0),
+)
+J45_TRACE_CASES = (
+    ("watch-start-history-put", "etcdserverpb.KV/Put"),
+    ("initial-minus-two-created", "etcdserverpb.Watch/Watch"),
+    ("initial-minus-two-compacted", "etcdserverpb.Watch/Watch"),
+    ("initial-minus-two-duplicate-id", "etcdserverpb.Watch/Watch"),
+    ("initial-minus-two-cancel-id", "etcdserverpb.Watch/Watch"),
+    ("initial-minus-two-reused-created", "etcdserverpb.Watch/Watch"),
+    ("initial-minus-two-reused-cancelled", "etcdserverpb.Watch/Watch"),
+    ("initial-minus-one-created", "etcdserverpb.Watch/Watch"),
+    ("initial-minus-one-cancelled", "etcdserverpb.Watch/Watch"),
+    ("initial-zero-created", "etcdserverpb.Watch/Watch"),
+    ("initial-zero-cancelled", "etcdserverpb.Watch/Watch"),
+    ("initial-watch-id-minus-one-created", "etcdserverpb.Watch/Watch"),
+    ("initial-watch-id-minus-one-cancelled", "etcdserverpb.Watch/Watch"),
+    ("initial-future-created", "etcdserverpb.Watch/Watch"),
+    ("initial-future-cancelled", "etcdserverpb.Watch/Watch"),
+    ("watch-negative-live-created", "etcdserverpb.Watch/Watch"),
+    ("watch-negative-live-progress", "etcdserverpb.Watch/Watch"),
+    ("watch-negative-live-put", "etcdserverpb.KV/Put"),
+    ("watch-negative-live-event", "etcdserverpb.Watch/Watch"),
+    ("watch-negative-live-cancelled", "etcdserverpb.Watch/Watch"),
+    ("watch-compact-fixture-put", "etcdserverpb.KV/Put"),
+    ("watch-compact-fixture-range", "etcdserverpb.KV/Range"),
+    ("watch-compact-fixture-compact", "etcdserverpb.KV/Compact"),
+    ("compacted-minus-two-created", "etcdserverpb.Watch/Watch"),
+    ("compacted-minus-two-compacted", "etcdserverpb.Watch/Watch"),
+    ("compacted-minus-two-duplicate-id", "etcdserverpb.Watch/Watch"),
+    ("compacted-minus-two-cancel-id", "etcdserverpb.Watch/Watch"),
+    ("compacted-minus-two-reused-created", "etcdserverpb.Watch/Watch"),
+    ("compacted-minus-two-reused-cancelled", "etcdserverpb.Watch/Watch"),
+    ("compacted-minus-one-created", "etcdserverpb.Watch/Watch"),
+    ("compacted-minus-one-compacted", "etcdserverpb.Watch/Watch"),
+    ("compacted-minus-one-duplicate-id", "etcdserverpb.Watch/Watch"),
+    ("compacted-minus-one-cancel-id", "etcdserverpb.Watch/Watch"),
+    ("compacted-minus-one-reused-created", "etcdserverpb.Watch/Watch"),
+    ("compacted-minus-one-reused-cancelled", "etcdserverpb.Watch/Watch"),
+    ("compacted-zero-created", "etcdserverpb.Watch/Watch"),
+    ("compacted-zero-cancelled", "etcdserverpb.Watch/Watch"),
+    ("compacted-watch-id-minus-one-created", "etcdserverpb.Watch/Watch"),
+    ("compacted-watch-id-minus-one-cancelled", "etcdserverpb.Watch/Watch"),
+)
 
 J40_TRACE_CASES = (
     ("native-baseline", "etcdserverpb.Lease/LeaseLeases"),
@@ -649,6 +791,9 @@ def validate_registry_document(document: object) -> dict[str, object]:
     j44 = task_map.get("J44")
     if j44 is not None:
         _validate_j44_registration(j44)
+    j45 = task_map.get("J45")
+    if j45 is not None:
+        _validate_j45_registration(j45)
     return document
 
 
@@ -658,6 +803,16 @@ def _validate_task_shape(task: dict[str, object]) -> None:
                 or not isinstance(task.get("maven_tests"), list)
                 or not task["maven_tests"]):
             raise ReportError("J44 must register its event-storage integration suites")
+        return
+    if task.get("id") == "J45":
+        if (task.get("kind") != "watch-stream"
+                or not isinstance(task.get("maven_tests"), list)
+                or not task["maven_tests"]
+                or not isinstance(task.get("go_tests"), list)
+                or not isinstance(task.get("trace_cases"), list)
+                or not isinstance(task.get("watch_start_matrix"), list)
+                or task.get("verification_boundary") != J45_VERIFICATION_BOUNDARY):
+            raise ReportError("J45 must register its raw-proto oracle and local Watch suites")
         return
     if not isinstance(task.get("api_ids"), list) or not task["api_ids"]:
         raise ReportError("registered M4 task must identify API coverage")
@@ -718,7 +873,12 @@ def _validate_j40_go_tests(registrations: list[dict[str, object]]) -> None:
         raise ReportError("J40 Go regression coverage is incomplete")
 
 
-def _registered_java_tests(registrations: list[dict[str, object]], label: str) -> dict[str, set[str]]:
+def _registered_java_suite_index(
+    registrations: list[dict[str, object]], label: str, *,
+    require_single_module: bool = False, required_kind: str | None = None,
+) -> tuple[set[str], dict[str, str], dict[str, set[str]]]:
+    java_classes: set[str] = set()
+    java_modules: dict[str, str] = {}
     java_methods: dict[str, set[str]] = {}
     for suite in registrations:
         if not isinstance(suite, dict):
@@ -728,9 +888,20 @@ def _registered_java_tests(registrations: list[dict[str, object]], label: str) -
         )
         if module not in JAVA_MODULES or kind not in JAVA_KINDS or not isinstance(class_name, str):
             raise ReportError(f"{label} Maven test registration has an invalid module, kind, or class")
+        if required_kind is not None and kind != required_kind:
+            raise ReportError(f"{label} Maven suites must be JVM unit tests in known modules")
         if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
             raise ReportError(f"{label} Maven suite has no named required tests")
+        java_classes.add(class_name)
+        previous_module = java_modules.setdefault(class_name, module)
+        if require_single_module and previous_module != module:
+            raise ReportError(f"{label} Maven suite is registered in multiple modules")
         java_methods.setdefault(class_name, set()).update(tests)
+    return java_classes, java_modules, java_methods
+
+
+def _registered_java_tests(registrations: list[dict[str, object]], label: str) -> dict[str, set[str]]:
+    _, _, java_methods = _registered_java_suite_index(registrations, label)
     return java_methods
 
 
@@ -848,24 +1019,9 @@ def _validate_j42_registration(task: dict[str, object]) -> None:
            for package, expected in J42_GO_TESTS.items()):
         raise ReportError("J42 Go KeepAlive regression coverage is incomplete")
 
-    java_classes: set[str] = set()
-    java_methods: dict[str, set[str]] = {}
-    java_modules: dict[str, str] = {}
-    for suite in task["maven_tests"]:
-        if not isinstance(suite, dict):
-            raise ReportError("J42 Maven test registration is malformed")
-        module, kind, class_name, tests = (
-            suite.get("module"), suite.get("kind"), suite.get("class"), suite.get("tests")
-        )
-        if module not in JAVA_MODULES or kind not in JAVA_KINDS or not isinstance(class_name, str):
-            raise ReportError("J42 Maven test registration has an invalid module, kind, or class")
-        if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
-            raise ReportError("J42 Maven suite has no named required tests")
-        java_classes.add(class_name)
-        previous_module = java_modules.setdefault(class_name, module)
-        if previous_module != module:
-            raise ReportError("J42 Maven suite is registered in multiple modules")
-        java_methods.setdefault(class_name, set()).update(tests)
+    java_classes, java_modules, java_methods = _registered_java_suite_index(
+        task["maven_tests"], "J42", require_single_module=True
+    )
     if not J42_JAVA_CLASSES.issubset(java_classes):
         raise ReportError("J42 stream, standby-owner, or real dual-runtime suites are not registered")
     if any(java_modules.get(class_name) != module
@@ -917,24 +1073,9 @@ def _validate_j43_registration(task: dict[str, object]) -> None:
            for package, expected in J43_GO_TESTS.items()):
         raise ReportError("J43 Go Revoke regression coverage is incomplete")
 
-    java_classes: set[str] = set()
-    java_methods: dict[str, set[str]] = {}
-    java_modules: dict[str, str] = {}
-    for suite in task["maven_tests"]:
-        if not isinstance(suite, dict):
-            raise ReportError("J43 Maven test registration is malformed")
-        module, kind, class_name, tests = (
-            suite.get("module"), suite.get("kind"), suite.get("class"), suite.get("tests")
-        )
-        if module not in JAVA_MODULES or kind not in JAVA_KINDS or not isinstance(class_name, str):
-            raise ReportError("J43 Maven test registration has an invalid module, kind, or class")
-        if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
-            raise ReportError("J43 Maven suite has no named required tests")
-        java_classes.add(class_name)
-        previous_module = java_modules.setdefault(class_name, module)
-        if previous_module != module:
-            raise ReportError("J43 Maven suite is registered in multiple modules")
-        java_methods.setdefault(class_name, set()).update(tests)
+    java_classes, java_modules, java_methods = _registered_java_suite_index(
+        task["maven_tests"], "J43", require_single_module=True
+    )
     if not J43_JAVA_CLASSES.issubset(java_classes):
         raise ReportError("J43 expiry, Revoke, race, or mixed-load suites are not registered")
     if any(java_modules.get(class_name) != module
@@ -963,24 +1104,9 @@ def _validate_j43_registration(task: dict[str, object]) -> None:
 def _validate_j44_registration(task: dict[str, object]) -> None:
     if task.get("kind") != "event-storage" or task.get("id") != "J44":
         raise ReportError("J44 event-storage registration changed")
-    java_classes: set[str] = set()
-    java_methods: dict[str, set[str]] = {}
-    java_modules: dict[str, str] = {}
-    for suite in task["maven_tests"]:
-        if not isinstance(suite, dict):
-            raise ReportError("J44 Maven test registration is malformed")
-        module, kind, class_name, tests = (
-            suite.get("module"), suite.get("kind"), suite.get("class"), suite.get("tests")
-        )
-        if module not in JAVA_MODULES or kind not in JAVA_KINDS or not isinstance(class_name, str):
-            raise ReportError("J44 Maven suite has an invalid module, kind, or class")
-        if not isinstance(tests, list) or not tests or any(not isinstance(name, str) for name in tests):
-            raise ReportError("J44 Maven suite has no named required tests")
-        java_classes.add(class_name)
-        previous_module = java_modules.setdefault(class_name, module)
-        if previous_module != module:
-            raise ReportError("J44 Maven suite is registered in multiple modules")
-        java_methods.setdefault(class_name, set()).update(tests)
+    java_classes, java_modules, java_methods = _registered_java_suite_index(
+        task["maven_tests"], "J44", require_single_module=True
+    )
     if java_classes != set(J44_JAVA_CLASS_MODULES):
         raise ReportError("J44 cursor, pin, backfill, shared tailer, and MiniCluster suites are incomplete")
     if any(java_modules.get(class_name) != module
@@ -989,6 +1115,96 @@ def _validate_j44_registration(task: dict[str, object]) -> None:
     if any(not methods.issubset(java_methods.get(class_name, set()))
            for class_name, methods in J44_CRITICAL_JAVA_TESTS.items()):
         raise ReportError("J44 event cursor, backfill, fairness, or layout regression coverage is incomplete")
+
+
+def _validate_j45_registration(task: dict[str, object]) -> None:
+    _validate_j45_task_registration(task)
+    _validate_j45_trace_registration(task)
+    _validate_j45_watch_matrix_registration(task)
+    _validate_j45_go_evidence_registration(task)
+    _validate_j45_java_registration(task)
+
+
+def _validate_j45_task_registration(task: dict[str, object]) -> None:
+    if task.get("kind") != "watch-stream" or task.get("id") != "J45":
+        raise ReportError("J45 Watch stream registration changed")
+    if (task.get("scenario") != "m4-watch-starts-v1"
+            or task.get("manifest") != "m4-watch-starts.yaml"
+            or task.get("artifact_subdir") != "j45"
+            or task.get("api_ids") != ["C14", "C19", "P01", "R01"]):
+        raise ReportError("J45 raw-proto Watch scenario registration changed")
+
+
+def _validate_j45_trace_registration(task: dict[str, object]) -> None:
+    traces = task["trace_cases"]
+    if (any(not isinstance(item, dict) for item in traces)
+            or [(item.get("id"), item.get("method")) for item in traces] != list(J45_TRACE_CASES)):
+        raise ReportError("J45 native Watch trace is missing, reordered, or changed")
+    api_id_by_case = {
+        case_id: _j45_trace_api_id(case_id)
+        for case_id, _ in J45_TRACE_CASES
+    }
+    if any(item.get("api_id") != api_id_by_case[item["id"]] for item in traces):
+        raise ReportError("J45 trace case API mappings changed")
+
+
+def _j45_trace_api_id(case_id: str) -> str:
+    if case_id in {
+        "watch-start-history-put", "watch-negative-live-put", "watch-compact-fixture-put",
+    }:
+        return "P01"
+    if case_id == "watch-compact-fixture-range":
+        return "R01"
+    if case_id == "watch-compact-fixture-compact":
+        return "C14"
+    return "C19"
+
+
+def _validate_j45_watch_matrix_registration(task: dict[str, object]) -> None:
+    matrix = task["watch_start_matrix"]
+    matrix_fields = ("id", "state", "start_revision", "compacted", "compact_revision")
+    if (any(not isinstance(item, dict) for item in matrix)
+            or [tuple(item.get(field) for field in matrix_fields) for item in matrix]
+            != list(J45_START_MATRIX)):
+        raise ReportError("J45 must register initial -2/-1/0/future and compacted -2/-1/0 Watch starts")
+    watch_id_matrix = task.get("watch_id_matrix")
+    watch_id_fields = ("id", "state", "watch_id", "start_revision")
+    if (not isinstance(watch_id_matrix, list)
+            or any(not isinstance(item, dict) for item in watch_id_matrix)
+            or [tuple(item.get(field) for field in watch_id_fields) for item in watch_id_matrix]
+            != list(J45_RAW_WATCH_ID_MATRIX)):
+        raise ReportError("J45 must register raw Watch ID -1 create and cancel in both phases")
+
+
+def _validate_j45_go_evidence_registration(task: dict[str, object]) -> None:
+    go_tests = _registered_go_tests(task["go_tests"], "J45")
+    if any(not expected.issubset(go_tests.get(package, set()))
+           for package, expected in J45_GO_TESTS.items()):
+        raise ReportError("J45 raw-proto native oracle tests are incomplete")
+    evidence = task.get("evidence")
+    if (not isinstance(evidence, dict) or set(evidence) != {"native", "local_service"}
+            or evidence.get("native") != {
+                "scope": "native-etcd", "layout": "", "embedded_native": True,
+            } or evidence.get("local_service") != {
+                "scope": "local-service", "layout": "", "embedded_native": False,
+            }):
+        raise ReportError("J45 must register native and local Java WatchService evidence")
+
+
+def _validate_j45_java_registration(task: dict[str, object]) -> None:
+    java_classes, java_modules, java_methods = _registered_java_suite_index(
+        task["maven_tests"], "J45", require_single_module=True, required_kind="surefire"
+    )
+    if java_classes != set(J45_JAVA_CLASS_MODULES):
+        raise ReportError("J45 tailer, RPC wiring, stream, and gateway suites are incomplete")
+    if any(java_modules.get(class_name) != module
+           for class_name, module in J45_JAVA_CLASS_MODULES.items()):
+        raise ReportError("J45 Java suites must be collected from their declared modules")
+    if any(not methods.issubset(java_methods.get(class_name, set()))
+           for class_name, methods in J45_CRITICAL_JAVA_TESTS.items()):
+        raise ReportError(
+            "J45 revision floors, termination/resource cleanup, or single-writer coverage is incomplete"
+        )
 
 
 def load_registry(path: Path = REGISTRY_PATH) -> dict[str, object]:
@@ -1072,9 +1288,45 @@ def _validate_commands(artifact: Path, run: dict[str, object], task: dict[str, o
                 raise ReportError("M4 command log path escapes its artifact directory") from error
             if not log_path.is_file() or log_path.is_symlink():
                 raise ReportError(f"M4 command log for {name} is missing or unsafe")
-    required = J44_REQUIRED_COMMANDS if task.get("id") == "J44" else REQUIRED_COMMANDS
+    required = {
+        "J44": J44_REQUIRED_COMMANDS,
+        "J45": J45_REQUIRED_COMMANDS,
+    }.get(task.get("id"), REQUIRED_COMMANDS)
     if not required.issubset(names):
         raise ReportError("M4 run is missing a required task verification command")
+    if task.get("id") == "J45":
+        if names != J45_REQUIRED_COMMANDS:
+            raise ReportError("J45 verification must run its native Go oracle and JVM unit profile only")
+        maven = next(command for command in commands if command["name"] == "maven-unit-tests")
+        if ("-Pm4-j45-public" not in maven["argv"] or "test" not in maven["argv"]
+                or "verify" in maven["argv"]):
+            raise ReportError("J45 Maven verification must run Surefire only with the local profile")
+        go_tests = next(command for command in commands if command["name"] == "go-tests")
+        if ("scripts/dev/go-m0.sh" not in go_tests["argv"] or "test" not in go_tests["argv"]
+                or "-json" not in go_tests["argv"] or "-run" not in go_tests["argv"]
+                or "./internal/scenario" not in go_tests["argv"]
+                or "./cmd/m4driver" not in go_tests["argv"]
+                or "./internal/trace" not in go_tests["argv"]):
+            raise ReportError("J45 Go tests must run the registered native and local-service Watch suites")
+        oracle = next(command for command in commands if command["name"] == "native-watch-oracle")
+        argv = oracle["argv"]
+        required_argv = (
+            "scripts/dev/go-m0.sh", "run", "./cmd/m4driver", "run", "--scenario",
+            "../scenarios/m4-watch-starts.yaml", "--native-data-dir", "--scope",
+            "native-etcd", "--prefix", f"etcd-hbase-m4-test/{run['run_id']}/watch/",
+            "--trace", "--metadata",
+        )
+        if any(value not in argv for value in required_argv):
+            raise ReportError("J45 native oracle command does not run the pinned raw-proto scenario")
+        for flag in ("--native-data-dir", "--trace", "--metadata"):
+            value = argv[argv.index(flag) + 1] if argv.index(flag) + 1 < len(argv) else ""
+            resolved = Path(os.path.abspath(value))
+            try:
+                resolved.relative_to(artifact)
+            except ValueError as error:
+                raise ReportError("J45 native oracle outputs must stay inside the artifact directory") from error
+            if flag != "--native-data-dir" and (not resolved.is_file() or resolved.is_symlink()):
+                raise ReportError("J45 native oracle trace or metadata is missing or unsafe")
 
 
 def _validate_go_tests(artifact: Path, task: dict[str, object]) -> int:
@@ -1439,6 +1691,325 @@ def _trace_int64(value: object, label: str) -> int:
     return parsed
 
 
+def _trace_uint64(value: object, label: str) -> int:
+    if not isinstance(value, str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)", value):
+        raise ReportError(f"J45 {label} is missing or is not a canonical uint64")
+    parsed = int(value)
+    if parsed > (1 << 64) - 1:
+        raise ReportError(f"J45 {label} is outside the uint64 range")
+    return parsed
+
+
+def _j45_header_fields(
+    response_fields: dict[str, object], label: str, *, allow_zero_raft_term: bool = False,
+) -> dict[str, object]:
+    header = _snapshot_fields(response_fields.get("header"), f"{label} header")
+    for field in ("clusterId", "memberId"):
+        if _trace_uint64(header.get(field), f"{label} header {field}") < 1:
+            raise ReportError(f"J45 {label} header {field} must be positive")
+    raft_term = _trace_uint64(header.get("raftTerm"), f"{label} header raftTerm")
+    if raft_term < 1 and not allow_zero_raft_term:
+        raise ReportError(f"J45 {label} header raftTerm must be positive")
+    return header
+
+
+def _j45_record_request(
+    record: dict[str, object], label: str, request_kind: str,
+) -> dict[str, object]:
+    snapshot = record.get("request")
+    request_fields = _snapshot_fields(snapshot, f"{label} request")
+    oneofs = snapshot.get("oneofs") if isinstance(snapshot, dict) else None
+    if oneofs != {"request_union": request_kind}:
+        raise ReportError(f"J45 {label} request is not the registered raw Watch operation")
+    field_name = "createRequest" if request_kind == "create_request" else "cancelRequest"
+    return _snapshot_fields(request_fields.get(field_name), f"{label} {field_name}")
+
+
+def _j45_watch_response(
+    record: dict[str, object], label: str, *, watch_id: int, header_revision: int,
+    created: bool, canceled: bool, compact_revision: int = 0, cancel_reason: str = "",
+) -> None:
+    response = record.get("response")
+    fields = _snapshot_fields(response, f"{label} response")
+    local_service = record.get("evidence_scope") == "local-service"
+    header = _j45_header_fields(fields, label, allow_zero_raft_term=local_service)
+    if (_trace_int64(header.get("revision"), f"{label} header revision") != header_revision
+            or _trace_int64(fields.get("watchId"), f"{label} watch ID") != watch_id
+            or fields.get("created") is not created or fields.get("canceled") is not canceled
+            or _trace_int64(fields.get("compactRevision"), f"{label} compact revision") != compact_revision
+            or fields.get("cancelReason") != cancel_reason or fields.get("events") != []):
+        raise ReportError(f"J45 {label} response fields differ from the pinned etcd Watch contract")
+
+
+def _validate_j45_native_history_fixture(
+    cases: dict[str, dict[str, object]],
+) -> tuple[dict[str, object], int]:
+    history_record = cases["watch-start-history-put"]
+    history_request = _snapshot_fields(history_record["request"], "J45 Watch history fixture Put request")
+    history_response = _snapshot_fields(history_record["response"], "J45 Watch history fixture Put response")
+    history_header = _j45_header_fields(history_response, "Watch history fixture Put")
+    history_revision = _trace_int64(history_header.get("revision"), "Watch history fixture revision")
+    if history_revision <= 1 or not history_request.get("key") or not history_request.get("value"):
+        raise ReportError("J45 Watch history fixture Put did not establish an initial old value")
+    return history_request, history_revision
+
+
+def _validate_j45_native_live_probe(
+    cases: dict[str, dict[str, object]], history_request: dict[str, object],
+    history_revision: int,
+) -> None:
+    negative_watch_request = _j45_record_request(
+        cases["initial-minus-one-created"], "initial-minus-one-created", "create_request"
+    )
+    if negative_watch_request.get("key") != history_request.get("key"):
+        raise ReportError("J45 negative start did not watch the key seeded by its history fixture")
+
+    live_created_id = "watch-negative-live-created"
+    live_create_request = _j45_record_request(
+        cases[live_created_id], live_created_id, "create_request"
+    )
+    if (_trace_int64(live_create_request.get("watchId"), "negative live Watch ID") != 45
+            or _trace_int64(live_create_request.get("startRevision"), "negative live start revision") != -1
+            or live_create_request.get("key") != history_request.get("key")):
+        raise ReportError("J45 live negative Watch does not target its prior history fixture")
+    _j45_watch_response(cases[live_created_id], live_created_id, watch_id=45,
+                        header_revision=history_revision, created=True, canceled=False)
+
+    progress_record = cases["watch-negative-live-progress"]
+    progress_request = progress_record.get("request")
+    progress_request_fields = _snapshot_fields(progress_request, "J45 synced Watch progress request")
+    progress_oneofs = progress_request.get("oneofs") if isinstance(progress_request, dict) else None
+    progress_response = _snapshot_fields(
+        progress_record.get("response"), "J45 synced Watch progress response"
+    )
+    progress_header = _j45_header_fields(progress_response, "synced Watch progress response")
+    if (progress_oneofs != {"request_union": "progress_request"}
+            or not isinstance(progress_request_fields.get("progressRequest"), dict)
+            or _trace_int64(progress_response.get("watchId"), "synced progress Watch ID") != -1
+            or progress_response.get("created") is not False
+            or progress_response.get("canceled") is not False
+            or _trace_int64(progress_header.get("revision"), "synced progress revision") != history_revision
+            or progress_response.get("events") != []):
+        raise ReportError("J45 native negative-start event probe has no synced progress barrier")
+
+    live_put = cases["watch-negative-live-put"]
+    live_put_request = _snapshot_fields(live_put["request"], "J45 live negative Watch Put request")
+    live_put_response = _snapshot_fields(live_put["response"], "J45 live negative Watch Put response")
+    live_put_header = _j45_header_fields(live_put_response, "negative Watch live Put")
+    live_revision = _trace_int64(live_put_header.get("revision"), "negative Watch live revision")
+    if (live_put_request.get("key") != history_request.get("key")
+            or not live_put_request.get("value") or live_revision != history_revision + 1):
+        raise ReportError("J45 live negative Watch Put does not follow its history fixture exactly once")
+
+    live_event_id = "watch-negative-live-event"
+    event_record = cases[live_event_id]
+    event_request = _j45_record_request(event_record, live_event_id, "create_request")
+    event_response = _snapshot_fields(event_record["response"], f"{live_event_id} response")
+    event_header = _j45_header_fields(event_response, live_event_id)
+    events = event_response.get("events")
+    if (event_request != live_create_request
+            or _trace_int64(event_header.get("revision"), f"{live_event_id} header revision") != live_revision
+            or _trace_int64(event_response.get("watchId"), f"{live_event_id} watch ID") != 45
+            or event_response.get("created") is not False or event_response.get("canceled") is not False
+            or not isinstance(events, list) or len(events) != 1):
+        raise ReportError("J45 negative Watch did not report one post-create event at its Put revision")
+    event_fields = _snapshot_fields(events[0], f"{live_event_id} event")
+    event_kv = _snapshot_fields(event_fields.get("kv"), f"{live_event_id} key-value")
+    # Native proto traces encode Event_EventType as its wire enum value (PUT = 0).
+    if (event_fields.get("type") != 0
+            or event_kv.get("key") != live_put_request.get("key")
+            or event_kv.get("value") != live_put_request.get("value")
+            or _trace_int64(event_kv.get("modRevision"), f"{live_event_id} mod revision") != live_revision):
+        raise ReportError("J45 negative Watch delivered an old or mismatched event")
+
+    cancel_id = "watch-negative-live-cancelled"
+    cancel_request = _j45_record_request(cases[cancel_id], cancel_id, "cancel_request")
+    if _trace_int64(cancel_request.get("watchId"), f"{cancel_id} Watch ID") != 45:
+        raise ReportError("J45 negative Watch cleanup canceled a different Watch ID")
+    _j45_watch_response(cases[cancel_id], cancel_id, watch_id=45,
+                        header_revision=live_revision, created=False, canceled=True)
+
+
+def _validate_j45_native_compaction_fixture(cases: dict[str, dict[str, object]]) -> int:
+    put = cases["watch-compact-fixture-put"]
+    put_request = _snapshot_fields(put["request"], "J45 compaction fixture Put request")
+    put_response = _snapshot_fields(put["response"], "J45 compaction fixture Put response")
+    put_header = _j45_header_fields(put_response, "compaction fixture Put")
+    compact_revision = _trace_int64(put_header.get("revision"), "compaction fixture revision")
+    if compact_revision <= 1 or not put_request.get("key") or not put_request.get("value"):
+        raise ReportError("J45 compaction fixture Put did not advance a durable native revision")
+
+    range_record = cases["watch-compact-fixture-range"]
+    range_request = _snapshot_fields(range_record["request"], "J45 compaction fixture Range request")
+    range_response = _snapshot_fields(range_record["response"], "J45 compaction fixture Range response")
+    range_header = _j45_header_fields(range_response, "compaction fixture Range")
+    kvs = range_response.get("kvs")
+    if (range_request.get("key") != put_request.get("key")
+            or _trace_int64(range_header.get("revision"), "compaction fixture Range revision") != compact_revision
+            or not isinstance(kvs, list) or len(kvs) != 1):
+        raise ReportError("J45 compaction fixture Range did not confirm the Put revision")
+    fixture_kv = _snapshot_fields(kvs[0], "J45 compaction fixture key-value")
+    if (fixture_kv.get("key") != put_request.get("key")
+            or fixture_kv.get("value") != put_request.get("value")):
+        raise ReportError("J45 compaction fixture Range returned a different key or value")
+
+    compact_record = cases["watch-compact-fixture-compact"]
+    compact_request = _snapshot_fields(compact_record["request"], "J45 compaction fixture Compact request")
+    compact_response = _snapshot_fields(compact_record["response"], "J45 compaction fixture Compact response")
+    compact_header = _j45_header_fields(compact_response, "compaction fixture Compact")
+    if (_trace_int64(compact_request.get("revision"), "compaction request revision") != compact_revision
+            or _trace_int64(compact_header.get("revision"), "compaction response revision") != compact_revision):
+        raise ReportError("J45 compaction fixture did not compact its verified native revision")
+    return compact_revision
+
+
+def _validate_j45_native_trace(records: list[dict[str, object]]) -> None:
+    cases = {record["case_id"]: record for record in records}
+    history_request, history_revision = _validate_j45_native_history_fixture(cases)
+    _validate_j45_native_live_probe(cases, history_request, history_revision)
+    compact_revision = _validate_j45_native_compaction_fixture(cases)
+    _validate_j45_watch_phase(cases, "initial", history_revision, -1)
+    _validate_j45_watch_phase(cases, "compacted", compact_revision, compact_revision)
+
+
+def _validate_j45_local_trace(records: list[dict[str, object]], phase: str,
+                              revision: int, compact_revision: int) -> None:
+    expected_case_ids = [case_id for case_id, _ in J45_TRACE_CASES
+                         if case_id.startswith(f"{phase}-")]
+    cases = {record["case_id"]: record for record in records}
+    if list(cases) != expected_case_ids:
+        raise ReportError(f"J45 local {phase} Watch trace has missing or reordered cases")
+    _validate_j45_watch_phase(cases, phase, revision, compact_revision)
+
+
+def _validate_j45_watch_phase(cases: dict[str, dict[str, object]], phase: str,
+                              response_revision: int, compact_boundary: int) -> None:
+    _validate_j45_start_revision_matrix(cases, phase, response_revision, compact_boundary)
+    _validate_j45_raw_watch_id_matrix(cases, phase, response_revision)
+
+
+def _validate_j45_start_revision_matrix(
+    cases: dict[str, dict[str, object]], phase: str,
+    response_revision: int, compact_boundary: int,
+) -> None:
+    for matrix_id, matrix_phase, start_revision, compacted, boundary in J45_START_MATRIX:
+        if matrix_phase != phase:
+            continue
+        _validate_j45_start_revision_case(
+            cases, matrix_id, phase, start_revision, compacted, boundary,
+            response_revision, compact_boundary,
+        )
+
+
+def _validate_j45_start_revision_case(
+    cases: dict[str, dict[str, object]], matrix_id: str, phase: str,
+    start_revision: int, compacted: bool, boundary: int | str,
+    response_revision: int, compact_boundary: int,
+) -> None:
+    _, start_name = matrix_id.split("-", 1)
+    base_id = f"{phase}-{start_name}"
+    watch_id = {-2: 41, -1: 42, 0: 43, 3: 44}[start_revision]
+    if compacted != (start_revision != 0 and start_revision < compact_boundary):
+        raise ReportError(f"J45 {phase} Watch start registration disagrees with its compact boundary")
+    if ((boundary == "fixture" and phase != "compacted")
+            or (boundary != "fixture" and boundary != compact_boundary)):
+        raise ReportError("J45 Watch start matrix changed its compact boundary")
+
+    created_id = f"{base_id}-created"
+    created_request = _j45_record_request(cases[created_id], created_id, "create_request")
+    if (_trace_int64(created_request.get("startRevision"), f"{created_id} start revision")
+            != start_revision
+            or _trace_int64(created_request.get("watchId"), f"{created_id} request watch ID")
+            != watch_id):
+        raise ReportError(f"J45 {created_id} request changed the raw Watch start revision or ID")
+    _j45_watch_response(cases[created_id], created_id, watch_id=watch_id,
+                        header_revision=response_revision, created=True, canceled=False)
+
+    if compacted:
+        final_cancel_id = _validate_j45_compacted_start_lifecycle(
+            cases, base_id, watch_id, response_revision, compact_boundary
+        )
+    else:
+        final_cancel_id = f"{base_id}-cancelled"
+    _validate_j45_start_final_cancel(cases, final_cancel_id, watch_id, response_revision)
+
+
+def _validate_j45_compacted_start_lifecycle(
+    cases: dict[str, dict[str, object]], base_id: str, watch_id: int,
+    response_revision: int, compact_boundary: int,
+) -> str:
+    compacted_id = f"{base_id}-compacted"
+    compacted_request = _j45_record_request(cases[compacted_id], compacted_id, "create_request")
+    created_request = _j45_record_request(cases[f"{base_id}-created"],
+                                          f"{base_id}-created", "create_request")
+    if compacted_request != created_request:
+        raise ReportError(f"J45 {compacted_id} did not preserve the original create request")
+    _j45_watch_response(cases[compacted_id], compacted_id, watch_id=watch_id,
+                        header_revision=0, created=False, canceled=True,
+                        compact_revision=compact_boundary)
+
+    duplicate_id = f"{base_id}-duplicate-id"
+    duplicate_request = _j45_record_request(cases[duplicate_id], duplicate_id, "create_request")
+    if (_trace_int64(duplicate_request.get("startRevision"), f"{duplicate_id} start revision") != 0
+            or _trace_int64(duplicate_request.get("watchId"), f"{duplicate_id} request watch ID")
+            != watch_id):
+        raise ReportError(f"J45 {duplicate_id} did not reuse the still-reserved Watch ID")
+    _j45_watch_response(cases[duplicate_id], duplicate_id, watch_id=-1,
+                        header_revision=response_revision, created=True, canceled=True,
+                        cancel_reason="mvcc: duplicate watch ID provided on the WatchStream")
+
+    cancel_id = f"{base_id}-cancel-id"
+    cancel_request = _j45_record_request(cases[cancel_id], cancel_id, "cancel_request")
+    if _trace_int64(cancel_request.get("watchId"), f"{cancel_id} request watch ID") != watch_id:
+        raise ReportError(f"J45 {cancel_id} canceled a different Watch ID")
+    _j45_watch_response(cases[cancel_id], cancel_id, watch_id=watch_id,
+                        header_revision=response_revision, created=False, canceled=True)
+
+    reused_id = f"{base_id}-reused-created"
+    reused_request = _j45_record_request(cases[reused_id], reused_id, "create_request")
+    if (_trace_int64(reused_request.get("startRevision"), f"{reused_id} start revision") != 0
+            or _trace_int64(reused_request.get("watchId"), f"{reused_id} request watch ID") != watch_id):
+        raise ReportError(f"J45 {reused_id} did not reuse the Watch ID after explicit cancellation")
+    _j45_watch_response(cases[reused_id], reused_id, watch_id=watch_id,
+                        header_revision=response_revision, created=True, canceled=False)
+    return f"{base_id}-reused-cancelled"
+
+
+def _validate_j45_start_final_cancel(
+    cases: dict[str, dict[str, object]], case_id: str,
+    watch_id: int, response_revision: int,
+) -> None:
+    cancel_request = _j45_record_request(cases[case_id], case_id, "cancel_request")
+    if _trace_int64(cancel_request.get("watchId"), f"{case_id} request watch ID") != watch_id:
+        raise ReportError(f"J45 {case_id} canceled a different Watch ID")
+    _j45_watch_response(cases[case_id], case_id, watch_id=watch_id,
+                        header_revision=response_revision, created=False, canceled=True)
+
+
+def _validate_j45_raw_watch_id_matrix(
+    cases: dict[str, dict[str, object]], phase: str, response_revision: int,
+) -> None:
+
+    for matrix_id, matrix_phase, watch_id, start_revision in J45_RAW_WATCH_ID_MATRIX:
+        if matrix_phase != phase:
+            continue
+        create_id = f"{matrix_id}-created"
+        create_request = _j45_record_request(cases[create_id], create_id, "create_request")
+        if (_trace_int64(create_request.get("watchId"), f"{create_id} request watch ID") != watch_id
+                or _trace_int64(create_request.get("startRevision"), f"{create_id} start revision")
+                != start_revision):
+            raise ReportError(f"J45 {create_id} changed the raw Watch ID or create checkpoint")
+        _j45_watch_response(cases[create_id], create_id, watch_id=watch_id,
+                            header_revision=response_revision, created=True, canceled=False)
+
+        cancel_id = f"{matrix_id}-cancelled"
+        cancel_request = _j45_record_request(cases[cancel_id], cancel_id, "cancel_request")
+        if _trace_int64(cancel_request.get("watchId"), f"{cancel_id} request watch ID") != watch_id:
+            raise ReportError(f"J45 {cancel_id} did not cancel the raw Watch ID")
+        _j45_watch_response(cases[cancel_id], cancel_id, watch_id=watch_id,
+                            header_revision=response_revision, created=False, canceled=True)
+
+
 def _successful_lease_response(
     record: dict[str, object], label: str,
 ) -> dict[str, object]:
@@ -1638,13 +2209,15 @@ def _load_run_and_task(
         raise ReportError("M4 run manifest is malformed")
     tasks = run.get("tasks")
     if (run.get("schema") != RUN_SCHEMA or run.get("status") != "passed"
-            or run.get("scope") != "public-local-minicluster"
             or not isinstance(tasks, list) or len(tasks) != 1):
         raise ReportError("M4 run manifest is incomplete or did not pass")
     task_id = tasks[0]
     task = next((item for item in registry["tasks"] if item["id"] == task_id), None)
     if task is None:
         raise ReportError("M4 run task is not registered")
+    expected_scope = "public-local-unit" if task_id == "J45" else "public-local-minicluster"
+    if run.get("scope") != expected_scope:
+        raise ReportError("M4 run scope does not match its task verification profile")
     _validate_run_identity(artifact, run)
     return run, task
 
@@ -1680,6 +2253,8 @@ def _scenario_hashes(
         prefix += "keepalive/"
     elif task.get("id") == "J43":
         prefix += "revoke/"
+    elif task.get("id") == "J45":
+        prefix += "watch/"
     prefix_hash = hashlib.sha256(prefix.encode()).hexdigest()
     return suite_hash, prefix_hash
 
@@ -1698,8 +2273,9 @@ def _validate_native_evidence(
         trace_bytes=trace_bytes, suite_hash=suite_hash, prefix_hash=prefix_hash, layout="",
     )
     log_path = evidence_root / "native.log"
-    if not log_path.is_file() or "M4 Lease scenario passed" not in log_path.read_text(encoding="utf-8"):
-        raise ReportError("native Go Lease run has no success record")
+    marker = "M4 Watch start scenario passed" if task.get("id") == "J45" else "M4 Lease scenario passed"
+    if not log_path.is_file() or marker not in log_path.read_text(encoding="utf-8"):
+        raise ReportError("native Go M4 run has no success record")
 
 
 def _validate_target_evidence(
@@ -1931,6 +2507,111 @@ def _validate_j29_4_expiry(value: object) -> None:
         raise ReportError("J29.4 expiry delay sample accounting is inconsistent")
 
 
+def _validate_j45_native_artifact(
+    run: dict[str, object],
+    task: dict[str, object], evidence_root: Path,
+    suite_hash: str, prefix_hash: str,
+) -> int:
+    descriptor = task["evidence"]["native"]
+    trace_bytes, records = _read_trace(
+        evidence_root / "native-trace.jsonl", task["trace_cases"], descriptor["scope"]
+    )
+    _validate_j45_native_trace(records)
+    _validate_run_metadata(
+        evidence_root / "native-metadata.json", run=run, descriptor=descriptor,
+        trace_bytes=trace_bytes, suite_hash=suite_hash, prefix_hash=prefix_hash, layout="",
+    )
+    native_log = evidence_root / "native.log"
+    if (not native_log.is_file()
+            or "M4 Watch start scenario passed" not in native_log.read_text(encoding="utf-8")):
+        raise ReportError("J45 native raw-proto Watch oracle has no success record")
+    return len(records)
+
+
+def _validate_j45_local_phase_artifact(
+    evidence_root: Path, phase: str, revision: int, compact_revision: int,
+    local_descriptor: dict[str, object], run: dict[str, object], suite_hash: str,
+) -> int:
+    expected_cases = [
+        {"id": case_id, "method": method}
+        for case_id, method in J45_TRACE_CASES
+        if case_id.startswith(f"{phase}-")
+    ]
+    local_root = evidence_root / "local-service"
+    trace_path = local_root / f"{phase}-trace.jsonl"
+    trace_bytes, records = _read_trace(trace_path, expected_cases, local_descriptor["scope"])
+    _validate_j45_local_trace(records, phase, revision, compact_revision)
+
+    run_id = run["run_id"]
+    prefix = f"etcd-hbase-m4-test/{run_id}/watch/{phase}/"
+    prefix_hash = hashlib.sha256(prefix.encode()).hexdigest()
+    metadata_path = local_root / f"{phase}-metadata.json"
+    _validate_run_metadata(
+        metadata_path, run=run, descriptor=local_descriptor,
+        trace_bytes=trace_bytes, suite_hash=suite_hash,
+        prefix_hash=prefix_hash, layout="",
+    )
+    metadata = read_json(metadata_path)
+    if (metadata.get("watch_phase") != phase
+            or type(metadata.get("watch_revision")) is not int
+            or metadata.get("watch_revision") != revision
+            or type(metadata.get("watch_compact_revision")) is not int
+            or metadata.get("watch_compact_revision") != compact_revision):
+        raise ReportError(f"J45 local {phase} Watch metadata differs from its fixture")
+
+    log_path = local_root / f"{phase}.log"
+    log_text = log_path.read_text(encoding="utf-8") if log_path.is_file() else ""
+    if "M4 Watch start scenario passed" not in log_text:
+        raise ReportError(f"J45 local {phase} Watch fixture has no success record")
+    return len(records)
+
+
+def _validate_j45_local_lifecycle_artifact(evidence_root: Path) -> None:
+    lifecycle_log = evidence_root / "local-lifecycle/initial.log"
+    log_text = lifecycle_log.read_text(encoding="utf-8") if lifecycle_log.is_file() else ""
+    if "M4 Watch lifecycle interop passed" not in log_text:
+        raise ReportError("J45 local initial Watch fixture has no lifecycle success record")
+
+
+def _validate_j45_artifact(
+    repository: Path, artifact: Path, run: dict[str, object],
+    task: dict[str, object], java_test_count: int,
+) -> dict[str, object]:
+    if any(kind != "surefire" for _, kind, _ in _java_test_report_paths(artifact)):
+        raise ReportError("J45 evidence must contain JVM unit reports only")
+    go_test_count = _validate_go_tests(artifact, task)
+    evidence_root = _task_artifact_root(artifact, task)
+    suite_hash, prefix_hash = _scenario_hashes(repository, task, run["run_id"])
+    native_trace_cases = _validate_j45_native_artifact(
+        run, task, evidence_root, suite_hash, prefix_hash
+    )
+
+    local_descriptor = task["evidence"]["local_service"]
+    local_trace_cases = sum(
+        _validate_j45_local_phase_artifact(
+            evidence_root, phase, revision, compact_revision,
+            local_descriptor, run, suite_hash,
+        )
+        for phase, revision, compact_revision in J45_LOCAL_SERVICE_PHASES
+    )
+    _validate_j45_local_lifecycle_artifact(evidence_root)
+    return {
+        "task": run["tasks"][0],
+        "run_id": run["run_id"],
+        "source_commit": run["source_commit"],
+        "base_commit": run["base_commit"],
+        "evidence_class": "official-clean" if run["worktree_clean"] else "development-dirty",
+        "go_test_count": go_test_count,
+        "java_test_count": java_test_count,
+        "native_trace_cases": native_trace_cases,
+        "native_watch_start_cases": len(J45_START_MATRIX),
+        "native_watch_id_cases": len(J45_RAW_WATCH_ID_MATRIX),
+        "local_service_trace_cases": local_trace_cases,
+        "evidence": "JVM-Watch-units-plus-native-start-and-local-service-start-and-lifecycle-matrices",
+        "scope": "public-local-unit",
+    }
+
+
 def validate_artifact(repository: Path, artifact: Path, registry: dict[str, object]) -> dict[str, object]:
     run, task = _load_run_and_task(artifact, registry)
     _validate_commands(artifact, run, task)
@@ -1946,6 +2627,8 @@ def validate_artifact(repository: Path, artifact: Path, registry: dict[str, obje
             "java_test_count": java_test_count,
             "evidence": "real-HBase-MiniCluster-event-and-layout-tests",
         }
+    if task.get("id") == "J45":
+        return _validate_j45_artifact(repository, artifact, run, task, java_test_count)
     evidence_root = _task_artifact_root(artifact, task)
     go_test_count = _validate_go_tests(artifact, task)
     run_id = run["run_id"]
