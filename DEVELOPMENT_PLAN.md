@@ -855,11 +855,19 @@ J02/J03/J07 等基础交付按所需工程输入推进，不能等待 J00 的全
   - 依赖：J45。
   - 完成标准：快照到订阅及回放到实时窗口不漏事件；整 revision、顺序、重连与 fragment 中断边界按原生协议验证。
   - 子任务 / 交付物（各项记录状态、负责人、日期、PR 与证据）：
-    - [ ] **J46.1** 历史回放与实时交接：水位、inclusive startRevision、重连以及快照→订阅窗口无遗漏。
-    - [ ] **J46.2** progress：进度水位及完整事件关系，单独记录原生对照结果。
-    - [ ] **J46.3** fragment：大 revision 分片、顺序、断流恢复边界，独立验证；首版全部交付。
+    - [x] **J46.1** 历史回放与实时交接：水位、inclusive startRevision、重连以及快照→订阅窗口无遗漏。
+    - [x] **J46.2** progress：进度水位及完整事件关系，单独记录原生对照结果；覆盖显式和周期 progress、过滤与历史回放屏障、raw `watch_id=-1`。
+    - [x] **J46.3** fragment：有界大 revision 分片、顺序、取消清理；固定 Go client 的分片重组和同一 Watch 调用在未完成 revision 中断后的自动重连。
   - 验证层次：L1 内核 + L2 协议/Go client；注册联动另记 L3。
-  - 跟踪：状态=未开始；负责人=待分配；完成日期=—；PR/commit=—；验证报告=—；评审人/结论=—。
+  - 跟踪：J46.1–J46.3 实现及原 head 的公开 MiniCluster 验证完成，PR #53 已开放；CI 首轮发现 Watch 测试夹具缺少有效事件序号，head `4c028a7b654653a0270ea97551cf60f01ccbd610` 的跨任务检查又发现 opt-in Go→Java 集成测试被常规 Go 套件计为 skip；两项均已形成局部修复，后者的常规 Go 全套复验通过，完整新 head CI 待运行；负责人=Codex；完成日期=2026-11-18；实现 commit=`f8b498020aebe5265161a2a77bb30fd4167e067f`；Base=上游 `main` `5c3298e5014255dc16f6a85347b2309f0f7aec16`；Head=`Huginn-kio:codex/j46-watch-replay-progress`；正式 reviewer=`Reidddddd`，按前序 PR 顺序在 #52 合并后请求；目标身份与 M4 阶段验收=未完成。
+  - J46.1 公开定向验证：Temurin JDK 21；`scripts/verify/m4.sh --scope public --task J46 --artifact-root .artifacts/m4/j46-1-targeted-20261118-1` 通过。报告脚本 38 项、`WatchHistoryReplayTest` 2 项通过，失败/错误/跳过均为 0；artifact 标记为 `development-dirty`。证据仅覆盖 inclusive 历史回放、revision/ordinal 顺序和 captured barrier 交接，不代表 J46.2/J46.3、完整 J46、MiniCluster 或原生 Go client 验收。
+  - J46.2 显式进度屏障公开定向验证：Temurin JDK 21；`scripts/verify/m4.sh --scope public --task J46 --artifact-root .artifacts/m4/j46-2-targeted-20261118-2` 通过。固定 etcd v3.5.23 raw-proto Go 对照 1 项，Java 回放与进度测试 6 项，报告脚本 38 项；失败/错误/跳过均为 0，artifact 标记为 `development-dirty`。覆盖 synced 全流 `watch_id=-1` 响应、进度前的事件发送、过滤后空水位、任一历史回放未完成时不返回进度、未来起点门禁；不覆盖周期 progress、fragment、MiniCluster 或 Java 服务上的完整 Go client 互通。
+  - J46 完整公开验证：Temurin JDK 21；artifact `j46-final-clean-20261118-1` 标记为 `official-clean`，scope=`public-local-minicluster`，source/checkout SHA=`f8b498020aebe5265161a2a77bb30fd4167e067f`，base SHA=`5c3298e5014255dc16f6a85347b2309f0f7aec16`，`worktree_clean=true`。报告记录固定 etcd v3.5.23 raw-proto Go 对照 1 项、Java 测试 65 项，失败/错误/跳过均为 0；HISTORY/NATIVE 两种 MiniCluster 布局均由 Go v3.5.23 client 验证历史 fragment 重组、首片/中片断流后的自动重连重放和 live handoff，以及完整 revision 后断流恢复。断流通过 client-side interceptor 取消真实 RPC context 并注入 `UNAVAILABLE`；同一 `clientv3.Watcher.Watch` 持续交付完整 revision。报告注册表、报告测试和 artifact 校验均通过。
+  - CI 夹具修复：J46 引入 `(sequence, ordinal)` 屏障后，`WatchGoInteropTest` 的 mock delivery 仍返回默认 sequence `0`，被作为屏障前事件过滤；测试夹具现按 `PreparedEvent.baseSequence + 1` 生成 sequence，并为同 revision 事件给出递增 ordinal。Temurin JDK 21 下 `scripts/dev/mvn21.sh -pl server -am -Dtest=WatchGoInteropTest -Dsurefire.failIfNoSpecifiedTests=false test` 通过 1 项，失败/错误/跳过均为 0；完整 PR CI 的 41 项检查对应代码提交 `5557d1a065f5b156383f91f4a30587684f889d23`，全部成功。
+  - Go→Java 集成测试隔离修复：`m4_watch_java_service_test.go` 使用 `m4watchintegration` build tag；`M4WatchRpcIT` 启动固定 Go client 时显式启用该 tag，并继续设置 endpoint/prefix、要求测试输出 `PASS` 且拒绝 `SKIP`。因此 M0/M3/M4/J07 等普通 Go 套件不再把未配置服务端的可选集成测试算作 skip，J46 Failsafe 仍必须实际执行它。Go 1.27.2 下 `scripts/dev/go-m0.sh test -json -count=1 ./...`：12 个包、398 项通过，失败/跳过均为 0；`scripts/dev/go-m0.sh test -tags=m4watchintegration -run '^$' ./internal/scenario` 编译通过。Temurin JDK 21 下 `scripts/dev/mvn21.sh -B -ntp -pl server -am -Pm4-j46-public -DskipTests test-compile` 八模块生产与测试源码编译通过。代码提交 `5557d1a065f5b156383f91f4a30587684f889d23` 的 J46 专项 job 验证了 MiniCluster Failsafe 与 Go client 互通。
+  - Review 边界：raw proto `watch_id=-1` 的 progress 已修复并由定向 Java 测试和完整 J46 验证覆盖。Created 后回放遇到 Compact 时携带 `compact_revision`，以及开流回放期间取消、deadline、断连后等待 producer drain，按 M4 设计 §9 和 J47 完成标准归 J47；J46 不宣称这些 J47 生命周期已验收。
+  - J46 取消清理修复：Watch state memory 与 live tailer subscription 在获取后立即注册为 `RequestScope` 清理项；控制快照读取未完成时取消，订阅索引、watch memory、request admission 和 reserved bytes 在 barrier 仍 pending 时恢复至 tailer 基线。Temurin JDK 21 下运行 `scripts/dev/mvn21.sh -pl server -am -Dtest=WatchGatewayTest -Dsurefire.failIfNoSpecifiedTests=false test`，15 项通过，失败/错误/跳过均为 0；`git diff --check` 通过。独立复核对象为 commit `5557d1a065f5b156383f91f4a30587684f889d23`，P1/P2/P3 均无；该代码提交对应的 PR #53 GitHub 41 项 checks 全部通过，含 J46 MiniCluster/Go client job。
+  - 作者自审=完成；独立复核=已覆盖原 J46 冻结快照及当前取消清理增量（无 P1/P2/P3）；CI 证据绑定代码提交 `5557d1a065f5b156383f91f4a30587684f889d23`，41 项全部成功。维护者正式 review=尚未请求，按顺序等待 #52 合并后请求；目标身份与 M4 阶段验收=未完成。
 
 - [ ] **J47｜gRPC readiness、慢消费、取消与 compaction 错误**
   - 依赖：J26/J46。

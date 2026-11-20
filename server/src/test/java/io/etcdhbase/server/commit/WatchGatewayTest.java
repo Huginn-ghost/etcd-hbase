@@ -212,6 +212,48 @@ class WatchGatewayTest {
   }
 
   @Test
+  void cancellingStreamRemovesInstalledTailerSubscriptionBeforeBarrierReadCompletes()
+      throws Exception {
+    try (var startup = RequestScope.withoutDeadline();
+         var tailerScope = RequestScope.withoutDeadline();
+         var streamScope = RequestScope.withoutDeadline()) {
+      var budgets = budgets();
+      var tailerMemory = budgets.admit(TABLE_GROUP, tailerScope,
+          new BudgetManager.Reservation(0, 1, 1, 1));
+      BudgetManager.Snapshot tailerBaseline = budgets.snapshot();
+      try (var tailer = new SharedEventTailer(mock(SelectedSequenceReader.class),
+          ByteKey.copyOf(new byte[32]), tailerMemory, 0, 1, 4,
+          WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH,
+          LeaseBudgetProfile.EVENT_TAILER_MAX_REVISION_BYTES)) {
+        var control = mock(CommitControlStore.class);
+        var barrierRead = new CompletableFuture<Optional<ControlSnapshot>>();
+        when(control.read(streamScope)).thenReturn(barrierRead);
+        var gateway = gateway(startup, budgets, RESPONSE_BYTES, control);
+
+        CompletableFuture<WatchStream.OpenedWatch> opening = session(gateway, tailer, streamScope)
+            .subscribe(KeyRange.all(), Rpc.WatchCreateRequest.getDefaultInstance())
+            .toCompletableFuture();
+        assertEquals(1, tailer.subscriptionCount());
+
+        streamScope.cancel();
+
+        assertEquals(0, tailer.subscriptionCount(),
+            "cancellation releases the shared range index without waiting for the barrier read");
+        assertEquals(0, budgets.snapshot().allocatedBytes(),
+            "cancellation also releases the watch state memory before the barrier read completes");
+        assertEquals(tailerBaseline.requests(), budgets.snapshot().requests(),
+            "cancellation releases the watch admission before the barrier read completes");
+        assertEquals(tailerBaseline.reservedBytes(), budgets.snapshot().reservedBytes(),
+            "cancellation releases the watch reservation before the barrier read completes");
+        barrierRead.complete(Optional.of(snapshot(12, 0)));
+        assertThrows(CompletionException.class, opening::join);
+      }
+      tailerScope.close();
+      assertReleased(budgets);
+    }
+  }
+
+  @Test
   void cleanupFailuresAreSuppressedAndDoNotPreventOtherResourcesFromReleasing() throws Exception {
     try (var startup = RequestScope.withoutDeadline(); var scope = RequestScope.withoutDeadline()) {
       var tailer = openTailer();
@@ -251,7 +293,7 @@ class WatchGatewayTest {
       upper[0] = 1;
       KeyRange range = KeyRange.between(ByteKey.copyOf(lower), ByteKey.copyOf(upper));
       long retainedBytes = 512 + lower.length + upper.length;
-      var budgets = budgetsWithMemory(4_096);
+      var budgets = budgetsWithMemory(8_192);
       var gateway = gateway(startup, budgets, 1);
 
       WatchStream.OpenedWatch opened = subscribe(gateway, tailer, scope, range);
@@ -293,6 +335,123 @@ class WatchGatewayTest {
     }
   }
 
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void fragmentFlagControlsRevisionAggregationBeforeWatchResponseFragmenter(boolean fragment)
+      throws Exception {
+    int messageLimit = 1_024;
+    byte[] authorization = new byte[32];
+    ByteKey authorizationDigest = ByteKey.copyOf(authorization);
+    TransactionId transactionId = TransactionId.create();
+    CommitDecision decision = new CommitDecision(transactionId, InvocationId.create(), 4, 4, 5,
+        ByteKey.copyOf(new byte[] {1}), ByteKey.copyOf(new byte[32]), true);
+    List<PreparedEvent> events = List.of(
+        revisionEvent(transactionId, 0, new byte[] {1}, new byte[400]),
+        revisionEvent(transactionId, 1, new byte[] {1, 0}, new byte[400]),
+        revisionEvent(transactionId, 2, new byte[] {1, (byte) 0xff}, new byte[400]));
+    assertTrue(events.stream().mapToLong(PreparedEvent::retainedBytes).sum() > messageLimit);
+
+    try (var startup = RequestScope.withoutDeadline();
+         var tailerScope = RequestScope.withoutDeadline();
+         var readScope = RequestScope.withoutDeadline();
+         var streamScope = RequestScope.withoutDeadline()) {
+      var budgets = watchBudgets();
+      var tailerReservation = new BudgetManager.Reservation(1, 1, 1,
+          LeaseBudgetProfile.EVENT_TAILER_MAX_REVISION_BYTES, 0);
+      var readReservation = new BudgetManager.Reservation(1, 1, 1, 1, 0);
+      long indexMemoryBytes = 512 + 1 + 1;
+      long expectedRevisionBytes = fragment
+          ? LeaseBudgetProfile.EVENT_TAILER_MAX_REVISION_BYTES : messageLimit;
+      var watchReservation = new BudgetManager.Reservation(indexMemoryBytes, 1, 1,
+          Math.addExact(expectedRevisionBytes, indexMemoryBytes), 0);
+      try (var tailerMemory = budgets.admit(TABLE_GROUP, tailerScope, tailerReservation);
+           var readMemory = budgets.admit(TABLE_GROUP, readScope, readReservation)) {
+        var readBudget = new ManifestCatalog.ProofReadBudget(readScope, readMemory, 4, 1L << 20);
+        var source = mock(SelectedSequenceReader.class);
+        var cursor = mock(ProtectedEventCursor.class);
+        var selected = new SelectedSequenceReader.Selected(decision, Optional.of(cursor),
+            Optional.of(new EventRevisionIndex(decision, new EventReference(
+                ByteKey.copyOf(new byte[] {2}), ByteKey.copyOf(new byte[32]), 0,
+                events.size() - 1, events.size(),
+                events.stream().mapToLong(PreparedEvent::retainedBytes).sum(), 1, 0))));
+        when(source.openNext(eq(3L), eq(4L), eq(authorizationDigest), eq(readScope), any()))
+            .thenReturn(CompletableFuture.completedFuture(
+                new SelectedSequenceReader.ReadAhead(3, Optional.of(selected))));
+        AtomicLong nextEvent = new AtomicLong();
+        when(cursor.next(any(ManifestCatalog.ProofReadBudget.class))).thenAnswer(ignored -> {
+          long index = nextEvent.getAndIncrement();
+          Optional<PreparedEvent> event = index < events.size()
+              ? Optional.of(events.get(Math.toIntExact(index))) : Optional.empty();
+          return CompletableFuture.completedFuture(event);
+        });
+        when(cursor.releaseCompletion()).thenReturn(CompletableFuture.completedFuture(null));
+
+        try (var tailer = new SharedEventTailer(source, authorizationDigest, tailerMemory,
+            3, 4, 4, WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH,
+            LeaseBudgetProfile.EVENT_TAILER_MAX_REVISION_BYTES)) {
+          var pending = new M3TableGroupRuntime.Pending(startup, null, true);
+          pending.installEventTailer(tailer);
+          var gateway = new WatchGateway(TABLE_GROUP, pending, control(4, 0), budgets,
+              Runnable::run, mock(ScheduledExecutorService.class), 11, 12, messageLimit);
+          WatchStream.Session session = session(gateway, tailer, streamScope);
+          var observer = new RecordingResponseObserver();
+          try (var stream = new WatchStream(observer, streamScope, Runnable::run,
+              mock(ScheduledExecutorService.class), () -> CompletableFuture.completedFuture(session),
+              11, 12, messageLimit)) {
+            Rpc.WatchCreateRequest create = Rpc.WatchCreateRequest.newBuilder()
+                .setWatchId(31)
+                .setKey(ByteString.copyFrom(new byte[] {1}))
+                .setRangeEnd(ByteString.copyFrom(new byte[] {2}))
+                .setFragment(fragment)
+                .build();
+            stream.onNext(Rpc.WatchRequest.newBuilder().setCreateRequest(create).build());
+            assertTrue(observer.responses.stream().anyMatch(Rpc.WatchResponse::getCreated));
+            assertEquals(tailerReservation.total() + readReservation.total() + watchReservation.total(),
+                budgets.snapshot().reservedBytes(),
+                "the OUTPUT reservation includes both the event revision and tailer index");
+            assertEquals(2 * indexMemoryBytes, budgets.snapshot().allocatedBytes(),
+                "the watch state and tailer index are retained in separate memory lanes");
+
+            assertEquals(SharedEventTailer.Step.OPENED, tailer.step(readScope, readBudget).join());
+            for (int index = 0; index < events.size(); index++) {
+              assertEquals(SharedEventTailer.Step.BUFFERED, tailer.step(readScope, readBudget).join());
+            }
+            assertEquals(SharedEventTailer.Step.PUBLISHED, tailer.step(readScope, readBudget).join());
+            stream.onNext(Rpc.WatchRequest.getDefaultInstance());
+
+            List<Rpc.WatchResponse> eventResponses = observer.responses.stream()
+                .filter(response -> response.getEventsCount() > 0).toList();
+            if (fragment) {
+              assertNull(observer.failure);
+              assertTrue(eventResponses.size() > 1,
+                  "the complete revision reaches the sender and is split into response-sized fragments");
+              assertTrue(eventResponses.getFirst().getFragment());
+              assertFalse(eventResponses.getLast().getFragment());
+              assertTrue(eventResponses.stream()
+                  .allMatch(response -> response.getSerializedSize() <= messageLimit));
+              assertEquals(events.stream().map(event -> ByteString.copyFrom(
+                      event.current().value().orElseThrow())).toList(),
+                  eventResponses.stream().flatMap(response -> response.getEventsList().stream())
+                      .map(event -> event.getKv().getValue()).toList());
+              assertEquals(2 * indexMemoryBytes, budgets.snapshot().allocatedBytes(),
+                  "the final fragment releases all event output leases");
+            } else {
+              assertTrue(eventResponses.isEmpty(), "a non-fragment watch never emits part of a revision");
+              assertTrue(observer.responses.stream().anyMatch(response -> response.getWatchId() == 31
+                  && response.getCanceled()
+                  && response.getCancelReason().contains("subscription resource limit")));
+              assertEquals(0, budgets.snapshot().allocatedBytes(),
+                  "a rejected non-fragment revision releases the state and tailer index");
+            }
+          }
+          assertEquals(0, budgets.snapshot().allocatedBytes(),
+              "closing the stream releases remaining watch memory");
+        }
+      }
+      assertReleased(budgets);
+    }
+  }
+
   @Test
   void currentRevisionReadsTheAuthoritativeControlSnapshotInsteadOfTheTailerCheckpoint()
       throws Exception {
@@ -331,7 +490,7 @@ class WatchGatewayTest {
       when(tailer.subscribeWithCheckpoint(any(KeyRange.class), any(BudgetManager.Account.class),
           anyInt(), anyLong(), anyLong()))
           .thenReturn(new SharedEventTailer.SubscriptionStart(subscription, 3, 4));
-      var budgets = budgetsWithMemory(515);
+      var budgets = budgetsWithMemory(2_048);
       var gateway = gateway(startup, budgets, 1, control(4, 2));
       var request = Rpc.WatchCreateRequest.newBuilder().setStartRevision(-2).build();
 
@@ -376,6 +535,31 @@ class WatchGatewayTest {
     }
   }
 
+  @Test
+  void initiallyCompactedPositiveStartSkipsHistoryRegistrationAndKeepsPerWatchBoundary()
+      throws Exception {
+    try (var startup = RequestScope.withoutDeadline(); var scope = RequestScope.withoutDeadline()) {
+      var tailer = openTailer();
+      var sharedSubscription = mock(SharedEventTailer.Subscription.class);
+      when(tailer.subscribeWithCheckpoint(any(KeyRange.class), any(BudgetManager.Account.class),
+          anyInt(), anyLong(), eq(3L)))
+          .thenReturn(new SharedEventTailer.SubscriptionStart(sharedSubscription, 4, 5));
+      var budgets = budgets();
+      var gateway = gateway(startup, budgets, RESPONSE_BYTES, control(5, 4));
+      var request = Rpc.WatchCreateRequest.newBuilder().setStartRevision(3).build();
+
+      WatchStream.OpenedWatch opened = subscribe(gateway, tailer, scope, KeyRange.all(), request);
+
+      assertEquals(5, opened.revision());
+      assertEquals(4, opened.compactRevision());
+      assertFalse(opened.historicalReplaySupported());
+      verify(sharedSubscription, never()).requireRevisionAtLeast(anyLong());
+      opened.subscription().close();
+      verify(sharedSubscription).close();
+      assertReleased(budgets);
+    }
+  }
+
   @ParameterizedTest
   @ValueSource(longs = {0, -1})
   void nonPositiveStartRegistersBeforeTheBarrierAndDropsOnlyEventsAtOrBeforeIt(
@@ -391,23 +575,14 @@ class WatchGatewayTest {
       queued.add(eventAtBarrier);
       queued.add(eventAfterBarrier);
       when(eventAtBarrier.revision()).thenReturn(4L);
+      when(eventAtBarrier.sequence()).thenReturn(4L);
       when(eventAtBarrier.event()).thenReturn(event(4));
       when(eventAfterBarrier.revision()).thenReturn(5L);
+      when(eventAfterBarrier.sequence()).thenReturn(5L);
       when(eventAfterBarrier.event()).thenReturn(event(5));
       when(sharedSubscription.poll()).thenAnswer(ignored -> Optional.ofNullable(queued.pollFirst()));
       when(sharedSubscription.termination()).thenReturn(Optional.empty());
-      doAnswer(invocation -> {
-        long minimumRevision = invocation.getArgument(0);
-        var iterator = queued.iterator();
-        while (iterator.hasNext()) {
-          var delivery = iterator.next();
-          if (delivery.revision() < minimumRevision) {
-            iterator.remove();
-            delivery.close();
-          }
-        }
-        return null;
-      }).when(sharedSubscription).requireRevisionAtLeast(anyLong());
+      doAnswer(invocation -> null).when(sharedSubscription).requireRevisionAtLeast(anyLong());
       when(tailer.subscribeWithCheckpoint(any(KeyRange.class), any(BudgetManager.Account.class),
           anyInt(), anyLong(), anyLong()))
           .thenReturn(new SharedEventTailer.SubscriptionStart(sharedSubscription, 2, 3));
@@ -429,16 +604,17 @@ class WatchGatewayTest {
           eq((long) RESPONSE_BYTES), eq(startRevision));
       order.verify(control).read(scope);
 
-      barrier.complete(Optional.of(snapshot(4, 2)));
+      barrier.complete(Optional.of(snapshot(4, 2, 4)));
       WatchStream.OpenedWatch opened = opening.toCompletableFuture().join();
 
       assertEquals(4, opened.revision());
       assertEquals(2, opened.compactRevision(), "compact boundary comes from the same control snapshot");
+      assertEquals(4, opened.barrierSequence(), "the handoff captures the selected sequence too");
       verify(sharedSubscription).requireRevisionAtLeast(5L);
-      verify(eventAtBarrier).close();
       try (var delivery = opened.subscription().poll().orElseThrow()) {
         assertEquals(5, delivery.revision(), "B+1 is retained after raising the floor");
       }
+      verify(eventAtBarrier).close();
       verify(eventAfterBarrier).close();
       opened.subscription().close();
       assertReleased(budgets);
@@ -593,6 +769,11 @@ class WatchGatewayTest {
     return new BudgetManager(limits, Map.of(TABLE_GROUP, limits), limits);
   }
 
+  private static BudgetManager watchBudgets() {
+    var limits = new BudgetManager.Limits(8, 8, 8, 8, 8, 1L << 20, 64L << 20);
+    return new BudgetManager(limits, Map.of(TABLE_GROUP, limits), limits);
+  }
+
   private static WatchGateway gateway(RequestScope startup, BudgetManager budgets) {
     return gateway(startup, budgets, RESPONSE_BYTES);
   }
@@ -617,8 +798,13 @@ class WatchGatewayTest {
   }
 
   private static ControlSnapshot snapshot(long revision, long compactRevision) {
+    return snapshot(revision, compactRevision, 0);
+  }
+
+  private static ControlSnapshot snapshot(long revision, long compactRevision, long sequence) {
     CommitState state = CommitState.restore(CommitState.FORMAT_VERSION, ByteKey.copyOf(new byte[32]),
-        Optional.empty(), 0, 0, 1, 0, revision, 0, revision, Optional.empty(), compactRevision);
+        Optional.empty(), 0, 0, 1, sequence, revision, sequence, revision,
+        Optional.empty(), compactRevision);
     return new ControlSnapshot(state, new byte[] {1});
   }
 
@@ -701,5 +887,22 @@ class WatchGatewayTest {
     return new PreparedEvent(new TransactionId(new UUID(0, revision)), 1, revision - 1,
         revision - 1, 0,
         PreparedEvent.Kind.PUT, stored, Optional.empty());
+  }
+
+  private static PreparedEvent revisionEvent(TransactionId transactionId, long ordinal,
+      byte[] key, byte[] value) {
+    var stored = StoredRecord.live(ByteKey.copyOf(key),
+        new StorageMetadata(1, 5, 5, 0, StorageMetadata.State.LIVE, value.length), value);
+    return new PreparedEvent(transactionId, 1, 3, 4, ordinal,
+        PreparedEvent.Kind.PUT, stored, Optional.empty());
+  }
+
+  private static final class RecordingResponseObserver implements StreamObserver<Rpc.WatchResponse> {
+    private final List<Rpc.WatchResponse> responses = new ArrayList<>();
+    private Throwable failure;
+
+    @Override public void onNext(Rpc.WatchResponse response) { responses.add(response); }
+    @Override public void onError(Throwable error) { failure = error; }
+    @Override public void onCompleted() {}
   }
 }

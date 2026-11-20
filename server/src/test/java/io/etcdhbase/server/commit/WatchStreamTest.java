@@ -3,6 +3,7 @@ package io.etcdhbase.server.commit;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -581,6 +582,341 @@ class WatchStreamTest {
   }
 
   @Test
+  void explicitProgressFollowsAllEligibleEventsAndUsesTheAuthoritativeRevision() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    byte[] key = {4};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(31, key, new byte[0], 0, false));
+      session.revision = 5;
+      subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[] {5}, Optional.empty()));
+
+      stream.onNext(progressRequest());
+
+      assertEquals(3, observer.responses.size());
+      assertTrue(observer.responses.get(0).getCreated());
+      Rpc.WatchResponse event = observer.responses.get(1);
+      assertEquals(31, event.getWatchId());
+      assertEquals(5, event.getHeader().getRevision());
+      assertEquals(1, event.getEventsCount());
+      Rpc.WatchResponse progress = observer.responses.get(2);
+      assertEquals(-1, progress.getWatchId());
+      assertEquals(5, progress.getHeader().getRevision());
+      assertEquals(0, progress.getEventsCount());
+      assertEquals(1, subscription.releases.get());
+      stream.close();
+    }
+  }
+
+  @Test
+  void explicitProgressWaitsForEveryWatchThroughItsBarrier() {
+    var future = new RecordingSubscription();
+    var pending = new RecordingSubscription();
+    var session = new RecordingSession(4, future, pending);
+    var observer = new RecordingObserver();
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(31, new byte[] {1}, new byte[0], 0, false));
+      stream.onNext(createRequest(32, new byte[] {2}, new byte[0], 0, false));
+      observer.ready = false;
+      session.revision = 5;
+      future.add(event(6, PreparedEvent.Kind.PUT, new byte[] {1}, new byte[] {6}, Optional.empty()));
+      pending.add(event(5, PreparedEvent.Kind.PUT, new byte[] {2}, new byte[] {5}, Optional.empty()));
+      stream.onNext(progressRequest());
+      observer.ready = true;
+      observer.readyHandler.run();
+
+      int eventIndex = indexOfResponse(observer.responses,
+          response -> response.getWatchId() == 32 && response.getEventsCount() > 0);
+      int progressIndex = indexOfResponse(observer.responses, response -> response.getWatchId() == -1);
+      int futureIndex = indexOfResponse(observer.responses,
+          response -> response.getWatchId() == 31 && response.getEventsCount() > 0);
+      assertTrue(eventIndex >= 0 && eventIndex < progressIndex);
+      assertTrue(progressIndex < futureIndex);
+      assertEquals(5, observer.responses.get(progressIndex).getHeader().getRevision());
+      stream.close();
+    }
+  }
+
+  @Test
+  void explicitProgressCanAdvanceAcrossARevisionFilteredByTheWatch() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    byte[] key = {5};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(32, key, new byte[0], 0, false,
+          Rpc.WatchCreateRequest.FilterType.NOPUT));
+      session.revision = 5;
+      subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[] {6}, Optional.empty()));
+
+      stream.onNext(progressRequest());
+
+      assertEquals(2, observer.responses.size());
+      assertTrue(observer.responses.getFirst().getCreated());
+      Rpc.WatchResponse progress = observer.responses.get(1);
+      assertEquals(-1, progress.getWatchId());
+      assertEquals(5, progress.getHeader().getRevision());
+      assertEquals(0, progress.getEventsCount());
+      assertEquals(1, subscription.releases.get(), "filtered events are consumed before progress");
+      stream.close();
+    }
+  }
+
+  @Test
+  void progressRequestIsDroppedWhenAnyWatchHasNotFinishedHistoricalReplay() {
+    var ready = new RecordingSubscription();
+    var replaying = new RecordingSubscription();
+    replaying.progressReady = false;
+    var session = new RecordingSession(8, true, ready, replaying);
+    var observer = new RecordingObserver();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(33, new byte[] {1}, new byte[0], 0, false));
+      stream.onNext(createRequest(34, new byte[] {2}, new byte[0], 3, false));
+
+      stream.onNext(progressRequest());
+      assertEquals(2, observer.responses.size(),
+          "the all-watch progress request has no response while one replay is incomplete");
+
+      replaying.progressReady = true;
+      stream.onNext(progressRequest());
+      assertEquals(3, observer.responses.size());
+      assertEquals(-1, observer.responses.get(2).getWatchId());
+      assertEquals(8, observer.responses.get(2).getHeader().getRevision());
+      stream.close();
+    }
+  }
+
+  @Test
+  void progressRequestIsDroppedUntilFutureStartRevisionIsReached() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    byte[] key = {6};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(35, key, new byte[0], 7, false));
+
+      stream.onNext(progressRequest());
+      assertEquals(1, observer.responses.size(), "future-start Watch blocks stream progress");
+
+      session.revision = 7;
+      subscription.add(event(7, PreparedEvent.Kind.PUT, key, new byte[] {7}, Optional.empty()));
+      stream.onNext(progressRequest());
+
+      assertEquals(3, observer.responses.size());
+      assertEquals(35, observer.responses.get(1).getWatchId());
+      assertEquals(7, observer.responses.get(1).getHeader().getRevision());
+      assertEquals(-1, observer.responses.get(2).getWatchId());
+      assertEquals(7, observer.responses.get(2).getHeader().getRevision());
+      stream.close();
+    }
+  }
+
+  @Test
+  void periodicProgressNotifySupportsRawNegativeIdAndDrainsEventsBeforeItsWatermark() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    var periodicTick = new AtomicReference<Runnable>();
+    byte[] key = {9};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = new WatchStream(observer, scope, Runnable::run,
+          timers(periodicTick, 1_000), () -> CompletableFuture.completedFuture(session),
+          CLUSTER_ID, MEMBER_ID, 1 << 20, 1_000);
+      stream.onNext(createRequest(-1, key, new byte[0], 0, false, true, false));
+      session.revision = 5;
+      subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[] {5}, Optional.empty()));
+
+      Runnable tick = periodicTick.getAndSet(null);
+      assertTrue(tick != null, "progress_notify schedules a periodic trigger after Created");
+      tick.run();
+
+      assertEquals(3, observer.responses.size());
+      Rpc.WatchResponse deliveredEvent = observer.responses.get(1);
+      assertEquals(-1, deliveredEvent.getWatchId());
+      assertEquals(5, deliveredEvent.getHeader().getRevision());
+      Rpc.WatchResponse progress = observer.responses.get(2);
+      assertEquals(-1, progress.getWatchId(), "periodic progress is scoped to its raw-proto watcher");
+      assertEquals(5, progress.getHeader().getRevision());
+      assertEquals(0, progress.getEventsCount());
+      assertEquals(1, subscription.releases.get());
+
+      stream.close();
+      assertEquals(1, subscription.closeCount.get());
+    }
+  }
+
+  @Test
+  void periodicProgressNotifySkipsFutureAndUnsyncedWatchersIndependently() {
+    var ready = new RecordingSubscription();
+    var future = new RecordingSubscription();
+    future.progressReady = false;
+    var session = new RecordingSession(5, ready, future);
+    var observer = new RecordingObserver();
+    var periodicTick = new AtomicReference<Runnable>();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = new WatchStream(observer, scope, Runnable::run,
+          timers(periodicTick, 1_000), () -> CompletableFuture.completedFuture(session),
+          CLUSTER_ID, MEMBER_ID, 1 << 20, 1_000);
+      stream.onNext(createRequest(40, new byte[] {1}, new byte[0], 0, false, true, false));
+      stream.onNext(createRequest(41, new byte[] {2}, new byte[0], 9, false, true, false));
+
+      Runnable tick = periodicTick.getAndSet(null);
+      assertTrue(tick != null, "the stream has one timer for all opted-in watchers");
+      tick.run();
+
+      assertEquals(3, observer.responses.size());
+      Rpc.WatchResponse progress = observer.responses.get(2);
+      assertEquals(40, progress.getWatchId(), "one unsynced watcher does not block another");
+      assertEquals(5, progress.getHeader().getRevision());
+
+      stream.close();
+      assertEquals(1, ready.closeCount.get());
+      assertEquals(1, future.closeCount.get());
+    }
+  }
+
+  @Test
+  void fragmentsKeepTheRevisionContiguousAheadOfProgressAndOtherWatches() {
+    var fragmented = new RecordingSubscription();
+    var other = new RecordingSubscription();
+    var session = new RecordingSession(4, fragmented, other);
+    var observer = new RecordingObserver();
+    var values = List.of(new byte[80], new byte[80], new byte[80]);
+    byte[] fragmentedKey = {1};
+    byte[] otherKey = {2};
+    var fragmentedEvents = values.stream()
+        .map(value -> event(5, PreparedEvent.Kind.PUT, fragmentedKey, value, Optional.empty()))
+        .toList();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = new WatchStream(observer, scope, Runnable::run, timers(),
+          () -> CompletableFuture.completedFuture(session), CLUSTER_ID, MEMBER_ID, 220);
+      stream.onNext(createRequest(31, fragmentedKey, new byte[0], 0, false,
+          false, true));
+      stream.onNext(createRequest(32, otherKey, new byte[0], 0, false));
+
+      session.revision = 5;
+      fragmentedEvents.forEach(fragmented::add);
+      other.add(event(6, PreparedEvent.Kind.PUT, otherKey, new byte[] {6}, Optional.empty()));
+      AtomicInteger blockedAfterFirstFragment = new AtomicInteger();
+      observer.onNextHook = () -> {
+        Rpc.WatchResponse sent = observer.responses.getLast();
+        if (sent.getWatchId() == 31 && sent.getFragment()
+            && blockedAfterFirstFragment.compareAndSet(0, 1)) {
+          observer.ready = false;
+          stream.onNext(progressRequest());
+        }
+      };
+
+      stream.onNext(Rpc.WatchRequest.getDefaultInstance());
+      assertEquals(1, blockedAfterFirstFragment.get());
+      assertEquals(3, observer.responses.size(), "only Created responses and the first fragment were sent");
+      assertEquals(0, fragmented.releases.get(), "event leases remain held during an incomplete revision");
+
+      observer.ready = true;
+      observer.readyHandler.run();
+
+      List<Rpc.WatchResponse> fragments = observer.responses.stream()
+          .filter(response -> response.getWatchId() == 31 && response.getEventsCount() > 0)
+          .toList();
+      assertTrue(fragments.size() > 1);
+      assertTrue(fragments.getFirst().getFragment());
+      assertFalse(fragments.getLast().getFragment());
+      assertTrue(fragments.stream().allMatch(response -> response.getSerializedSize() <= 220));
+      List<ByteString> deliveredValues = fragments.stream()
+          .flatMap(response -> response.getEventsList().stream())
+          .map(event -> event.getKv().getValue()).toList();
+      assertEquals(values.stream().map(ByteString::copyFrom).toList(), deliveredValues);
+
+      int firstFragmentIndex = observer.responses.indexOf(fragments.getFirst());
+      int finalFragmentIndex = observer.responses.indexOf(fragments.getLast());
+      assertEquals(fragments.size(), finalFragmentIndex - firstFragmentIndex + 1,
+          "no other watch or control response may split a fragment sequence");
+      int progressIndex = indexOfResponse(observer.responses, response -> response.getWatchId() == -1);
+      int otherWatchEventIndex = indexOfResponse(observer.responses,
+          response -> response.getWatchId() == 32 && response.getEventsCount() > 0);
+      assertTrue(progressIndex > finalFragmentIndex);
+      assertTrue(otherWatchEventIndex > progressIndex);
+      assertEquals(3, fragmented.releases.get(), "the final fragment releases the complete revision");
+
+      stream.close();
+      assertEquals(1, fragmented.closeCount.get());
+      assertEquals(1, other.closeCount.get());
+    }
+  }
+
+  @Test
+  void rejectsARevisionBeyondTheAggregationBoundWithoutSendingAPartialRevision() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    byte[] key = {4};
+    for (int index = 0; index <= WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH; index++) {
+      subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[] {(byte) index}, Optional.empty()));
+    }
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(), () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(33, key, new byte[0], 0, false, false, true));
+
+      assertEquals(2, observer.responses.size());
+      assertTrue(observer.responses.getFirst().getCreated());
+      Rpc.WatchResponse cancelled = observer.responses.getLast();
+      assertTrue(cancelled.getCanceled());
+      assertEquals(33, cancelled.getWatchId());
+      assertTrue(cancelled.getCancelReason().contains("aggregation budget"));
+      assertEquals(WatchEventBatchEncoder.MAX_PENDING_EVENTS_PER_WATCH + 1, subscription.releases.get());
+
+      stream.close();
+      assertEquals(1, subscription.closeCount.get());
+    }
+  }
+
+  @Test
+  void closingDuringAFragmentSequenceReleasesTheUnfinishedRevision() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    byte[] key = {5};
+    for (int value = 0; value < 3; value++) {
+      subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[80], Optional.empty()));
+    }
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = new WatchStream(observer, scope, Runnable::run, timers(),
+          () -> CompletableFuture.completedFuture(session), CLUSTER_ID, MEMBER_ID, 220);
+      observer.onNextHook = () -> {
+        Rpc.WatchResponse sent = observer.responses.getLast();
+        if (sent.getWatchId() == 34 && sent.getFragment()) observer.ready = false;
+      };
+      stream.onNext(createRequest(34, key, new byte[0], 0, false, false, true));
+
+      assertEquals(2, observer.responses.size());
+      assertTrue(observer.responses.getLast().getFragment());
+      assertEquals(0, subscription.releases.get());
+
+      stream.close();
+      assertEquals(3, subscription.releases.get());
+      assertEquals(1, subscription.closeCount.get());
+      observer.ready = true;
+      observer.readyHandler.run();
+      assertEquals(2, observer.responses.size(), "closing must discard the unfinished fragment tail");
+    }
+  }
+
+  @Test
   void zeroStartWaitsForCreatedBarrierAndExcludesEarlierEvents() {
     long startRevision = 0;
     var subscription = new RecordingSubscription();
@@ -1109,6 +1445,45 @@ class WatchStreamTest {
   }
 
   @Test
+  void matchingCancelStopsTheRemainingFragmentsAndReleasesTheirDeliveries() {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    var observer = new RecordingObserver();
+    var cancelSent = new AtomicInteger();
+    byte[] key = {1};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(),
+          () -> CompletableFuture.completedFuture(session), 512);
+      stream.onNext(createRequest(7, key, new byte[0], 0, false, false, true));
+      for (int index = 0; index < 5; index++) {
+        subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[160], Optional.empty()));
+      }
+      observer.onNextHook = () -> {
+        if (observer.responses.size() == 2 && cancelSent.compareAndSet(0, 1)) {
+          stream.onNext(Rpc.WatchRequest.newBuilder().setCancelRequest(
+              Rpc.WatchCancelRequest.newBuilder().setWatchId(7)).build());
+        }
+      };
+      observer.readyHandler.run();
+
+      assertEquals(3, observer.responses.size(),
+          "cancellation discards every unsent fragment of the active revision");
+      Rpc.WatchResponse sentFragment = observer.responses.get(1);
+      assertEquals(7, sentFragment.getWatchId());
+      assertTrue(sentFragment.getFragment());
+      assertTrue(observer.responses.get(2).getCanceled());
+      assertEquals(7, observer.responses.get(2).getWatchId());
+      assertEquals(5, subscription.releases.get(),
+          "all retained event deliveries are released exactly once");
+      assertEquals(1, subscription.closeCount.get());
+      stream.close();
+      assertEquals(5, subscription.releases.get());
+      assertEquals(1, subscription.closeCount.get());
+    }
+  }
+
+  @Test
   void peerCancellationClosesEveryActiveSubscription() {
     var first = new RecordingSubscription();
     var second = new RecordingSubscription();
@@ -1158,12 +1533,33 @@ class WatchStreamTest {
   }
 
   @Test
+  void subscriptionPollFailureFailsTheWatchStreamInsteadOfReportingWatcherCancellation() {
+    var subscription = new RecordingSubscription();
+    subscription.pollFailure = new IllegalStateException("replay cleanup failed");
+    var session = new RecordingSession(8, subscription);
+    var observer = new RecordingObserver();
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = stream(observer, scope, timers(),
+          () -> CompletableFuture.completedFuture(session));
+      stream.onNext(createRequest(23, new byte[] {1}, new byte[0], 0, false));
+
+      assertNotNull(observer.failure, "a subscription poll failure must fail the RPC stream");
+      assertEquals(1, subscription.closeCount.get());
+      assertTrue(observer.responses.stream().noneMatch(Rpc.WatchResponse::getCanceled),
+          "a cleanup failure must not be presented as watcher-local resource cancellation");
+      stream.close();
+      assertEquals(1, subscription.closeCount.get());
+    }
+  }
+
+  @Test
   void watcherCloseStillClosesSubscriptionWhenPendingDeliveryCleanupThrowsError() {
     var subscription = new RecordingSubscription();
     var subscriptionFailure = new IllegalStateException("subscription cleanup failed");
     subscription.closeFailure = subscriptionFailure;
     var watcher = new WatchRegistry(new CompactedWatchIdBudget(1))
-        .registerActive(1, 1, false, false, false, subscription).watcher();
+        .registerActive(1, 1, 1, false, false, false, false, false, subscription).watcher();
     var deliveryFailure = new AssertionError("pending delivery cleanup failed");
     var pendingDelivery = new WatchStream.Delivery(2,
         event(2, PreparedEvent.Kind.PUT, new byte[] {1}, new byte[] {2}, Optional.empty()),
@@ -1326,12 +1722,31 @@ class WatchStreamTest {
         CLUSTER_ID, MEMBER_ID, 1 << 20, compactedWatchIdBudget);
   }
 
+  private static WatchStream stream(RecordingObserver observer, RequestScope scope,
+      ScheduledExecutorService timers, WatchStream.SessionProvider sessions,
+      int maximumResponseBytes) {
+    return new WatchStream(observer, scope, Runnable::run, timers, sessions,
+        CLUSTER_ID, MEMBER_ID, maximumResponseBytes, CompactedWatchIdBudget.processWide());
+  }
+
   private static Rpc.WatchRequest createRequest(long id, byte[] key, byte[] rangeEnd,
       long startRevision, boolean prevKv, Rpc.WatchCreateRequest.FilterType... filters) {
+    return createRequest(id, key, rangeEnd, startRevision, prevKv, false, false, filters);
+  }
+
+  private static Rpc.WatchRequest createRequest(long id, byte[] key, byte[] rangeEnd,
+      long startRevision, boolean prevKv, boolean progressNotify, boolean fragment,
+      Rpc.WatchCreateRequest.FilterType... filters) {
     var create = Rpc.WatchCreateRequest.newBuilder().setWatchId(id)
         .setKey(ByteString.copyFrom(key)).setRangeEnd(ByteString.copyFrom(rangeEnd))
-        .setStartRevision(startRevision).setPrevKv(prevKv).addAllFilters(List.of(filters)).build();
+        .setStartRevision(startRevision).setPrevKv(prevKv).setProgressNotify(progressNotify)
+        .setFragment(fragment).addAllFilters(List.of(filters)).build();
     return Rpc.WatchRequest.newBuilder().setCreateRequest(create).build();
+  }
+
+  private static Rpc.WatchRequest progressRequest() {
+    return Rpc.WatchRequest.newBuilder()
+        .setProgressRequest(Rpc.WatchProgressRequest.getDefaultInstance()).build();
   }
 
   private static PreparedEvent event(long revision, PreparedEvent.Kind kind, byte[] key,
@@ -1363,6 +1778,19 @@ class WatchStreamTest {
     return timers;
   }
 
+  private static ScheduledExecutorService timers(
+      AtomicReference<Runnable> periodicTick, long periodicDelayMillis) {
+    ScheduledExecutorService timers = mock(ScheduledExecutorService.class);
+    ScheduledFuture<?> future = mock(ScheduledFuture.class);
+    doAnswer(invocation -> {
+      Runnable task = invocation.getArgument(0);
+      long delay = invocation.getArgument(1);
+      if (delay == periodicDelayMillis) periodicTick.set(task);
+      return future;
+    }).when(timers).schedule(any(Runnable.class), anyLong(), eq(TimeUnit.MILLISECONDS));
+    return timers;
+  }
+
   private static ScheduledExecutorService immediateZeroDelayTimers() {
     ScheduledExecutorService timers = mock(ScheduledExecutorService.class);
     ScheduledFuture<?> future = mock(ScheduledFuture.class);
@@ -1375,6 +1803,14 @@ class WatchStreamTest {
     return timers;
   }
 
+  private static int indexOfResponse(List<Rpc.WatchResponse> responses,
+      java.util.function.Predicate<Rpc.WatchResponse> predicate) {
+    for (int index = 0; index < responses.size(); index++) {
+      if (predicate.test(responses.get(index))) return index;
+    }
+    return -1;
+  }
+
   private static final class CountingDirectExecutor implements Executor {
     private final AtomicInteger executions = new AtomicInteger();
 
@@ -1385,8 +1821,9 @@ class WatchStreamTest {
   }
 
   private static final class RecordingSession implements WatchStream.Session {
-    private final long revision;
+    private long revision;
     private final long compactRevision;
+    private final boolean historicalReplaySupported;
     private final ArrayDeque<RecordingSubscription> available = new ArrayDeque<>();
     private final List<RecordingSubscription> subscriptions = new ArrayList<>();
     private final List<KeyRange> ranges = new ArrayList<>();
@@ -1395,12 +1832,23 @@ class WatchStreamTest {
     private KeyRange range;
 
     private RecordingSession(long revision, RecordingSubscription... subscriptions) {
-      this(revision, -1, subscriptions);
+      this(revision, -1, false, subscriptions);
     }
 
     private RecordingSession(long revision, long compactRevision, RecordingSubscription... subscriptions) {
+      this(revision, compactRevision, false, subscriptions);
+    }
+
+    private RecordingSession(long revision, boolean historicalReplaySupported,
+        RecordingSubscription... subscriptions) {
+      this(revision, -1, historicalReplaySupported, subscriptions);
+    }
+
+    private RecordingSession(long revision, long compactRevision, boolean historicalReplaySupported,
+        RecordingSubscription... subscriptions) {
       this.revision = revision;
       this.compactRevision = compactRevision;
+      this.historicalReplaySupported = historicalReplaySupported;
       available.addAll(List.of(subscriptions));
     }
 
@@ -1419,7 +1867,8 @@ class WatchStreamTest {
       RecordingSubscription subscription = available.removeFirst();
       subscriptions.add(subscription);
       return CompletableFuture.completedFuture(
-          new WatchStream.OpenedWatch(revision, compactRevision, subscription));
+          new WatchStream.OpenedWatch(revision, 0, compactRevision, subscription,
+              historicalReplaySupported));
     }
   }
 
@@ -1428,9 +1877,11 @@ class WatchStreamTest {
     private final AtomicInteger releases = new AtomicInteger();
     private final AtomicInteger closeCount = new AtomicInteger();
     private RuntimeException closeFailure;
+    private RuntimeException pollFailure;
     private Runnable afterPoll;
     private Runnable wakeup;
     private String terminationReason;
+    private boolean progressReady = true;
     private boolean closed;
 
     private void add(PreparedEvent event) {
@@ -1449,6 +1900,7 @@ class WatchStreamTest {
 
     @Override public Optional<WatchStream.Delivery> poll() {
       if (closed || terminationReason != null) return Optional.empty();
+      if (pollFailure != null) throw pollFailure;
       WatchStream.Delivery delivery = deliveries.pollFirst();
       Runnable hook = afterPoll;
       afterPoll = null;
@@ -1458,6 +1910,8 @@ class WatchStreamTest {
 
     @Override
     public Optional<String> terminationReason() { return Optional.ofNullable(terminationReason); }
+
+    @Override public boolean progressReady(long revision) { return progressReady; }
 
     @Override
     public void setWakeup(Runnable wakeup) {

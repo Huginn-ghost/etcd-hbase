@@ -1080,7 +1080,54 @@
         "local_service": {"scope": "local-service", "layout": "", "embedded_native": false}
       },
       "verification_boundary": "J45 public protocol evidence covers negative/zero startRevision cases, negative watch ID Create/Cancel, future startRevision Create/Cancel, and the Compact-boundary lifecycle. Future-event delivery, positive historical startRevision behavior, and replay/live handoff are assigned to J46.1. The native raw-proto event probe waits for etcd's synced progress marker as a harness barrier; this does not claim Java progress-request support, which is assigned to J46.2. Native raw-proto and local-service Go traces compare the registered start/cancel matrix; a separate Go-client lifecycle run exercises multiple watch IDs, byte ranges, filters/PrevKV, and client-context cancellation cleanup against Java WatchService, including two concurrently requested watchers sharing one pinned client stream. Normal server-side request half-close semantics remain assigned to J47. MiniCluster acceptance remains outside this unit evidence"
+    },
+    {
+      "id": "J46",
+      "kind": "watch-replay",
+      "api_ids": ["C19"],
+      "go_tests": [
+        {"package": "internal/scenario", "tests": [
+          "TestM4WatchProgressRequestMatchesPinnedNativeOracle"
+        ]}
+      ],
+      "maven_tests": [
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.WatchHistoryReplayTest", "tests": [
+          "replaysInclusiveStartInRevisionAndOrdinalOrder",
+          "replayToLiveHandoffDropsTheWholeBarrierSequenceWithoutGapsOrDuplicates",
+          "compactAdvancingDuringReplayRegistrationReturnsPerWatchCancellationBoundary"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.WatchStreamTest", "tests": [
+          "explicitProgressFollowsAllEligibleEventsAndUsesTheAuthoritativeRevision",
+          "explicitProgressCanAdvanceAcrossARevisionFilteredByTheWatch",
+          "progressRequestIsDroppedWhenAnyWatchHasNotFinishedHistoricalReplay",
+          "progressRequestIsDroppedUntilFutureStartRevisionIsReached",
+          "periodicProgressNotifySupportsRawNegativeIdAndDrainsEventsBeforeItsWatermark",
+          "periodicProgressNotifySkipsFutureAndUnsyncedWatchersIndependently",
+          "fragmentsKeepTheRevisionContiguousAheadOfProgressAndOtherWatches",
+          "closingDuringAFragmentSequenceReleasesTheUnfinishedRevision",
+          "matchingCancelStopsTheRemainingFragmentsAndReleasesTheirDeliveries"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.WatchResponseFragmenterTest", "tests": [
+          "leavesACompleteRevisionAsOneUnfragmentedResponseWhenItFits",
+          "splitsLargeRevisionInOrderAndMarksOnlyNonFinalFragments",
+          "packsMultipleEventsIntoEachFragmentWithoutChangingTheirOrder",
+          "allowsTheFinalFragmentToUseItsSmallerFalseFlagEncoding",
+          "includesPrevKvAndProtoOverheadWhenRejectingAnOversizedEvent",
+          "passesControlResponsesWithoutFragmentingThem",
+          "rejectsControlResponseThatExceedsTheMessageBudget",
+          "rejectsEventsFromDifferentRevisions",
+          "rejectsAlreadyFragmentedInputAndNonPositiveBudget"
+        ]},
+        {"module": "server", "kind": "surefire", "class": "io.etcdhbase.server.commit.WatchGatewayTest", "tests": [
+          "initiallyCompactedPositiveStartSkipsHistoryRegistrationAndKeepsPerWatchBoundary",
+          "pollCancellationHandoffClosesTheDetachedDeliveryBeforeReleasingItsAccount"
+        ]},
+        {"module": "server", "kind": "failsafe", "class": "io.etcdhbase.server.M4WatchRpcIT", "tests": [
+          "pinnedGoClientVerifiesFragmentAutoResumeAndLiveHandoffOnBothLayouts"
+        ]}
+      ],
+      "verification_boundary": "J46.1 validates inclusive positive historical replay, per-revision ordinal ordering, compaction registration races, and deterministic replay-to-live handoff at the captured (sequence, ordinal) barrier. J46.2 validates explicit and periodic progress barriers, event-before-progress ordering, filtered revisions, incomplete history, future starts, and the pinned etcd v3.5.23 raw-proto oracle. J46.3 validates bounded revision fragmentation, ordering and cancellation cleanup, plus the pinned Go client's fragment reassembly, automatic reconnection after first- and middle-fragment interruptions, and resumption at the next revision after a disconnect following a complete fragmented revision. Both recovery boundaries use the same Watch channel and verify replay-to-live handoff against Java WatchService on HBase MiniCluster with HISTORY and NATIVE layouts."
     }
   ],
-  "pending_tasks": ["J46","J47","J29.4"]
+  "pending_tasks": ["J47","J29.4"]
 }

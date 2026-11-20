@@ -26,6 +26,7 @@ import io.etcdhbase.core.commit.OwnerForwarding;
 import io.etcdhbase.core.commit.RecoveryManager;
 import io.etcdhbase.core.commit.ResultPreparation;
 import io.etcdhbase.core.commit.SharedEventTailer;
+import io.etcdhbase.core.commit.SelectedSequenceReader;
 import io.etcdhbase.core.commit.UnchangedRangeProof;
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.lease.LeaseIdAllocator;
@@ -786,9 +787,12 @@ public final class M3TableGroupRuntime implements AutoCloseable {
       var history = new EventHistoryCycle(backfill, tailer, business.metrics());
       pending.installEventHistoryWorker(new EventHistoryWorker(
           pending.leaseTimers, owner::currentToken, history::run, business.metrics()));
+      var selectedEvents = new SelectedSequenceReader(pending.eventPins, stores.control(),
+          stores.decisions(), stores.manifestRepository(), stores.eventIndexes());
       var watchGateway = new WatchGateway(plan.source().tableGroupId(), pending,
           stores.control(), budgets, pending.worker, pending.leaseTimers,
-          stores.clusterId(), activation.memberIdBits(), limits.maxRpcBytes());
+          stores.clusterId(), activation.memberIdBits(), limits.maxRpcBytes(), pending.eventPins,
+          selectedEvents, authorization);
       watchService = new WatchService(watchGateway.handler());
     }
     return new ServiceComponents(new KvService(gateway, txnGateway, txnGateway::deleteRange,
