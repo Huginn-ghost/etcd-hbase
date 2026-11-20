@@ -118,8 +118,8 @@ final class WatchRegistry {
 
     synchronized boolean isClosed() { return closed; }
 
-    synchronized Optional<String> terminationReason() {
-      return closed ? Optional.empty() : subscription.terminationReason();
+    synchronized Optional<WatchTermination> termination() {
+      return closed ? Optional.empty() : subscription.termination();
     }
 
     @Override

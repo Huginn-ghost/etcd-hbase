@@ -5,13 +5,16 @@ import static io.etcdhbase.grpc.RequestCompletionRecorder.Outcome;
 
 import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
+import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.grpc.RequestCompletionRecorder;
 import java.time.Duration;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
@@ -30,6 +33,10 @@ public final class RequestMetrics implements RequestCompletionRecorder {
   private final Map<TxnStage, StageCounter> txnStages;
   private final Map<LeaseRenewalStage, StageCounter> leaseRenewalStages;
   private final Map<LeaseRevocationStage, StageCounter> leaseRevocationStages;
+  private final Map<WatchCreateResourceFailureStage, LongAdder> watchCreateResourceFailures;
+  private final Map<WatchReplayOpenResourceFailureStage, LongAdder> watchReplayOpenResourceFailures;
+  private final AtomicReference<BudgetManager.ReservedAdmissionFailureSnapshot>
+      watchReplayLookupAdmissionFailure = new AtomicReference<>();
   private final LongAdder putOutputBytes = new LongAdder();
   private final LongAdder txnOutputBytes = new LongAdder();
   private final LongAdder leaseRenewalRequests = new LongAdder();
@@ -106,6 +113,18 @@ public final class RequestMetrics implements RequestCompletionRecorder {
       revocations.put(stage, new StageCounter());
     }
     leaseRevocationStages = Map.copyOf(revocations);
+    Map<WatchCreateResourceFailureStage, LongAdder> watchFailures =
+        new EnumMap<>(WatchCreateResourceFailureStage.class);
+    for (WatchCreateResourceFailureStage stage : WatchCreateResourceFailureStage.values()) {
+      watchFailures.put(stage, new LongAdder());
+    }
+    watchCreateResourceFailures = Map.copyOf(watchFailures);
+    Map<WatchReplayOpenResourceFailureStage, LongAdder> replayFailures =
+        new EnumMap<>(WatchReplayOpenResourceFailureStage.class);
+    for (WatchReplayOpenResourceFailureStage stage : WatchReplayOpenResourceFailureStage.values()) {
+      replayFailures.put(stage, new LongAdder());
+    }
+    watchReplayOpenResourceFailures = Map.copyOf(replayFailures);
   }
 
   /** Bounded stages that J30 actually observes; publication includes M2 finalization. */
@@ -121,6 +140,65 @@ public final class RequestMetrics implements RequestCompletionRecorder {
 
   /** Bounded stages measured while preparing and publishing a Lease revocation. */
   public enum LeaseRevocationStage { QUEUE, PREPARE, PUBLISH_AND_FINALIZE }
+
+  /**
+   * Coarse, bounded stages for Watch-create resource failures. These counters locate the processing
+   * stage that rejected a request; they do not identify the specific budget dimension or limit.
+   */
+  public enum WatchCreateResourceFailureStage {
+    REQUEST_ACCOUNT_ADMISSION,
+    STATE_MEMORY_RETENTION,
+    TAILER_SUBSCRIPTION,
+    BARRIER_READ,
+    HISTORY_REPLAY_OPEN
+  }
+
+  /** Bounded inner phases for a resource failure while opening historical Watch replay. */
+  public enum WatchReplayOpenResourceFailureStage {
+    LOOKUP_ACCOUNT_ADMISSION,
+    SEQUENCE_LOOKUP,
+    PIN_REGISTRATION,
+    PIN_RENEWAL,
+    CONTROL_REVALIDATION_ACCOUNT_ADMISSION,
+    CONTROL_REVALIDATION_READ,
+    SEQUENCE_REVALIDATION_ACCOUNT_ADMISSION,
+    SEQUENCE_REVALIDATION_READ
+  }
+
+  public void recordWatchCreateResourceFailure(WatchCreateResourceFailureStage stage) {
+    Objects.requireNonNull(stage, "stage");
+    watchCreateResourceFailures.get(stage).increment();
+  }
+
+  public Map<WatchCreateResourceFailureStage, Long> watchCreateResourceFailures() {
+    Map<WatchCreateResourceFailureStage, Long> snapshot =
+        new EnumMap<>(WatchCreateResourceFailureStage.class);
+    watchCreateResourceFailures.forEach((stage, count) -> snapshot.put(stage, count.sum()));
+    return Map.copyOf(snapshot);
+  }
+
+  public void recordWatchReplayOpenResourceFailure(WatchReplayOpenResourceFailureStage stage) {
+    Objects.requireNonNull(stage, "stage");
+    watchReplayOpenResourceFailures.get(stage).increment();
+  }
+
+  public Map<WatchReplayOpenResourceFailureStage, Long> watchReplayOpenResourceFailures() {
+    Map<WatchReplayOpenResourceFailureStage, Long> snapshot =
+        new EnumMap<>(WatchReplayOpenResourceFailureStage.class);
+    watchReplayOpenResourceFailures.forEach((stage, count) -> snapshot.put(stage, count.sum()));
+    return Map.copyOf(snapshot);
+  }
+
+  /** Retains only the latest bounded lookup-admission rejection; no group or request identity. */
+  public void recordWatchReplayLookupAdmissionFailure(
+      BudgetManager.ReservedAdmissionFailureSnapshot snapshot) {
+    watchReplayLookupAdmissionFailure.set(Objects.requireNonNull(snapshot, "snapshot"));
+  }
+
+  public Optional<BudgetManager.ReservedAdmissionFailureSnapshot>
+      watchReplayLookupAdmissionFailure() {
+    return Optional.ofNullable(watchReplayLookupAdmissionFailure.get());
+  }
 
   public void recordTxnStage(TxnStage stage, long elapsedNanos) {
     Objects.requireNonNull(stage, "stage");
