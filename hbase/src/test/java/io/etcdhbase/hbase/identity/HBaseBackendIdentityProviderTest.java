@@ -111,6 +111,9 @@ class HBaseBackendIdentityProviderTest {
 
   @Test
   void discardingUnpublishedIdentityReleasesCapacityAndRejectsFurtherBorrowing() throws Exception {
+    var verification = new CompletableFuture<Void>();
+    var callbackEntered = new CountDownLatch(1);
+    var releaseCallback = new CountDownLatch(1);
     var issuedContext = new AtomicReference<HBaseUserContext>();
     var openedConnection = new AtomicReference<AsyncConnection>();
     try (var provider = provider(
@@ -119,7 +122,7 @@ class HBaseBackendIdentityProviderTest {
           issuedContext.set(context);
           return context;
         },
-        (backend, scope) -> CompletableFuture.completedFuture(null),
+        (backend, scope) -> verification,
         (configuration, user) -> {
           AsyncConnection connection = mock(AsyncConnection.class);
           openedConnection.set(connection);
@@ -127,7 +130,11 @@ class HBaseBackendIdentityProviderTest {
         },
         TIMEOUT,
         1)) {
-      AuthorizedBackendIdentity first = authenticate(provider).get(5, TimeUnit.SECONDS);
+      var authentication = authenticate(provider);
+      var callback = authentication.thenRun(() -> blockCallback(callbackEntered, releaseCallback));
+      verification.complete(null);
+      assertTrue(callbackEntered.await(5, TimeUnit.SECONDS));
+      AuthorizedBackendIdentity first = authentication.get(5, TimeUnit.SECONDS);
       HBaseUserContext firstContext = issuedContext.get();
       AsyncConnection firstConnection = openedConnection.get();
 
@@ -136,8 +143,14 @@ class HBaseBackendIdentityProviderTest {
       verify(firstContext).close();
       assertReason(Reason.INSUFFICIENT_PERMISSION, provider.connectionFor(first).toCompletableFuture());
 
-      AuthorizedBackendIdentity next = authenticate(provider).get(5, TimeUnit.SECONDS);
+      // Closing the identity does not release the notification slot while its callback runs.
+      assertReason(Reason.RESOURCE_LIMIT, authenticate(provider));
+      releaseCallback.countDown();
+      callback.get(5, TimeUnit.SECONDS);
+      AuthorizedBackendIdentity next = authenticateAfterCleanup(provider);
       assertNotEquals(first.contextRef(), next.contextRef());
+    } finally {
+      releaseCallback.countDown();
     }
   }
 
@@ -178,7 +191,7 @@ class HBaseBackendIdentityProviderTest {
       assertSame(secondConnection,
           provider.connectionFor(second).toCompletableFuture().get(5, TimeUnit.SECONDS));
 
-      AuthorizedBackendIdentity third = authenticate(provider, "carol").get(5, TimeUnit.SECONDS);
+      AuthorizedBackendIdentity third = authenticateAfterCleanup(provider, "carol");
       assertNotEquals(first.contextRef(), third.contextRef());
     }
   }
@@ -1047,17 +1060,22 @@ class HBaseBackendIdentityProviderTest {
 
   private static AuthorizedBackendIdentity authenticateAfterCleanup(
       HBaseBackendIdentityProvider provider) throws Exception {
+    return authenticateAfterCleanup(provider, "alice");
+  }
+
+  private static AuthorizedBackendIdentity authenticateAfterCleanup(
+      HBaseBackendIdentityProvider provider, String principal) throws Exception {
     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
     while (true) {
       try {
-        return authenticate(provider).get(5, TimeUnit.SECONDS);
+        return authenticate(provider, principal).get(5, TimeUnit.SECONDS);
       } catch (ExecutionException failure) {
         if (!(failure.getCause() instanceof BackendIdentityException identityFailure)
             || identityFailure.reason() != Reason.RESOURCE_LIMIT
             || System.nanoTime() >= deadline) {
           throw failure;
         }
-        // Wait for asynchronous retirement, not a specific wall-clock scheduling window.
+        // Wait for asynchronous retirement and notification completion, not a scheduling window.
         Thread.yield();
       }
     }
