@@ -21,6 +21,7 @@ import io.etcdhbase.core.auth.CredentialEnvelopeProtector;
 import io.etcdhbase.core.auth.SubjectAuthority;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.CommitControlStore;
+import io.etcdhbase.core.commit.CommitDecision;
 import io.etcdhbase.core.commit.CommitState;
 import io.etcdhbase.core.commit.ControlSnapshot;
 import io.etcdhbase.core.commit.InvocationBinding;
@@ -29,14 +30,20 @@ import io.etcdhbase.core.commit.InvocationResultResolver;
 import io.etcdhbase.core.commit.InvocationService;
 import io.etcdhbase.core.commit.MutationForwardRequest;
 import io.etcdhbase.core.commit.OwnerForwarding;
+import io.etcdhbase.core.commit.ResultCatalog;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.kv.PutResult;
+import io.etcdhbase.core.kv.ResultNode;
+import io.etcdhbase.core.kv.ResultTree;
 import io.etcdhbase.core.kv.TxnCommand;
+import io.etcdhbase.core.kv.TxnEvaluator;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.grpc.EtcdAuthTokenMetadata;
 import io.etcdhbase.grpc.RequestScopeInterceptor;
 import io.etcdhbase.grpc.service.AuthService;
 import io.etcdhbase.grpc.service.KvService;
+import io.etcdhbase.hbase.codec.ResultMessages;
 import io.etcdhbase.server.auth.AesGcmCredentialEnvelopeProtector;
 import io.etcdhbase.server.auth.AuthSessionService;
 import io.etcdhbase.server.auth.AuthenticateRpcHandler;
@@ -56,11 +63,13 @@ import io.grpc.StatusRuntimeException;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
 import io.grpc.stub.MetadataUtils;
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -89,6 +98,75 @@ class M5GatewayAuthenticationRpcTest {
       new AuthenticationScope(TABLE_GROUP, "profile");
   private static final ByteKey DATASET = ByteKey.copyOf(fill(32, (byte) 0x31));
   private static final ByteKey FINGERPRINT = ByteKey.copyOf(fill(32, (byte) 0x52));
+
+  @Test
+  void noTokenPutAndTxnSucceedWithServiceIdentityWhenAuthenticationIsDisabled() throws Exception {
+    var serviceIdentity = identity("server-service", "service-context");
+    var authorization = AuthorizationScopeDigest.fromIdentity(serviceIdentity);
+    var forwarded = new AtomicReference<MutationForwardRequest>();
+    var relay = mock(MutationRelay.class);
+    when(relay.forward(any(MutationForwardRequest.class), any(RequestScope.class)))
+        .thenAnswer(call -> {
+          MutationForwardRequest request = call.getArgument(0);
+          forwarded.set(request);
+          return CompletableFuture.completedFuture(new MutationRelay.KnownResult(request.invocationId().bytes()));
+        });
+
+    var payload = mock(ResultCatalog.RetainedResult.class);
+    when(payload.belongsTo(any(RequestScope.class))).thenReturn(true);
+    when(payload.retainForConsumer(any())).thenReturn(true);
+    var key = ByteKey.copyOf("put-key".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    when(payload.buffer()).thenReturn(ByteBuffer.wrap(ResultMessages.encode(
+        new PutResult(key, 2, Optional.empty()))));
+    var decision = mock(CommitDecision.class);
+    when(decision.containsKeyChanges()).thenReturn(true);
+    when(decision.revision()).thenReturn(2L);
+    var result = mock(InvocationResultResolver.ResolvedResult.class);
+    when(result.payload()).thenReturn(payload);
+    when(result.decision()).thenReturn(decision);
+    var results = mock(InvocationResultResolver.class);
+    when(results.resolve(any(), any(), any(), any(), any()))
+        .thenReturn(CompletableFuture.completedFuture(result));
+
+    var observedIdentity = new AtomicReference<AuthorizedBackendIdentity>();
+    var reads = mock(TxnReadExecutor.class);
+    when(reads.execute(any(), any(), any(), any(), any(), anyBoolean())).thenAnswer(call -> {
+      observedIdentity.set(call.getArgument(2));
+      var header = new ResultNode.Header(true, 2);
+      var tree = new ResultTree(new ResultNode.Txn(0, header, true,
+          List.of(new ResultNode.Range(0, header, List.of(), 0, false))));
+      var validated = mock(TxnEvaluator.ValidatedRead.class);
+      when(validated.belongsTo(any(RequestScope.class))).thenReturn(true);
+      when(validated.result()).thenReturn(tree);
+      when(validated.revision()).thenReturn(2L);
+      return CompletableFuture.completedFuture(validated);
+    });
+
+    var control = controlStore();
+    var budgets = budgets();
+    var responseReservation = new BudgetManager.Reservation(1L << 16, 1L << 16,
+        1L << 16, 1L << 18, 1L << 16);
+    var txn = new TxnGateway(TABLE_GROUP, serviceIdentity, authorization, 1, 1, 1 << 20,
+        control, relay, results, reads, budgets, responseReservation, Runnable::run, new RequestMetrics());
+    var put = new PutGateway(TABLE_GROUP, serviceIdentity, authorization, 1, 1, 1 << 20,
+        control, relay, results, budgets, responseReservation, Runnable::run, new RequestMetrics());
+    try (var server = RpcNode.start(new KvService(put, txn, txn::deleteRange, txn::range),
+        new AuthService())) {
+      var client = KVGrpc.newBlockingStub(server.channel()).withDeadlineAfter(3, TimeUnit.SECONDS);
+      var putResponse = client.put(Rpc.PutRequest.newBuilder().setKey(ByteString.copyFromUtf8("put-key"))
+          .setValue(ByteString.copyFromUtf8("value")).build());
+      assertEquals(2, putResponse.getHeader().getRevision());
+      assertNotNull(forwarded.get());
+      assertEquals(authorization, forwarded.get().authorizationScopeDigest());
+      assertEquals(ServiceAuthorizationContextReference.create(serviceIdentity, authorization),
+          forwarded.get().authorizationContextReference());
+
+      var txnResponse = client.txn(readTransaction());
+      assertTrue(txnResponse.getSucceeded());
+      assertEquals(1, txnResponse.getResponsesCount());
+      assertEquals(serviceIdentity, observedIdentity.get());
+    }
+  }
 
   @Test
   void authenticateOnAThenBRangeAndOwnerForwardingUseRevalidatedIdentityUntilPhysicalDrain()
@@ -312,6 +390,7 @@ class M5GatewayAuthenticationRpcTest {
   private static void assertInvalidAuthToken(Runnable rpc) {
     StatusRuntimeException failure = assertThrows(StatusRuntimeException.class, rpc::run);
     assertEquals(Status.Code.UNAUTHENTICATED, failure.getStatus().getCode());
+    assertEquals("etcdserver: invalid auth token", failure.getStatus().getDescription());
   }
 
   private static final class RpcNode implements AutoCloseable {
