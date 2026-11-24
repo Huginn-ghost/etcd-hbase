@@ -5,7 +5,6 @@ import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.server.auth.AuthSessionService;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
-import io.etcdhbase.spi.identity.BackendIdentityProvider;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -33,8 +32,7 @@ final class AuthenticatedRequestIdentityResolver {
     Objects.requireNonNull(token, "token");
     Objects.requireNonNull(scope, "scope");
     if (token.isEmpty()) {
-      if (!BackendIdentityProvider.DEVELOPMENT_NO_AUTH_PROVIDER_ID.equals(
-          serviceIdentity.providerId())) {
+      if (sessions != null) {
         return CompletableFuture.failedFuture(
             new AuthSessionException(AuthSessionException.Reason.INVALID_TOKEN));
       }

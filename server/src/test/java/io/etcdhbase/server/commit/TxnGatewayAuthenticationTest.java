@@ -2,6 +2,7 @@ package io.etcdhbase.server.commit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -15,12 +16,15 @@ import etcdserverpb.Rpc;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.auth.AuthSession;
 import io.etcdhbase.core.auth.CredentialEnvelope;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
 import io.etcdhbase.server.auth.AuthSessionService;
 import io.etcdhbase.server.observability.RequestMetrics;
 import io.etcdhbase.spi.identity.AuthenticationScope;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 import java.time.Duration;
 import java.util.Map;
@@ -30,11 +34,43 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class TxnGatewayAuthenticationTest {
   private static final String TABLE_GROUP = "auth-group";
   private static final String TOKEN = "opaque-token-from-authenticate";
+
+  @Test
+  void unauthenticatedRangeUsesServiceIdentityForOrdinaryProvider() {
+    AuthorizedBackendIdentity serviceIdentity = identity("service-user");
+    var observedIdentity = new AtomicReference<AuthorizedBackendIdentity>();
+    var observerFailure = new AtomicReference<Throwable>();
+    TxnReadExecutor reads = mock(TxnReadExecutor.class);
+    when(reads.execute(any(), any(), any(), any(), any(), anyBoolean())).thenAnswer(invocation -> {
+      observedIdentity.set(invocation.getArgument(2));
+      return CompletableFuture.failedFuture(
+          new BackendFailure(BackendFailure.Category.UNAVAILABLE));
+    });
+
+    var gateway = new TxnGateway(TABLE_GROUP, serviceIdentity, ByteKey.copyOf(new byte[32]),
+        1, 1, 1 << 20, mock(io.etcdhbase.core.commit.CommitControlStore.class),
+        mock(MutationRelay.class), mock(io.etcdhbase.core.commit.InvocationResultResolver.class),
+        reads, budgets(), new BudgetManager.Reservation(1L << 16, 1L << 16, 1L << 16,
+            1L << 16, 1L << 16), Runnable::run, new RequestMetrics());
+
+    try (RequestScope scope = RequestScope.withoutDeadline()) {
+      gateway.accept(rangeTxn(), Optional.empty(), scope, new StreamObserver<>() {
+        @Override public void onNext(Rpc.TxnResponse response) { }
+        @Override public void onError(Throwable failure) { observerFailure.set(failure); }
+        @Override public void onCompleted() { }
+      });
+
+      assertSame(serviceIdentity, observedIdentity.get());
+      var projectedFailure = assertInstanceOf(StatusRuntimeException.class, observerFailure.get());
+      assertEquals(Status.Code.UNAVAILABLE, projectedFailure.getStatus().getCode());
+    }
+  }
 
   @Test
   void rangeUsesResolvedSessionIdentityAndReleasesOnlyAfterPhysicalReadDrains() throws Exception {

@@ -186,6 +186,22 @@ class M5GatewayAuthenticationRpcTest {
         var kvClient = KVGrpc.newBlockingStub(authenticatedChannel)
             .withDeadlineAfter(3, TimeUnit.SECONDS);
 
+        var missingTokenClient = KVGrpc.newBlockingStub(nonOwnerReplica.channel())
+            .withDeadlineAfter(3, TimeUnit.SECONDS);
+        assertInvalidAuthToken(() -> missingTokenClient.txn(readTransaction()));
+        assertInvalidAuthToken(() -> missingTokenClient.put(Rpc.PutRequest.newBuilder()
+            .setKey(ByteString.copyFromUtf8("missing-token-put")).build()));
+
+        var invalidMetadata = new Metadata();
+        invalidMetadata.put(EtcdAuthTokenMetadata.key(), "not-a-session-token");
+        var invalidTokenChannel = ClientInterceptors.intercept(nonOwnerReplica.channel(),
+            MetadataUtils.newAttachHeadersInterceptor(invalidMetadata));
+        var invalidTokenClient = KVGrpc.newBlockingStub(invalidTokenChannel)
+            .withDeadlineAfter(3, TimeUnit.SECONDS);
+        assertInvalidAuthToken(() -> invalidTokenClient.txn(readTransaction()));
+        assertInvalidAuthToken(() -> invalidTokenClient.put(Rpc.PutRequest.newBuilder()
+            .setKey(ByteString.copyFromUtf8("invalid-token-put")).build()));
+
         StatusRuntimeException rangeFailure = assertThrows(StatusRuntimeException.class,
             () -> kvClient.txn(readTransaction()));
         assertEquals(Status.Code.RESOURCE_EXHAUSTED, rangeFailure.getStatus().getCode());
@@ -291,6 +307,11 @@ class M5GatewayAuthenticationRpcTest {
     byte[] bytes = new byte[length];
     Arrays.fill(bytes, value);
     return bytes;
+  }
+
+  private static void assertInvalidAuthToken(Runnable rpc) {
+    StatusRuntimeException failure = assertThrows(StatusRuntimeException.class, rpc::run);
+    assertEquals(Status.Code.UNAUTHENTICATED, failure.getStatus().getCode());
   }
 
   private static final class RpcNode implements AutoCloseable {
