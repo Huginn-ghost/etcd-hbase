@@ -35,11 +35,11 @@ public final class AuthenticateRpcHandler
     Objects.requireNonNull(request, "request");
     Objects.requireNonNull(observer, "observer");
     RequestScope scope = Objects.requireNonNull(requestScopes.get(), "request scope");
-    var drained = new CompletableFuture<Void>();
     var delivery = new UndeliveredTokenGuard(sessions);
     var deliveryRegistration = new AtomicReference<RequestScope.ScopedCleanup>();
     if (!scope.startIfOpen(() -> {
-      scope.trackPhysicalProducer(drained);
+      // Issuance includes slot cleanup, so it cannot be a producer that cleanup waits on.
+      // The guard owns issuance/delivery; storage adapters track their physical producers.
       deliveryRegistration.set(scope.registerScopedCleanup(delivery, delivery.cleanupCompletion()));
     })) return;
 
@@ -53,13 +53,11 @@ public final class AuthenticateRpcHandler
         scope.startIfOpen(() -> observer.onError(ErrorProjection.project(invalid)));
       } finally {
         closeRegistration(deliveryRegistration.get());
-        drained.complete(null);
       }
       return;
     } catch (Error fatal) {
       delivery.issuanceFailed();
       closeRegistration(deliveryRegistration.get());
-      drained.complete(null);
       throw fatal;
     } finally {
       Arrays.fill(password, '\0');
@@ -72,7 +70,6 @@ public final class AuthenticateRpcHandler
     } catch (RuntimeException failure) {
       credentials.close();
       delivery.issuanceFailed();
-      drained.complete(null);
       try {
         scope.startIfOpen(() -> observer.onError(ErrorProjection.project(failure)));
       } finally {
@@ -83,7 +80,6 @@ public final class AuthenticateRpcHandler
       credentials.close();
       delivery.issuanceFailed();
       closeRegistration(deliveryRegistration.get());
-      drained.complete(null);
       throw fatal;
     }
     issued.whenComplete((token, failure) -> {
@@ -111,7 +107,6 @@ public final class AuthenticateRpcHandler
       } finally {
         closeRegistration(deliveryRegistration.get());
         credentials.close();
-        drained.complete(null);
       }
     });
   }

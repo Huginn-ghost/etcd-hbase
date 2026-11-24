@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import etcdserverpb.Rpc;
 import io.etcdhbase.core.auth.AuthSession;
 import io.etcdhbase.core.auth.AuthSessionException;
 import io.etcdhbase.core.auth.AuthSessionStore;
@@ -17,6 +18,7 @@ import io.etcdhbase.spi.identity.AuthenticationScope;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
 import io.etcdhbase.spi.identity.BackendCredentials;
 import io.etcdhbase.spi.identity.BackendIdentityException;
+import io.grpc.stub.StreamObserver;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.SecureRandom;
@@ -29,6 +31,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -202,6 +205,104 @@ class AuthSessionServiceTest {
           ((AuthSessionException) failure.getCause()).reason());
       assertEquals(AuthSlot.State.RETIRING, store.slots.get(0).state());
       assertEquals(mismatched, store.sessions.get(active.tokenDigest()));
+    }
+  }
+
+  @Test
+  void failedRestorableVerificationDiscardsIdentityAndReleasesSlot() throws Exception {
+    FakeStore store = new FakeStore();
+    FakeIdentityManager identities = new FakeIdentityManager();
+    identities.restorableFailure = new BackendIdentityException(
+        BackendIdentityException.Reason.RESOURCE_LIMIT);
+    try (var keys = keyProvider("key-1", temporary.resolve("key.bin"));
+        RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
+        var credentials = credentials()) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      AuthSessionService auth = service(store, protector, identities, 1);
+      var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> auth.authenticate(credentials, request).toCompletableFuture()
+              .get(3, java.util.concurrent.TimeUnit.SECONDS));
+      assertEquals(AuthSessionException.Reason.RESOURCE_LIMIT,
+          ((AuthSessionException) failure.getCause()).reason());
+      assertEquals(1, identities.discardedIdentities);
+      assertEquals(AuthSlot.State.EMPTY, store.slots.get(0).state());
+      assertTrue(store.sessions.isEmpty());
+
+      identities.restorableFailure = null;
+      assertTrue(auth.authenticate(credentials, request).toCompletableFuture()
+          .get(3, java.util.concurrent.TimeUnit.SECONDS).tokenForResponse().length() > 0);
+      assertEquals(AuthSlot.State.ACTIVE, store.slots.get(0).state());
+    }
+  }
+
+  @Test
+  void synchronousRestorableFailureDiscardsIdentityAndReleasesSlot() throws Exception {
+    FakeStore store = new FakeStore();
+    FakeIdentityManager identities = new FakeIdentityManager();
+    identities.throwRestorable = true;
+    try (var keys = keyProvider("key-1", temporary.resolve("key.bin"));
+        RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
+        var credentials = credentials()) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      AuthSessionService auth = service(store, protector, identities, 1);
+      var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> auth.authenticate(credentials, request).toCompletableFuture()
+              .get(3, java.util.concurrent.TimeUnit.SECONDS));
+      assertTrue(failure.getCause() instanceof IllegalStateException);
+      assertEquals(1, identities.discardedIdentities);
+      assertEquals(AuthSlot.State.EMPTY, store.slots.get(0).state());
+      assertTrue(store.sessions.isEmpty());
+      identities.throwRestorable = false;
+      auth.authenticate(credentials, request).toCompletableFuture()
+          .get(3, java.util.concurrent.TimeUnit.SECONDS);
+      assertEquals(AuthSlot.State.ACTIVE, store.slots.get(0).state());
+    }
+  }
+
+  @Test
+  void cancelledRpcReleasesReservationAfterRealProducerDrains() throws Exception {
+    FakeStore store = new FakeStore();
+    FakeIdentityManager identities = new FakeIdentityManager();
+    identities.authentication = new CompletableFuture<>();
+    var producer = new CompletableFuture<Void>();
+    try (var keys = keyProvider("key-1", temporary.resolve("key.bin"));
+        RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3))) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      AuthSessionService auth = service(store, protector, identities, 1);
+      request.trackPhysicalProducer(producer);
+      var handler = new AuthenticateRpcHandler(auth, () -> request);
+      var observerCalled = new AtomicBoolean();
+      handler.accept(Rpc.AuthenticateRequest.newBuilder()
+          .setName("milvus-service").setPassword("password-1").build(),
+          new StreamObserver<>() {
+            @Override public void onNext(Rpc.AuthenticateResponse value) { observerCalled.set(true); }
+            @Override public void onError(Throwable failure) { observerCalled.set(true); }
+            @Override public void onCompleted() { observerCalled.set(true); }
+          });
+      AuthSlot reserved = store.slots.get(0);
+      assertEquals(AuthSlot.State.RESERVED, reserved.state());
+      request.cancel();
+      identities.authentication.completeExceptionally(new BackendIdentityException(
+          BackendIdentityException.Reason.INVALID_CREDENTIALS));
+      assertFalse(request.cleanupCompletion().toCompletableFuture().isDone());
+      assertEquals(reserved, store.slots.get(0));
+
+      producer.complete(null);
+      request.cleanupOutcomeCompletion().toCompletableFuture()
+          .get(1, java.util.concurrent.TimeUnit.SECONDS);
+      assertFalse(observerCalled.get());
+      assertEquals(AuthSlot.State.EMPTY, store.slots.get(0).state());
+      assertEquals(reserved.generation(), store.slots.get(0).generation());
+      identities.authentication = null;
+      try (RequestScope retry = RequestScope.withTimeout(Duration.ofSeconds(3));
+          var credentials = credentials()) {
+        auth.authenticate(credentials, retry).toCompletableFuture()
+            .get(3, java.util.concurrent.TimeUnit.SECONDS);
+      }
+      assertEquals(AuthSlot.State.ACTIVE, store.slots.get(0).state());
+      assertTrue(store.slots.get(0).generation() > reserved.generation());
+    } finally {
+      producer.complete(null);
     }
   }
 
@@ -427,6 +528,8 @@ class AuthSessionServiceTest {
     private int activations;
     private int discardedIdentities;
     private boolean rejectCredentials;
+    private Throwable restorableFailure;
+    private boolean throwRestorable;
     private CompletableFuture<AuthorizedBackendIdentity> authentication;
     private CompletableFuture<SessionIdentityLease> activation;
     private int releasedIdentityLeases;
@@ -446,6 +549,8 @@ class AuthSessionServiceTest {
     public CompletionStage<Void> verifyRestorable(
         BackendCredentials credentials, AuthorizedBackendIdentity authenticatedIdentity) {
       restorableVerifications++;
+      if (throwRestorable) throw new IllegalStateException("restorable verification failed");
+      if (restorableFailure != null) return CompletableFuture.failedFuture(restorableFailure);
       return CompletableFuture.completedFuture(null);
     }
 

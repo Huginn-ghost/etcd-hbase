@@ -300,11 +300,11 @@ public final class AuthSessionService {
     return restorable.thenCompose(ignored -> ensureAuthority(identity, requestScope)
         .thenCompose(authority -> discardAuthenticatedIdentity(identity)
             .thenCompose(released -> createSession(credentials, identity, authority, reservation,
-                requestScope)))
+                requestScope))))
         .exceptionallyCompose(failure -> isUnresolved(unwrap(failure))
             ? discardWithoutRelease(identity, unwrap(failure))
             : discardAndRelease(identity, reservation, requestScope,
-                mapIdentityFailure(unwrap(failure)))));
+                mapIdentityFailure(unwrap(failure))));
   }
 
   private CompletionStage<Void> discardAuthenticatedIdentity(AuthorizedBackendIdentity identity) {
