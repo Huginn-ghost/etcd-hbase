@@ -1,146 +1,218 @@
-name: "CI · Maven 公共准备与验证"
+name: "CI · 按影响范围验证"
 
 on:
   push:
     branches:
       - main
-      - 'codex/**'
   pull_request:
     branches:
       - main
+  merge_group:
+    types:
+      - checks_requested
 
 permissions:
   contents: read
 
 concurrency:
-  group: maven-ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  plan:
+    name: CI · 计算影响范围
+    runs-on: ubuntu-24.04
+    outputs:
+      groups: ${{ steps.selection.outputs.groups }}
+      full: ${{ steps.selection.outputs.full }}
+      maven: ${{ steps.selection.outputs.maven }}
+      docs: ${{ steps.selection.outputs.docs }}
+      reason: ${{ steps.selection.outputs.reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 验证影响范围选择规则
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 scripts/verify/test_ci_impact.py
+      - name: 根据依赖映射选择验证组
+        id: selection
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+        run: >-
+          python3 scripts/verify/ci_impact.py
+          --event "$EVENT_NAME"
+          --base "$BASE_SHA"
+          --head "$HEAD_SHA"
+          --output "$GITHUB_OUTPUT"
+
   maven-dependencies:
     name: CI · Java 21 与 Maven 公共依赖准备
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.maven == 'true' }}
     uses: ./.github/workflows/maven-dependencies.yml
 
   j03:
     name: J03 · gRPC 协议骨架与 Go/Java 互通
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'j03') }}
     uses: ./.github/workflows/j03.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   j04:
     name: J04 · HBase 认证、令牌与 ACL 访问
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'j04') }}
     uses: ./.github/workflows/j04.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   j05:
     name: J05 · 盐配置、路由与 HBase 初始化
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'j05') }}
     uses: ./.github/workflows/j05.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   j06:
     name: J06 · 服务配置、请求生命周期与 HBase
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'j06') }}
     uses: ./.github/workflows/j06.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   j07:
     name: J07 · 原生 etcd 对照与 Go/Java 协议互通
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'j07') }}
     uses: ./.github/workflows/j07.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   j08:
     name: J08 · SPI 契约、模块边界与 HBase 回归
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'j08') }}
     uses: ./.github/workflows/j08.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   j09:
     name: J09 · 公开构建、运行包与镜像验证
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'j09') }}
     uses: ./.github/workflows/j09.yml
 
   j10:
     name: J10 · 字节编码、行键与存储协议
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'j10') }}
     uses: ./.github/workflows/j10.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   j11:
     name: J11 · HBase 访问与历史原型契约
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'j11') }}
     uses: ./.github/workflows/j11.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   j23:
     name: J23 · 提交发布、未知结果与服务交接
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'j23') }}
     uses: ./.github/workflows/j23.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   j24:
     name: J24 · 提交物化与迟到写隔离
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'j24') }}
     uses: ./.github/workflows/j24.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   j36-proof:
     name: J36 · 缓存组件隔离与 HBase 验证
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'j36-proof') }}
     uses: ./.github/workflows/j36-proof.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   m1:
     name: M1 · 存储扫描与资源约束
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'm1') }}
     uses: ./.github/workflows/m1.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   m3:
     name: M3 · KV/Range/Txn 与恢复集成
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'm3') }}
     uses: ./.github/workflows/m3.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
   m4:
     name: M4 · Lease 生命周期与 Watch 流
-    needs: maven-dependencies
-    if: ${{ !cancelled() }}
+    needs: [plan, maven-dependencies]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.maven-dependencies.result == 'success' && contains(fromJSON(needs.plan.outputs.groups), 'm4') }}
     uses: ./.github/workflows/m4.yml
     with:
       maven_preparation_result: ${{ needs.maven-dependencies.result }}
 
+  docs-validation:
+    name: CI · 文档差异校验
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.docs == 'true' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 检查文档差异空白错误
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+          PUSH_BEFORE: ${{ github.event.before || '' }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            if [[ -z "$PUSH_BEFORE" || "$PUSH_BEFORE" =~ ^0+$ ]]; then
+              git diff-tree --check --root --no-commit-id -r "$PUSH_AFTER"
+            else
+              git diff --check "$PUSH_BEFORE...$PUSH_AFTER"
+            fi
+          else
+            if [[ -z "$BASE_SHA" || -z "$HEAD_SHA" ]]; then
+              echo "Cannot determine the documentation diff base and head." >&2
+              exit 1
+            fi
+            git diff --check "$BASE_SHA...$HEAD_SHA"
+          fi
+
   ci-result:
     name: CI · 所有验证组汇总
     needs:
+      - plan
       - maven-dependencies
+      - docs-validation
       - j03
       - j04
       - j05
@@ -159,49 +231,30 @@ jobs:
     if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-24.04
     steps:
-      - name: 检查所有预期验证组均已执行并成功
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 检查已选验证组均成功且未选组均已跳过
         env:
-          MAVEN_DEPENDENCIES_RESULT: ${{ needs.maven-dependencies.result }}
-          J03_RESULT: ${{ needs.j03.result }}
-          J04_RESULT: ${{ needs.j04.result }}
-          J05_RESULT: ${{ needs.j05.result }}
-          J06_RESULT: ${{ needs.j06.result }}
-          J07_RESULT: ${{ needs.j07.result }}
-          J08_RESULT: ${{ needs.j08.result }}
-          J09_RESULT: ${{ needs.j09.result }}
-          J10_RESULT: ${{ needs.j10.result }}
-          J11_RESULT: ${{ needs.j11.result }}
-          J23_RESULT: ${{ needs.j23.result }}
-          J24_RESULT: ${{ needs.j24.result }}
-          J36_PROOF_RESULT: ${{ needs.j36-proof.result }}
-          M1_RESULT: ${{ needs.m1.result }}
-          M3_RESULT: ${{ needs.m3.result }}
-          M4_RESULT: ${{ needs.m4.result }}
-        run: |
-          set -u
-          failed=0
-          for check in \
-            "maven-dependencies=$MAVEN_DEPENDENCIES_RESULT" \
-            "j03=$J03_RESULT" \
-            "j04=$J04_RESULT" \
-            "j05=$J05_RESULT" \
-            "j06=$J06_RESULT" \
-            "j07=$J07_RESULT" \
-            "j08=$J08_RESULT" \
-            "j09=$J09_RESULT" \
-            "j10=$J10_RESULT" \
-            "j11=$J11_RESULT" \
-            "j23=$J23_RESULT" \
-            "j24=$J24_RESULT" \
-            "j36-proof=$J36_PROOF_RESULT" \
-            "m1=$M1_RESULT" \
-            "m3=$M3_RESULT" \
-            "m4=$M4_RESULT"
-          do
-            IFS='=' read -r check_id result <<< "$check"
-            printf '%s: %s\n' "$check_id" "$result"
-            if [[ "$result" != success ]]; then
-              failed=1
-            fi
-          done
-          exit "$failed"
+          PLAN_RESULT: ${{ needs.plan.result }}
+          SELECTED_GROUPS: ${{ needs.plan.outputs.groups }}
+          RUN_MAVEN: ${{ needs.plan.outputs.maven }}
+          RUN_DOCS: ${{ needs.plan.outputs.docs }}
+          MAVEN_RESULT: ${{ needs.maven-dependencies.result }}
+          DOCS_RESULT: ${{ needs.docs-validation.result }}
+          RESULT_J03: ${{ needs.j03.result }}
+          RESULT_J04: ${{ needs.j04.result }}
+          RESULT_J05: ${{ needs.j05.result }}
+          RESULT_J06: ${{ needs.j06.result }}
+          RESULT_J07: ${{ needs.j07.result }}
+          RESULT_J08: ${{ needs.j08.result }}
+          RESULT_J09: ${{ needs.j09.result }}
+          RESULT_J10: ${{ needs.j10.result }}
+          RESULT_J11: ${{ needs.j11.result }}
+          RESULT_J23: ${{ needs.j23.result }}
+          RESULT_J24: ${{ needs.j24.result }}
+          RESULT_J36_PROOF: ${{ needs.j36-proof.result }}
+          RESULT_M1: ${{ needs.m1.result }}
+          RESULT_M3: ${{ needs.m3.result }}
+          RESULT_M4: ${{ needs.m4.result }}
+        run: python3 scripts/verify/ci_impact.py --check-results

@@ -24,13 +24,22 @@ jobs:
         with:
           path: ~/.m2/wrapper/dists
           key: j09-maven-wrapper-${{ runner.os }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载固定 Temurin JDK
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/j09-temurin-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/j09-temurin-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
       - name: 完整公开验证及索引复核
         env:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}

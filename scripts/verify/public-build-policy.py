@@ -104,6 +104,32 @@ def require_status_summary(block, job_ids, label):
         raise ValueError(f"{label} summary must fail when a job fails or is skipped")
 
 
+def require_ci_status_summary(block, job_ids):
+    dollar = chr(36)
+    expected_needs = "    needs:\n" + "".join(f"      - {job_id}\n" for job_id in job_ids)
+    if expected_needs not in block:
+        raise ValueError("CI summary must depend on the plan and every validation job")
+    if "    if: " + dollar + "{{ always() && !cancelled() }}\n" not in block:
+        raise ValueError("CI summary must run after failures unless cancelled")
+
+    expected_environment = {
+        "PLAN_RESULT": dollar + "{{ needs.plan.result }}",
+        "SELECTED_GROUPS": dollar + "{{ needs.plan.outputs.groups }}",
+        "RUN_MAVEN": dollar + "{{ needs.plan.outputs.maven }}",
+        "RUN_DOCS": dollar + "{{ needs.plan.outputs.docs }}",
+        "MAVEN_RESULT": dollar + "{{ needs.maven-dependencies.result }}",
+        "DOCS_RESULT": dollar + "{{ needs.docs-validation.result }}",
+    }
+    for group in CI_WORKFLOW_CALL_ORDER:
+        result_name = "RESULT_" + re.sub(r"[^A-Za-z0-9]+", "_", group).upper()
+        expected_environment[result_name] = dollar + "{{ needs." + group + ".result }}"
+    for name, value in expected_environment.items():
+        if f"          {name}: {value}\n" not in block:
+            raise ValueError(f"CI summary is missing {name}")
+    if "run: python3 scripts/verify/ci_impact.py --check-results\n" not in block:
+        raise ValueError("CI summary must validate selected and skipped job results")
+
+
 def multi_job_summary_policy(workflow, content, validation_job_ids):
     required = {
         "m3.yml": ["j28-history", "j30", "j31", "j32", "j33", "j34", "j35"],
@@ -183,6 +209,31 @@ def maven_cache_policy(workflow, content):
     return len(cache_jobs)
 
 
+def locked_jdk_archive_policy(workflow, content):
+    """Require every pinned JDK setup to restore and verify its locked archive."""
+    jobs = workflow_job_blocks(content)
+    setup_jobs = [
+        (job_id, block)
+        for job_id, block in jobs.items()
+        if "distribution: jdkfile\n" in block
+    ]
+    for job_id, block in setup_jobs:
+        required = (
+            "id: jdk-cache\n",
+            "uses: actions/cache@",
+            "path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz\n",
+            "key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}\n",
+            "if: steps.jdk-cache.outputs.cache-hit != 'true'\n",
+            'run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"\n',
+            'run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"\n',
+            "java-version: '21'\n",
+            "jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz\n",
+        )
+        if any(item not in block for item in required):
+            raise ValueError(f"{workflow.name}:{job_id} must cache and verify the locked JDK archive")
+    return len(setup_jobs)
+
+
 def ci_orchestration_policy(root, content=None):
     path = root / MAVEN_ORCHESTRATION
     content = content if content is not None else path.read_text()
@@ -191,14 +242,16 @@ def ci_orchestration_policy(root, content=None):
         "  push:\n"
         "    branches:\n"
         "      - main\n"
-        "      - 'codex/**'\n"
         "  pull_request:\n"
         "    branches:\n"
-        "      - main"
+        "      - main\n"
+        "  merge_group:\n"
+        "    types:\n"
+        "      - checks_requested"
     )
     events = content.partition("on:\n")[2].partition("\n\npermissions:\n")[0]
     if events != expected_events:
-        raise ValueError("CI orchestration must preserve main and codex push/PR triggers")
+        raise ValueError("CI must run for main pushes, main PRs, and merge queue checks only")
 
     reusable_workflows = {MAVEN_PREPARATION, *CI_WORKFLOW_CALLS.values()}
     for reusable_workflow in reusable_workflows:
@@ -209,37 +262,56 @@ def ci_orchestration_policy(root, content=None):
             raise ValueError(f"{reusable_workflow} must run only through the CI orchestrator")
 
     jobs = workflow_job_blocks(content)
-    expected_job_ids = {"maven-dependencies", "ci-result", *CI_WORKFLOW_CALLS}
+    expected_job_ids = {"plan", "maven-dependencies", "docs-validation", "ci-result", *CI_WORKFLOW_CALLS}
     if set(jobs) != expected_job_ids:
         raise ValueError("CI orchestration must call every expected verification workflow exactly once")
 
+    plan = jobs["plan"]
+    if ("    name: CI · 计算影响范围\n" not in plan
+            or "python3 scripts/verify/test_ci_impact.py\n" not in plan
+            or "python3 scripts/verify/ci_impact.py" not in plan
+            or "      groups: " + dollar + "{{ steps.selection.outputs.groups }}\n" not in plan):
+        raise ValueError("CI must test and publish the impact selection before scheduling validation")
+
     preparation = jobs["maven-dependencies"]
-    if f"    uses: ./{MAVEN_PREPARATION}\n" not in preparation:
-        raise ValueError("CI orchestration must call Maven preparation exactly once")
+    if ("    needs: plan\n" not in preparation
+            or "needs.plan.outputs.maven == 'true'" not in preparation
+            or f"    uses: ./{MAVEN_PREPARATION}\n" not in preparation):
+        raise ValueError("CI must call Maven preparation once when a selected check needs it")
     for job_id, workflow in MAVEN_CONSUMER_WORKFLOWS.items():
         block = jobs[job_id]
         required = (
-            "    needs: maven-dependencies\n",
-            "    if: " + dollar + "{{ !cancelled() }}\n",
+            "    needs: [plan, maven-dependencies]\n",
+            "needs.plan.result == 'success'",
+            "needs.maven-dependencies.result == 'success'",
+            "contains(fromJSON(needs.plan.outputs.groups), '" + job_id + "')",
             f"    uses: ./{workflow}\n",
             "    with:\n"
             "      maven_preparation_result: " + dollar + "{{ needs.maven-dependencies.result }}\n",
         )
         if any(item not in block for item in required):
-            raise ValueError(f"{job_id} must wait for and receive the shared preparation result")
+            raise ValueError(f"{job_id} must run only when selected after shared Maven preparation")
     independent = jobs["j09"]
-    if (f"    uses: ./{INDEPENDENT_CI_WORKFLOWS['j09']}\n" not in independent
-            or "    needs:" in independent
+    if ("    needs: plan\n" not in independent
+            or "contains(fromJSON(needs.plan.outputs.groups), 'j09')" not in independent
+            or f"    uses: ./{INDEPENDENT_CI_WORKFLOWS['j09']}\n" not in independent
             or "maven_preparation_result:" in independent):
-        raise ValueError("J09 must run independently of Maven preparation")
+        raise ValueError("J09 must run only when selected and independently of Maven preparation")
+
+    docs = jobs["docs-validation"]
+    if ("    needs: plan\n" not in docs
+            or "needs.plan.outputs.docs == 'true'" not in docs
+            or "git diff --check" not in docs):
+        raise ValueError("CI must run the document diff check only when documents changed")
 
     summary = jobs["ci-result"]
-    expected_summary_jobs = ["maven-dependencies", *CI_WORKFLOW_CALL_ORDER]
-    require_status_summary(summary, expected_summary_jobs, "CI")
+    expected_summary_jobs = ["plan", "maven-dependencies", "docs-validation", *CI_WORKFLOW_CALL_ORDER]
+    require_ci_status_summary(summary, expected_summary_jobs)
     return {
         "maven_preparation_calls": 1,
         "maven_consumer_workflows": len(MAVEN_CONSUMER_WORKFLOWS),
         "maven_validation_jobs": MAVEN_VALIDATION_JOB_COUNT,
+        "stable_summary_gate": True,
         "j09_independent": True,
     }
 
@@ -262,12 +334,14 @@ def static_policy(root=ROOT):
         raise ValueError("public verification workflows are missing")
     preparation_jobs = 0
     consumer_jobs = 0
+    locked_jdk_jobs = 0
     for workflow in workflows:
         content = workflow.read_text()
         if "pull_request_target" in content or re.search(r"secrets\s*[.\[]", content) or re.search(r"permissions\s*:\s*(?:write-all|[\s\S]*?contents\s*:\s*write)", content):
             raise ValueError("M0 public CI must not request target secrets or write access")
         workflow_actions(content, root, action_pins)
         cache_jobs = maven_cache_policy(workflow, content)
+        locked_jdk_jobs += locked_jdk_archive_policy(workflow, content)
         if workflow.name == Path(MAVEN_PREPARATION).name:
             preparation_jobs += cache_jobs
         else:
@@ -290,6 +364,8 @@ def static_policy(root=ROOT):
                 raise ValueError("checkout credentials must not persist")
     if preparation_jobs != 1 or consumer_jobs != MAVEN_VALIDATION_JOB_COUNT:
         raise ValueError("CI must keep one Maven preparation job and all 27 Maven validation jobs")
+    if locked_jdk_jobs != 29:
+        raise ValueError("every Java validation job must restore the locked JDK archive")
     orchestration = ci_orchestration_policy(root)
     return {"workflows": len(workflows), "immutable_action_pins": len(action_pins),
             "runtime_base": runtime["reference"], "public_maven_only": True,
@@ -297,6 +373,8 @@ def static_policy(root=ROOT):
             "maven_preparation_calls": orchestration["maven_preparation_calls"],
             "maven_consumer_workflows": orchestration["maven_consumer_workflows"],
             "maven_validation_jobs": consumer_jobs,
+            "locked_jdk_archive_jobs": locked_jdk_jobs,
+            "stable_summary_gate": orchestration["stable_summary_gate"],
             "j09_independent": orchestration["j09_independent"]}
 
 

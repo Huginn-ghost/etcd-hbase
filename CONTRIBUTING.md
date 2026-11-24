@@ -22,6 +22,8 @@
 
 完整公开验证与实际运行镜像见 [J09 交付说明](docs/build/j09-public-delivery.md)。默认 Maven `clean verify` 不包含全部 Go/运行镜像检查。
 
+PR 的 CI 按文件影响关系选择验证组；主分支 push 和 merge queue 仍运行完整回归。路径映射、完整回归触发条件及稳定汇总门禁见 [CI 影响范围矩阵](docs/build/ci-impact-matrix.md)。
+
 ## Review 关注点
 
 - 正确性和错误边界；不可用未实现的业务成功响应伪装通过。

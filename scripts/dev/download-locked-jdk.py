@@ -18,12 +18,30 @@ ROOT = Path(__file__).resolve().parents[2]
 LOCK = ROOT / "build" / "dependency-lock.json"
 
 
+def verify_archive(archive: Path, expected_sha256: str, release: str) -> str:
+    if not archive.is_file():
+        raise ValueError(f"JDK archive does not exist: {archive}")
+    digest = hashlib.sha256()
+    with archive.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"JDK archive SHA-256 mismatch for {release}: expected {expected_sha256}, "
+            f"received {actual_sha256}"
+        )
+    return actual_sha256
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, type=Path, help="destination archive path")
+    operation = parser.add_mutually_exclusive_group(required=True)
+    operation.add_argument("--output", type=Path, help="destination archive path")
+    operation.add_argument("--verify", type=Path, metavar="ARCHIVE", help="verify a cached archive")
     args = parser.parse_args()
 
-    if sys.platform != "linux" or platform.machine().lower() not in {"x86_64", "amd64"}:
+    if args.output and (sys.platform != "linux" or platform.machine().lower() not in {"x86_64", "amd64"}):
         parser.error("the public CI JDK download currently supports Linux x64 only")
 
     try:
@@ -45,6 +63,14 @@ def main() -> int:
         or any(character not in "0123456789abcdef" for character in expected_sha256)
     ):
         parser.error("JDK archive must use the official HTTPS source and a lowercase SHA-256")
+
+    if args.verify:
+        try:
+            actual_sha256 = verify_archive(args.verify.expanduser().resolve(), expected_sha256, release)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        print(f"verified locked Temurin {release} archive SHA-256: {actual_sha256}")
+        return 0
 
     destination = args.output.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)

@@ -27,13 +27,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载锁定的 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m4-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m4-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -64,13 +73,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载锁定的 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m4-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m4-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -101,13 +119,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载锁定的 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m4-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m4-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -138,13 +165,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载锁定的 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m4-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m4-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -175,13 +211,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载锁定的 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m4-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m4-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -212,13 +257,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载锁定的 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m4-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m4-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -249,13 +303,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载锁定的 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m4-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m4-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -286,13 +349,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载锁定的 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m4-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m4-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |

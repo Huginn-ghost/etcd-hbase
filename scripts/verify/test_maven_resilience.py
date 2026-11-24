@@ -48,6 +48,8 @@ class MavenCachePolicyTest(unittest.TestCase):
         self.assertEqual(1, result["maven_preparation_calls"])
         self.assertEqual(14, result["maven_consumer_workflows"])
         self.assertEqual(27, result["maven_validation_jobs"])
+        self.assertEqual(29, result["locked_jdk_archive_jobs"])
+        self.assertTrue(result["stable_summary_gate"])
         self.assertTrue(result["j09_independent"])
 
     def test_j09_wrapper_cache_and_failure_diagnostics_are_locked(self):
@@ -131,25 +133,39 @@ class MavenCachePolicyTest(unittest.TestCase):
         path = ROOT / POLICY.MAVEN_ORCHESTRATION
         content = path.read_text()
         damages = (
-            content.replace("      - 'codex/**'\n", "", 1),
+            content.replace(
+                "  pull_request:\n    branches:\n      - main\n",
+                "",
+                1,
+            ),
+            content.replace(
+                "  merge_group:\n    types:\n      - checks_requested\n",
+                "",
+                1,
+            ),
+            content.replace(
+                "contains(fromJSON(needs.plan.outputs.groups), 'j03')",
+                "contains(fromJSON(needs.plan.outputs.groups), 'j04')",
+                1,
+            ),
             content.replace(
                 "uses: ./.github/workflows/j03.yml",
                 "uses: ./.github/workflows/j04.yml",
                 1,
             ),
             content.replace(
-                "  j09:\n    name:",
-                "  j09:\n    needs: maven-dependencies\n    name:",
+                "  j09:\n    name: J09 · 公开构建、运行包与镜像验证\n    needs: plan\n",
+                "  j09:\n    name: J09 · 公开构建、运行包与镜像验证\n    needs: [plan, maven-dependencies]\n",
                 1,
             ),
             content.replace(
-                "          J09_RESULT: ${{ needs.j09.result }}\n",
+                "          RESULT_J09: ${{ needs.j09.result }}\n",
                 "",
                 1,
             ),
             content.replace(
-                'if [[ "$result" != success ]]; then',
-                'if [[ "$result" == failure ]]; then',
+                "run: python3 scripts/verify/ci_impact.py --check-results\n",
+                "run: python3 scripts/verify/ci_impact.py\n",
                 1,
             ),
         )
@@ -178,6 +194,31 @@ class MavenCachePolicyTest(unittest.TestCase):
             orchestration = (ROOT / POLICY.MAVEN_ORCHESTRATION).read_text()
             with self.assertRaises(ValueError):
                 POLICY.ci_orchestration_policy(root, orchestration)
+
+    def test_locked_jdk_cache_rejects_unverified_or_unlocked_archives(self):
+        workflow_path = ROOT / ".github/workflows/m3.yml"
+        content = workflow_path.read_text()
+        damages = (
+            content.replace(
+                'run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"\n',
+                "",
+                1,
+            ),
+            content.replace(
+                "key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}\n",
+                "key: locked-jdk21-${{ runner.os }}\n",
+                1,
+            ),
+            content.replace(
+                'run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"\n',
+                'run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/other-jdk.tar.gz"\n',
+                1,
+            ),
+        )
+        for index, damaged in enumerate(damages):
+            self.assertNotEqual(content, damaged)
+            with self.subTest(damage=index), self.assertRaises(ValueError):
+                POLICY.locked_jdk_archive_policy(workflow_path, damaged)
 
     def test_only_approved_local_workflow_or_immutable_remote_actions_are_allowed(self):
         lock = json.loads((ROOT / "build/dependency-lock.json").read_text())
