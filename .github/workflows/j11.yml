@@ -1,7 +1,7 @@
 name: "J11 · HBase 访问与历史原型契约"
 on:
   push:
-    branches: [main, 'codex/**']
+    branches: [main]
   pull_request:
     branches: [main]
 permissions:

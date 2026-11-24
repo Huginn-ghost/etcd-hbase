@@ -1,7 +1,7 @@
 name: "M4 · Lease 生命周期与 Watch 流"
 on:
   push:
-    branches: [main, 'codex/**']
+    branches: [main]
   pull_request:
     branches: [main]
 permissions:

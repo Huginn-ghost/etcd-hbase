@@ -2,7 +2,7 @@ name: "J23 · 提交发布、未知结果与服务交接"
 
 on:
   push:
-    branches: [main, 'codex/**']
+    branches: [main]
   pull_request:
     branches: [main]
 

@@ -1,7 +1,7 @@
 name: "M1 · 存储扫描与资源约束"
 on:
   push:
-    branches: [main, 'codex/**']
+    branches: [main]
   pull_request:
     branches: [main]
 permissions:

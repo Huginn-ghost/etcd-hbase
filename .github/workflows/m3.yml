@@ -1,7 +1,7 @@
 name: "M3 · KV/Range/Txn 与恢复集成"
 on:
   push:
-    branches: [main, 'codex/**']
+    branches: [main]
   pull_request:
     branches: [main]
 permissions:
