@@ -1,4 +1,4 @@
-name: J03 protocol skeleton
+name: "J03 · gRPC 协议骨架与 Go/Java 互通"
 
 on:
   push:
@@ -18,11 +18,12 @@ concurrency:
 
 jobs:
   maven-dependencies:
+    name: J03 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   java-go-smoke:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: Java 21 and Go protocol smoke
+    name: J03 · gRPC 与 Java/Go 协议互通冒烟验证
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:

@@ -1,4 +1,4 @@
-name: J10 byte and storage encoding contracts
+name: "J10 · 字节编码、行键与存储协议"
 on:
   push:
     branches: [main, 'codex/**']
@@ -11,11 +11,12 @@ concurrency:
   cancel-in-progress: true
 jobs:
   maven-dependencies:
+    name: J10 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   storage-encoding:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: 字节、行键与内部存储协议
+    name: J10 · 字节编码、行键与 HBase 存储协议验证
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

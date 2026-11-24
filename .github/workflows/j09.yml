@@ -1,4 +1,4 @@
-name: J09 public build and Java 21 runtime image
+name: "J09 · 公开构建、运行包与镜像验证"
 
 on:
   push:
@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   public-delivery:
-    name: 公开完整构建、实际运行包与镜像
+    name: J09 · 公开构建、运行包与容器镜像验证
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:

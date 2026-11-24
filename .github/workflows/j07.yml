@@ -1,4 +1,4 @@
-name: J07 native oracle and Go Java wire
+name: "J07 · 原生 etcd 对照与 Go/Java 协议互通"
 
 on:
   push:
@@ -18,11 +18,12 @@ concurrency:
 
 jobs:
   maven-dependencies:
+    name: J07 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   protocol-oracle:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: 原生 etcd、严格 trace 与 Go Java 互通
+    name: J07 · 原生 etcd 对照、严格 trace 与 Go/Java 互通验证
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:

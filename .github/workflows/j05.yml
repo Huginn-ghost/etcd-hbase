@@ -1,4 +1,4 @@
-name: J05 salt and initialization
+name: "J05 · 盐配置、路由与 HBase 初始化"
 
 on:
   push:
@@ -18,11 +18,12 @@ concurrency:
 
 jobs:
   maven-dependencies:
+    name: J05 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   salt-and-initialization:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: Java 21 salt profiles and real HBase initialization
+    name: J05 · 盐策略、路由与 HBase 初始化验证
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
