@@ -1,12 +1,12 @@
 name: "J03 · gRPC 协议骨架与 Go/Java 互通"
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
+  workflow_call:
+    inputs:
+      maven_preparation_result:
+        description: Result of the shared Maven preparation job.
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -16,11 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  maven-dependencies:
-    name: J03 · Maven 公共依赖准备
-    uses: ./.github/workflows/maven-dependencies.yml
   java-go-smoke:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J03 · gRPC 与 Java/Go 协议互通冒烟验证
     runs-on: ubuntu-24.04
@@ -28,7 +24,7 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

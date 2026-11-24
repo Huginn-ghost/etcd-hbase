@@ -1,0 +1,207 @@
+name: "CI · Maven 公共准备与验证"
+
+on:
+  push:
+    branches:
+      - main
+      - 'codex/**'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maven-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  maven-dependencies:
+    name: CI · Java 21 与 Maven 公共依赖准备
+    uses: ./.github/workflows/maven-dependencies.yml
+
+  j03:
+    name: J03 · gRPC 协议骨架与 Go/Java 互通
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/j03.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  j04:
+    name: J04 · HBase 认证、令牌与 ACL 访问
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/j04.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  j05:
+    name: J05 · 盐配置、路由与 HBase 初始化
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/j05.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  j06:
+    name: J06 · 服务配置、请求生命周期与 HBase
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/j06.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  j07:
+    name: J07 · 原生 etcd 对照与 Go/Java 协议互通
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/j07.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  j08:
+    name: J08 · SPI 契约、模块边界与 HBase 回归
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/j08.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  j09:
+    name: J09 · 公开构建、运行包与镜像验证
+    uses: ./.github/workflows/j09.yml
+
+  j10:
+    name: J10 · 字节编码、行键与存储协议
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/j10.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  j11:
+    name: J11 · HBase 访问与历史原型契约
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/j11.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  j23:
+    name: J23 · 提交发布、未知结果与服务交接
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/j23.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  j24:
+    name: J24 · 提交物化与迟到写隔离
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/j24.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  j36-proof:
+    name: J36 · 缓存组件隔离与 HBase 验证
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/j36-proof.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  m1:
+    name: M1 · 存储扫描与资源约束
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/m1.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  m3:
+    name: M3 · KV/Range/Txn 与恢复集成
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/m3.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  m4:
+    name: M4 · Lease 生命周期与 Watch 流
+    needs: maven-dependencies
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/m4.yml
+    with:
+      maven_preparation_result: ${{ needs.maven-dependencies.result }}
+
+  ci-result:
+    name: CI · 所有验证组汇总
+    needs:
+      - maven-dependencies
+      - j03
+      - j04
+      - j05
+      - j06
+      - j07
+      - j08
+      - j09
+      - j10
+      - j11
+      - j23
+      - j24
+      - j36-proof
+      - m1
+      - m3
+      - m4
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检查所有预期验证组均已执行并成功
+        env:
+          MAVEN_DEPENDENCIES_RESULT: ${{ needs.maven-dependencies.result }}
+          J03_RESULT: ${{ needs.j03.result }}
+          J04_RESULT: ${{ needs.j04.result }}
+          J05_RESULT: ${{ needs.j05.result }}
+          J06_RESULT: ${{ needs.j06.result }}
+          J07_RESULT: ${{ needs.j07.result }}
+          J08_RESULT: ${{ needs.j08.result }}
+          J09_RESULT: ${{ needs.j09.result }}
+          J10_RESULT: ${{ needs.j10.result }}
+          J11_RESULT: ${{ needs.j11.result }}
+          J23_RESULT: ${{ needs.j23.result }}
+          J24_RESULT: ${{ needs.j24.result }}
+          J36_PROOF_RESULT: ${{ needs.j36-proof.result }}
+          M1_RESULT: ${{ needs.m1.result }}
+          M3_RESULT: ${{ needs.m3.result }}
+          M4_RESULT: ${{ needs.m4.result }}
+        run: |
+          set -u
+          failed=0
+          for check in \
+            "maven-dependencies=$MAVEN_DEPENDENCIES_RESULT" \
+            "j03=$J03_RESULT" \
+            "j04=$J04_RESULT" \
+            "j05=$J05_RESULT" \
+            "j06=$J06_RESULT" \
+            "j07=$J07_RESULT" \
+            "j08=$J08_RESULT" \
+            "j09=$J09_RESULT" \
+            "j10=$J10_RESULT" \
+            "j11=$J11_RESULT" \
+            "j23=$J23_RESULT" \
+            "j24=$J24_RESULT" \
+            "j36-proof=$J36_PROOF_RESULT" \
+            "m1=$M1_RESULT" \
+            "m3=$M3_RESULT" \
+            "m4=$M4_RESULT"
+          do
+            IFS='=' read -r check_id result <<< "$check"
+            printf '%s: %s\n' "$check_id" "$result"
+            if [[ "$result" != success ]]; then
+              failed=1
+            fi
+          done
+          exit "$failed"

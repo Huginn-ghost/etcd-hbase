@@ -1,20 +1,19 @@
 name: "J24 · 提交物化与迟到写隔离"
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_call:
+    inputs:
+      maven_preparation_result:
+        description: Result of the shared Maven preparation job.
+        required: true
+        type: string
+
 permissions:
   contents: read
 concurrency:
   group: j24-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
-  maven-dependencies:
-    name: J24 · Maven 公共依赖准备
-    uses: ./.github/workflows/maven-dependencies.yml
   materialization:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J24 · MiniCluster 提交物化与迟到写隔离验证
     runs-on: ubuntu-24.04
@@ -22,7 +21,7 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

@@ -1,10 +1,12 @@
 name: "J23 · 提交发布、未知结果与服务交接"
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_call:
+    inputs:
+      maven_preparation_result:
+        description: Result of the shared Maven preparation job.
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,11 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  maven-dependencies:
-    name: J23 · Maven 公共依赖准备
-    uses: ./.github/workflows/maven-dependencies.yml
   publication:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J23 · 发布 CAS 与结果未知查询验证
     runs-on: ubuntu-24.04
@@ -26,7 +24,7 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

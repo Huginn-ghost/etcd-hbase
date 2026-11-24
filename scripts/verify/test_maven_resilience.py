@@ -44,6 +44,11 @@ class MavenCachePolicyTest(unittest.TestCase):
         result = POLICY.static_policy()
         self.assertTrue(result["public_maven_only"])
         self.assertEqual(4, result["immutable_action_pins"])
+        self.assertEqual(1, result["maven_preparation_jobs"])
+        self.assertEqual(1, result["maven_preparation_calls"])
+        self.assertEqual(14, result["maven_consumer_workflows"])
+        self.assertEqual(27, result["maven_validation_jobs"])
+        self.assertTrue(result["j09_independent"])
 
     def test_j09_wrapper_cache_and_failure_diagnostics_are_locked(self):
         workflow = (ROOT / ".github/workflows/j09.yml").read_text()
@@ -63,19 +68,123 @@ class MavenCachePolicyTest(unittest.TestCase):
         content = workflow.read_text()
         damages = (
             content.replace("            build/dependency-lock.json\n", "", 1),
-            content.replace("    needs: maven-dependencies\n", "", 1),
             content.replace("    if: ${{ !cancelled() }}\n", "", 1),
+            content.replace(
+                "      maven_preparation_result:\n"
+                "        description: Result of the shared Maven preparation job.\n"
+                "        required: true\n"
+                "        type: string\n",
+                "      other_result:\n"
+                "        description: Result of the shared Maven preparation job.\n"
+                "        required: true\n"
+                "        type: string\n",
+                1,
+            ),
+            content.replace(
+                "PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}",
+                "PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}",
+                1,
+            ),
             content.replace('        run: test "$PREPARATION_RESULT" = success\n', "", 1),
             content.replace("          cache-read-only: true\n", "", 1),
-            content.replace("uses: ./" + POLICY.MAVEN_PREPARATION, "uses: ./unexpected.yml", 1),
+            content.replace(
+                "  j28-history:\n",
+                "  j28-history:\n    needs: maven-dependencies\n",
+                1,
+            ),
         )
         for index, damaged in enumerate(damages):
+            self.assertNotEqual(content, damaged)
             with self.subTest(damage=index), self.assertRaises(ValueError):
                 POLICY.maven_cache_policy(workflow, damaged)
 
+    def test_multi_job_summaries_reject_missing_or_ignored_results(self):
+        cases = (
+            (".github/workflows/m3.yml", "      - j34\n",
+             "          J31_RESULT: ${{ needs.j31.result }}\n"),
+            (".github/workflows/m4.yml", "      - j45\n",
+             "          J43_RESULT: ${{ needs.j43.result }}\n"),
+        )
+        for workflow_path, missing_need, missing_result in cases:
+            workflow = ROOT / workflow_path
+            content = workflow.read_text()
+            damages = (
+                content.replace(missing_need, "", 1),
+                content.replace(missing_result, "", 1),
+                content.replace(
+                    "    if: ${{ always() && !cancelled() }}\n",
+                    "    if: ${{ always() }}\n",
+                    1,
+                ),
+                content.replace(
+                    'if [[ "$result" != success ]]; then',
+                    'if [[ "$result" == failure ]]; then',
+                    1,
+                ),
+            )
+            for index, damaged in enumerate(damages):
+                self.assertNotEqual(content, damaged)
+                with self.subTest(workflow=workflow_path, damage=index), self.assertRaises(ValueError):
+                    POLICY.maven_cache_policy(workflow, damaged)
+
+    def test_ci_orchestration_rejects_missing_checks_and_j09_dependency(self):
+        path = ROOT / POLICY.MAVEN_ORCHESTRATION
+        content = path.read_text()
+        damages = (
+            content.replace("      - 'codex/**'\n", "", 1),
+            content.replace(
+                "uses: ./.github/workflows/j03.yml",
+                "uses: ./.github/workflows/j04.yml",
+                1,
+            ),
+            content.replace(
+                "  j09:\n    name:",
+                "  j09:\n    needs: maven-dependencies\n    name:",
+                1,
+            ),
+            content.replace(
+                "          J09_RESULT: ${{ needs.j09.result }}\n",
+                "",
+                1,
+            ),
+            content.replace(
+                'if [[ "$result" != success ]]; then',
+                'if [[ "$result" == failure ]]; then',
+                1,
+            ),
+        )
+        for index, damaged in enumerate(damages):
+            self.assertNotEqual(content, damaged)
+            with self.subTest(damage=index), self.assertRaises(ValueError):
+                POLICY.ci_orchestration_policy(ROOT, damaged)
+
+    def test_ci_orchestrator_is_the_only_push_and_pull_request_entrypoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow_dir = root / ".github/workflows"
+            workflow_dir.mkdir(parents=True)
+            paths = {POLICY.MAVEN_PREPARATION, *POLICY.CI_WORKFLOW_CALLS.values()}
+            for workflow in paths:
+                destination = workflow_dir / Path(workflow).name
+                shutil.copyfile(ROOT / workflow, destination)
+
+            j03_path = workflow_dir / "j03.yml"
+            j03 = j03_path.read_text()
+            j03_path.write_text(j03.replace(
+                "on:\n  workflow_call:\n",
+                "on:\n  push:\n    branches:\n      - main\n  workflow_call:\n",
+                1,
+            ))
+            orchestration = (ROOT / POLICY.MAVEN_ORCHESTRATION).read_text()
+            with self.assertRaises(ValueError):
+                POLICY.ci_orchestration_policy(root, orchestration)
+
     def test_only_approved_local_workflow_or_immutable_remote_actions_are_allowed(self):
-        pins = json.loads((ROOT / "build/dependency-lock.json").read_text())["actions"]
-        POLICY.workflow_actions("    uses: ./" + POLICY.MAVEN_PREPARATION, ROOT, pins)
+        lock = json.loads((ROOT / "build/dependency-lock.json").read_text())
+        pins = POLICY.approved_action_pins(ROOT, lock)
+        for workflow in (POLICY.MAVEN_PREPARATION, ".github/workflows/j03.yml",
+                         POLICY.INDEPENDENT_CI_WORKFLOWS["j09"]):
+            POLICY.workflow_actions("    uses: ./" + workflow, ROOT, pins)
         for action in ("actions/setup-java@main", "./../unexpected.yml", "./.github/workflows/other.yml"):
             with self.subTest(action=action), self.assertRaises(ValueError):
                 POLICY.workflow_actions("    uses: " + action, ROOT, pins)

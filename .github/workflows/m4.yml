@@ -1,20 +1,19 @@
 name: "M4 · Lease 生命周期与 Watch 流"
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_call:
+    inputs:
+      maven_preparation_result:
+        description: Result of the shared Maven preparation job.
+        required: true
+        type: string
+
 permissions:
   contents: read
 concurrency:
   group: m4-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
-  maven-dependencies:
-    name: M4 · Maven 公共依赖准备
-    uses: ./.github/workflows/maven-dependencies.yml
   j40:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J40 · Lease 管理与故障恢复验证
     runs-on: ubuntu-24.04
@@ -22,7 +21,7 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -52,7 +51,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m4.sh --scope public --task J40 --artifact-root ".artifacts/m4/ci-${{ github.run_id }}-${{ github.run_attempt }}"
   j41:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J41 · Lease 绑定与注册事务验证
     runs-on: ubuntu-24.04
@@ -60,7 +58,7 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -90,7 +88,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m4.sh --scope public --task J41 --artifact-root ".artifacts/m4/ci-${{ github.run_id }}-${{ github.run_attempt }}"
   j42:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J42 · KeepAlive 持久续约与跨副本接管验证
     runs-on: ubuntu-24.04
@@ -98,7 +95,7 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -128,7 +125,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m4.sh --scope public --task J42 --artifact-root ".artifacts/m4/ci-${{ github.run_id }}-${{ github.run_attempt }}"
   j43:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J43 · Lease 撤销与到期接管验证
     runs-on: ubuntu-24.04
@@ -136,7 +132,7 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -166,7 +162,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m4.sh --scope public --task J43 --artifact-root ".artifacts/m4/ci-${{ github.run_id }}-${{ github.run_attempt }}"
   j44:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J44 · 已提交事件与共享 tailer 验证
     runs-on: ubuntu-24.04
@@ -174,7 +169,7 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -204,7 +199,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m4.sh --scope public --task J44 --artifact-root ".artifacts/m4/ci-${{ github.run_id }}-${{ github.run_attempt }}"
   j45:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J45 · Watch 双向流与订阅生命周期验证
     runs-on: ubuntu-24.04
@@ -212,7 +206,7 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -242,7 +236,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m4.sh --scope public --task J45 --artifact-root ".artifacts/m4/ci-${{ github.run_id }}-${{ github.run_attempt }}"
   j46:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J46 · Watch 回放、进度、fragment 与 Go 客户端互通验证
     runs-on: ubuntu-24.04
@@ -250,7 +243,7 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -280,7 +273,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m4.sh --scope public --task J46 --artifact-root ".artifacts/m4/ci-${{ github.run_id }}-${{ github.run_attempt }}"
   j47:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J47 · 流控、取消与资源排空验证
     runs-on: ubuntu-24.04
@@ -288,7 +280,7 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -317,3 +309,48 @@ jobs:
         env:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m4.sh --scope public --task J47 --artifact-root ".artifacts/m4/ci-${{ github.run_id }}-${{ github.run_attempt }}"
+
+  summary:
+    name: M4 · 全部验证任务汇总
+    needs:
+      - j40
+      - j41
+      - j42
+      - j43
+      - j44
+      - j45
+      - j46
+      - j47
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检查全部任务均已执行并成功
+        env:
+          J40_RESULT: ${{ needs.j40.result }}
+          J41_RESULT: ${{ needs.j41.result }}
+          J42_RESULT: ${{ needs.j42.result }}
+          J43_RESULT: ${{ needs.j43.result }}
+          J44_RESULT: ${{ needs.j44.result }}
+          J45_RESULT: ${{ needs.j45.result }}
+          J46_RESULT: ${{ needs.j46.result }}
+          J47_RESULT: ${{ needs.j47.result }}
+        run: |
+          set -u
+          failed=0
+          for check in \
+            "j40=$J40_RESULT" \
+            "j41=$J41_RESULT" \
+            "j42=$J42_RESULT" \
+            "j43=$J43_RESULT" \
+            "j44=$J44_RESULT" \
+            "j45=$J45_RESULT" \
+            "j46=$J46_RESULT" \
+            "j47=$J47_RESULT"
+          do
+            IFS='=' read -r check_id result <<< "$check"
+            printf '%s: %s\n' "$check_id" "$result"
+            if [[ "$result" != success ]]; then
+              failed=1
+            fi
+          done
+          exit "$failed"
