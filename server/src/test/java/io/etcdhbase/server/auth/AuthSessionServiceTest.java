@@ -206,6 +206,36 @@ class AuthSessionServiceTest {
   }
 
   @Test
+  void cancelledAuthenticationKeepsItsSlotUntilPhysicalProducersDrain() throws Exception {
+    FakeStore store = new FakeStore();
+    FakeIdentityManager identities = new FakeIdentityManager();
+    identities.authentication = new CompletableFuture<>();
+    var producer = new CompletableFuture<Void>();
+    try (var keys = keyProvider("key-1", temporary.resolve("key.bin"));
+        RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
+        var credentials = credentials()) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      AuthSessionService auth = service(store, protector, identities, 1);
+      request.trackPhysicalProducer(producer);
+      var result = auth.authenticate(credentials, request).toCompletableFuture();
+      assertEquals(AuthSlot.State.RESERVED, store.slots.get(0).state());
+
+      request.cancel();
+      identities.authentication.completeExceptionally(new BackendIdentityException(
+          BackendIdentityException.Reason.INVALID_CREDENTIALS));
+      assertFalse(result.isDone());
+      assertEquals(AuthSlot.State.RESERVED, store.slots.get(0).state());
+
+      producer.complete(null);
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> result.get(3, java.util.concurrent.TimeUnit.SECONDS));
+      assertEquals(AuthSlot.State.EMPTY, store.slots.get(0).state());
+    } finally {
+      producer.complete(null);
+    }
+  }
+
+  @Test
   void unknownSessionWriteOutcomeKeepsTheGlobalSlotReserved() throws Exception {
     FakeStore store = new FakeStore();
     store.failSessionCreateWithoutWriting = true;
@@ -397,6 +427,7 @@ class AuthSessionServiceTest {
     private int activations;
     private int discardedIdentities;
     private boolean rejectCredentials;
+    private CompletableFuture<AuthorizedBackendIdentity> authentication;
     private CompletableFuture<SessionIdentityLease> activation;
     private int releasedIdentityLeases;
     private int providerCloses;
@@ -405,6 +436,7 @@ class AuthSessionServiceTest {
     @Override
     public CompletionStage<AuthorizedBackendIdentity> authenticate(
         BackendCredentials credentials, AuthenticationScope scope) {
+      if (authentication != null) return authentication;
       if (rejectCredentials) return CompletableFuture.failedFuture(new BackendIdentityException(
           BackendIdentityException.Reason.INVALID_CREDENTIALS));
       return CompletableFuture.completedFuture(identity(credentials.principal(), scope));

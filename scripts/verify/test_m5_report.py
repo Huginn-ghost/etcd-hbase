@@ -140,6 +140,17 @@ class M5ReportTest(unittest.TestCase):
                                     "io.etcdhbase.server.commit.TxnGatewayAuthenticationTest"):
             m5_report._validate_registry(self.registry)
 
+    def test_registry_requires_cancelled_authentication_producer_drain(self) -> None:
+        required_class = "io.etcdhbase.server.auth.AuthSessionServiceTest"
+        entry = next(test for test in self.task["tests"] if test["class"] == required_class)
+        entry["methods"].remove("cancelledAuthenticationKeepsItsSlotUntilPhysicalProducersDrain")
+        (self.registry / "J50.json").write_text(
+            json.dumps(self.task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(m5_report.ReportError,
+                                    "J50 required test methods are missing: " + required_class):
+            m5_report._validate_registry(self.registry)
+
     def test_registry_requires_authenticate_to_non_owner_gateway_rpc_suite(self) -> None:
         required_class = "io.etcdhbase.server.commit.M5GatewayAuthenticationRpcTest"
         self.task["tests"] = [entry for entry in self.task["tests"]

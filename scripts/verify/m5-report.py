@@ -57,6 +57,9 @@ J50_REQUIRED_TESTS = {
         {"authenticatesOnAThenUsesBGetPutTxnAndReactivatesAfterFullStop"},
     ("server", "surefire", "io.etcdhbase.server.auth.AuthSessionServiceTest"):
         {"authenticatesPersistsOnlyDigestAndEnvelopeAndResolvesOnAnotherReplica",
+         "undeliveredTokenCleanupRetiresOnlyItsSessionAndSlotGeneration",
+         "undeliveredCleanupRetainsTheSlotWhenTheSessionIdentityIsUncertain",
+         "cancelledAuthenticationKeepsItsSlotUntilPhysicalProducersDrain",
          "unknownSessionWriteOutcomeKeepsTheGlobalSlotReserved",
          "revokedAuthorityRejectsAnOtherwiseActiveToken"},
     ("server", "surefire", "io.etcdhbase.server.auth.ProviderSessionIdentityManagerTest"):

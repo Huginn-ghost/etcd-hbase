@@ -101,6 +101,9 @@
       "methods": [
         "authenticatesPersistsOnlyDigestAndEnvelopeAndResolvesOnAnotherReplica",
         "globallyBoundedSlotsRejectASecondReplicaAndBackendFailureReleasesReservation",
+        "undeliveredTokenCleanupRetiresOnlyItsSessionAndSlotGeneration",
+        "undeliveredCleanupRetainsTheSlotWhenTheSessionIdentityIsUncertain",
+        "cancelledAuthenticationKeepsItsSlotUntilPhysicalProducersDrain",
         "unknownSessionWriteOutcomeKeepsTheGlobalSlotReserved",
         "revokedAuthorityRejectsAnOtherwiseActiveToken",
         "activationIsDiscardedWhenAuthorityChangesBeforeIdentityIsPublished",

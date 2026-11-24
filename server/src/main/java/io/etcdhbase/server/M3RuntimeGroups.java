@@ -216,6 +216,23 @@ final class M3RuntimeGroups implements AutoCloseable {
 
     M3AuthenticationConfiguration auth = configuration.authentication();
     if (auth == null) throw new IllegalArgumentException("secure identity activation is not configured");
+    SecureBusinessIdentity business = activateSecureBusinessIdentity(
+        plan, configuration, activation, auth, resources);
+    HBaseAuthSessionStore store = openAuthControlStore(configuration, activation, auth, startup,
+        resources);
+    CredentialEnvelopeProtector protector = createCredentialProtector(auth, resources);
+    LongFunction<AuthSessionService> sessionFactory = clusterId -> new AuthSessionService(
+        store, protector, business.identities(), auth.trustDomain(), business.endpointProviderId(),
+        business.scope(), datasetDigest(source.fingerprint(), auth.trustDomain(), clusterId),
+        Duration.ofMillis(auth.sessionTtlMillis()), auth.sessionSlots(), Clock.systemUTC(),
+        new SecureRandom());
+    return new IdentityActivation(business.router(), business.serviceIdentity(), sessionFactory);
+  }
+
+  private static SecureBusinessIdentity activateSecureBusinessIdentity(M3TableGroupPlan plan,
+      RuntimeConfiguration configuration, M3RuntimeConfiguration activation,
+      M3AuthenticationConfiguration auth, GroupResources resources) throws Exception {
+    TableGroupInitializationPlan source = plan.source();
     String group = source.tableGroupId();
     var scope = new AuthenticationScope(group, source.hbaseProfile().id());
     var endpoint = auth.endpointBindings().stream()
@@ -244,7 +261,13 @@ final class M3RuntimeGroups implements AutoCloseable {
             scope, dataAccess, activation), router, scope, endpoint.providerId(),
         auth.maximumIdentityContainers());
     resources.sessionIdentities = identities;
+    return new SecureBusinessIdentity(router, serviceIdentity, identities, scope,
+        endpoint.providerId());
+  }
 
+  private static HBaseAuthSessionStore openAuthControlStore(RuntimeConfiguration configuration,
+      M3RuntimeConfiguration activation, M3AuthenticationConfiguration auth, RequestScope startup,
+      GroupResources resources) throws Exception {
     AuthControl configuredControl = auth.authControl();
     HBaseProfile controlProfile = hbaseProfile(configuration, configuredControl.hbaseProfileId());
     ClientProfile controlClient = clientProfile(auth, configuredControl.clientProfileId());
@@ -264,9 +287,12 @@ final class M3RuntimeGroups implements AutoCloseable {
     resources.authControlProvider = controlProvider;
     AuthorizedBackendIdentity controlIdentity = activateConfiguredIdentity(controlProvider,
         configuredControl.identity(), auth.secretDirectory(), controlScope, activation);
-    HBaseAuthSessionStore store = HBaseAuthSessionStore.open(controlProvider, controlIdentity,
+    return HBaseAuthSessionStore.open(controlProvider, controlIdentity,
         binding, startup).get(activation.startupTimeoutMs(), TimeUnit.MILLISECONDS);
+  }
 
+  private static CredentialEnvelopeProtector createCredentialProtector(
+      M3AuthenticationConfiguration auth, GroupResources resources) {
     Map<String, Path> keyFiles = new LinkedHashMap<>();
     for (var key : auth.credentialKeyRing().keys()) {
       keyFiles.put(key.keyId(), CredentialReferenceResolver.resolvePrivateSecretFile(
@@ -285,14 +311,7 @@ final class M3RuntimeGroups implements AutoCloseable {
         java.util.Arrays.fill(material, (byte) 0);
       }
     }
-    CredentialEnvelopeProtector protector = new AesGcmCredentialEnvelopeProtector(
-        keys, new SecureRandom());
-    LongFunction<AuthSessionService> sessionFactory = clusterId -> new AuthSessionService(
-        store, protector, identities, auth.trustDomain(), endpoint.providerId(), scope,
-        datasetDigest(source.fingerprint(), auth.trustDomain(), clusterId),
-        Duration.ofMillis(auth.sessionTtlMillis()), auth.sessionSlots(), Clock.systemUTC(),
-        new SecureRandom());
-    return new IdentityActivation(router, serviceIdentity, sessionFactory);
+    return new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
   }
 
   private static HBaseBackendIdentityProvider createDevelopmentProvider(
@@ -613,6 +632,10 @@ final class M3RuntimeGroups implements AutoCloseable {
   private record IdentityActivation(HBaseConnectionFactory connections,
       AuthorizedBackendIdentity identity,
       LongFunction<AuthSessionService> sessionFactory) {}
+
+  private record SecureBusinessIdentity(HBaseConnectionRouter router,
+      AuthorizedBackendIdentity serviceIdentity, ProviderSessionIdentityManager identities,
+      AuthenticationScope scope, String endpointProviderId) {}
 
   private static final class GroupResources implements AutoCloseable {
     private HBaseBackendIdentityProvider backendProvider;

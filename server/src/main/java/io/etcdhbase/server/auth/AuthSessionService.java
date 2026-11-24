@@ -599,38 +599,51 @@ public final class AuthSessionService {
         : CompletableFuture.completedFuture(null);
     CompletionStage<Void> cleanup = safeToInspect.thenCompose(ignored ->
         store.readSlot(reservation.slot().index(), cleanupScope))
-        .thenCompose(found -> {
-          if (found.isEmpty()) return CompletableFuture.completedFuture(null);
-          AuthSlot current = found.orElseThrow();
-          if (current.generation() != reservation.slot().generation()
-              || !reservation.slot().sessionId().equals(current.sessionId())) {
-            return CompletableFuture.completedFuture(null);
-          }
-          if (current.state() == AuthSlot.State.EMPTY) return CompletableFuture.completedFuture(null);
-          CompletionStage<AuthSlot> retirement;
-          if (current.state() == AuthSlot.State.RETIRING) {
-            retirement = CompletableFuture.completedFuture(current);
-          } else {
-            AuthSlot retiring = new AuthSlot(current.index(), current.generation(), current.sessionId(),
-                current.operationId(), AuthSlot.State.RETIRING);
-            retirement = store.compareAndSetSlot(current, retiring, cleanupScope).thenCompose(changed ->
-                changed ? CompletableFuture.completedFuture(retiring)
-                    : CompletableFuture.failedFuture(new AuthSessionException(
-                        AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE)));
-          }
-          return retirement.thenCompose(retiring -> removeUndeliveredSession(expectedSession,
-              reservation, cleanupScope).thenCompose(ignored -> {
-                AuthSlot empty = new AuthSlot(retiring.index(), retiring.generation(), null, null,
-                    AuthSlot.State.EMPTY);
-                return store.compareAndSetSlot(retiring, empty, cleanupScope).thenApply(released -> {
-                  if (!released) throw new AuthSessionException(
-                      AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE);
-                  return null;
-                });
-              }));
-        });
+        .thenCompose(found -> cleanupReservedSlot(found, expectedSession, reservation, cleanupScope));
     if (ownedScope) cleanup = cleanup.whenComplete((ignored, failure) -> cleanupScope.close());
     return cleanup;
+  }
+
+  private CompletionStage<Void> cleanupReservedSlot(Optional<AuthSlot> found,
+      AuthSession expectedSession, Reservation reservation, RequestScope cleanupScope) {
+    if (found.isEmpty()) return CompletableFuture.completedFuture(null);
+    AuthSlot current = found.orElseThrow();
+    if (current.generation() != reservation.slot().generation()
+        || !reservation.slot().sessionId().equals(current.sessionId())) {
+      return CompletableFuture.completedFuture(null);
+    }
+    if (current.state() == AuthSlot.State.EMPTY) return CompletableFuture.completedFuture(null);
+    return retireUndeliveredSlot(current, cleanupScope).thenCompose(retiring ->
+        removeSessionAndReleaseSlot(expectedSession, reservation, retiring, cleanupScope));
+  }
+
+  private CompletionStage<AuthSlot> retireUndeliveredSlot(
+      AuthSlot current, RequestScope cleanupScope) {
+    if (current.state() == AuthSlot.State.RETIRING) {
+      return CompletableFuture.completedFuture(current);
+    }
+    AuthSlot retiring = new AuthSlot(current.index(), current.generation(), current.sessionId(),
+        current.operationId(), AuthSlot.State.RETIRING);
+    return store.compareAndSetSlot(current, retiring, cleanupScope).thenCompose(changed ->
+        changed ? CompletableFuture.completedFuture(retiring)
+            : CompletableFuture.failedFuture(new AuthSessionException(
+                AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE)));
+  }
+
+  private CompletionStage<Void> removeSessionAndReleaseSlot(AuthSession expectedSession,
+      Reservation reservation, AuthSlot retiring, RequestScope cleanupScope) {
+    return removeUndeliveredSession(expectedSession, reservation, cleanupScope)
+        .thenCompose(ignored -> releaseUndeliveredSlot(retiring, cleanupScope));
+  }
+
+  private CompletionStage<Void> releaseUndeliveredSlot(AuthSlot retiring, RequestScope cleanupScope) {
+    AuthSlot empty = new AuthSlot(retiring.index(), retiring.generation(), null, null,
+        AuthSlot.State.EMPTY);
+    return store.compareAndSetSlot(retiring, empty, cleanupScope).thenApply(released -> {
+      if (!released) throw new AuthSessionException(
+          AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE);
+      return null;
+    });
   }
 
   private CompletionStage<Void> removeUndeliveredSession(AuthSession expectedSession,
