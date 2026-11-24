@@ -1,20 +1,19 @@
 name: "M3 · KV/Range/Txn 与恢复集成"
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_call:
+    inputs:
+      maven_preparation_result:
+        description: Result of the shared Maven preparation job.
+        required: true
+        type: string
+
 permissions:
   contents: read
 concurrency:
   group: m3-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
-  maven-dependencies:
-    name: M3 · Maven 公共依赖准备
-    uses: ./.github/workflows/maven-dependencies.yml
   j28-history:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J28.2 · Go 客户端并发历史与进程故障恢复验证
     runs-on: ubuntu-24.04
@@ -22,18 +21,27 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载固定 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m3-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m3-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -51,7 +59,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m3.sh --scope public --task J28.2 --artifact-root .artifacts/m3/ci
   j30:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J30 · 原生 etcd 对照、真实 HBase 与恢复验证
     runs-on: ubuntu-24.04
@@ -59,18 +66,27 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载固定 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m3-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m3-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -88,7 +104,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m3.sh --scope public --task J30 --artifact-root .artifacts/m3/ci
   j31:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J31 · 事务对照、真实 HBase 与恢复验证
     runs-on: ubuntu-24.04
@@ -96,18 +111,27 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载固定 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m3-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m3-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -125,7 +149,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m3.sh --scope public --task J31 --artifact-root .artifacts/m3/ci
   j32:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J32 · 嵌套事务、分页工作集与真实 HBase 验证
     runs-on: ubuntu-24.04
@@ -133,18 +156,27 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载固定 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m3-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m3-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -162,7 +194,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m3.sh --scope public --task J32 --artifact-root .artifacts/m3/ci
   j33:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J33 · 删除对照、有界准备与故障恢复验证
     runs-on: ubuntu-24.04
@@ -170,18 +201,27 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载固定 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m3-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m3-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -199,7 +239,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m3.sh --scope public --task J33 --artifact-root .artifacts/m3/ci
   j34:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J34 · Range 选项与原生协议对照验证
     runs-on: ubuntu-24.04
@@ -207,18 +246,27 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载固定 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m3-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m3-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -236,7 +284,6 @@ jobs:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m3.sh --scope public --task J34 --artifact-root .artifacts/m3/ci
   j35:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J35 · 全局升降序与反向存储扫描验证
     runs-on: ubuntu-24.04
@@ -244,18 +291,27 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载固定 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/m3-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/m3-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
@@ -272,3 +328,45 @@ jobs:
         env:
           ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
         run: scripts/verify/m3.sh --scope public --task J35 --artifact-root .artifacts/m3/ci
+
+  summary:
+    name: M3 · 全部验证任务汇总
+    needs:
+      - j28-history
+      - j30
+      - j31
+      - j32
+      - j33
+      - j34
+      - j35
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检查全部任务均已执行并成功
+        env:
+          J28_HISTORY_RESULT: ${{ needs.j28-history.result }}
+          J30_RESULT: ${{ needs.j30.result }}
+          J31_RESULT: ${{ needs.j31.result }}
+          J32_RESULT: ${{ needs.j32.result }}
+          J33_RESULT: ${{ needs.j33.result }}
+          J34_RESULT: ${{ needs.j34.result }}
+          J35_RESULT: ${{ needs.j35.result }}
+        run: |
+          set -u
+          failed=0
+          for check in \
+            "j28-history=$J28_HISTORY_RESULT" \
+            "j30=$J30_RESULT" \
+            "j31=$J31_RESULT" \
+            "j32=$J32_RESULT" \
+            "j33=$J33_RESULT" \
+            "j34=$J34_RESULT" \
+            "j35=$J35_RESULT"
+          do
+            IFS='=' read -r check_id result <<< "$check"
+            printf '%s: %s\n' "$check_id" "$result"
+            if [[ "$result" != success ]]; then
+              failed=1
+            fi
+          done
+          exit "$failed"

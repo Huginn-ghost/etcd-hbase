@@ -1,20 +1,19 @@
 name: "J36 · 缓存组件隔离与 HBase 验证"
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_call:
+    inputs:
+      maven_preparation_result:
+        description: Result of the shared Maven preparation job.
+        required: true
+        type: string
+
 permissions:
   contents: read
 concurrency:
   group: j36-proof-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
-  maven-dependencies:
-    name: J36 · Maven 公共依赖准备
-    uses: ./.github/workflows/maven-dependencies.yml
   component-proof:
-    needs: maven-dependencies
     if: ${{ !cancelled() }}
     name: J36 · 默认关闭缓存组件与临时 HBase 验证
     runs-on: ubuntu-24.04
@@ -22,18 +21,27 @@ jobs:
     steps:
       - name: 确认依赖准备成功
         env:
-          PREPARATION_RESULT: ${{ needs.maven-dependencies.result }}
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
         run: test "$PREPARATION_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
       - name: 下载固定 Java 21
-        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/j36-jdk.tar.gz"
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
       - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
         with:
           distribution: jdkfile
           java-version: '21'
-          jdk-file: ${{ runner.temp }}/j36-jdk.tar.gz
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
           cache: maven
           cache-read-only: true
           cache-dependency-path: |
