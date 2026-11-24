@@ -156,14 +156,20 @@
     {
       "module": "server",
       "kind": "surefire",
+      "class": "io.etcdhbase.server.commit.AuthenticatedRequestIdentityResolverTest",
+      "methods": ["missingTokenIsRejectedWhenAuthenticationIsEnabled", "unauthenticatedModeUsesServiceIdentityForOrdinaryProvider", "suppliedTokenWithoutSessionServiceRemainsUnavailable"]
+    },
+    {
+      "module": "server",
+      "kind": "surefire",
       "class": "io.etcdhbase.server.commit.TxnGatewayAuthenticationTest",
-      "methods": ["rangeUsesResolvedSessionIdentityAndReleasesOnlyAfterPhysicalReadDrains"]
+      "methods": ["rangeUsesResolvedSessionIdentityAndReleasesOnlyAfterPhysicalReadDrains", "unauthenticatedRangeUsesServiceIdentityForOrdinaryProvider"]
     },
     {
       "module": "server",
       "kind": "surefire",
       "class": "io.etcdhbase.server.commit.M5GatewayAuthenticationRpcTest",
-      "methods": ["authenticateOnAThenBRangeAndOwnerForwardingUseRevalidatedIdentityUntilPhysicalDrain"]
+      "methods": ["authenticateOnAThenBRangeAndOwnerForwardingUseRevalidatedIdentityUntilPhysicalDrain", "noTokenPutAndTxnSucceedWithServiceIdentityWhenAuthenticationIsDisabled"]
     },
     {
       "module": "hbase",

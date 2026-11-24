@@ -47,14 +47,20 @@ class ImpactSelectionTest(unittest.TestCase):
     def test_protocol_and_clients_select_both_ends_and_affected_watch_regression(self):
         cases = (
             ("protocol/src/main/proto/etcdserverpb/rpc.proto",
-             ["j03", "j04", "j06", "j07", "j23", "j24", "m3", "m4"]),
+             ["j03", "j04", "j06", "j07", "j23", "j24", "m3", "m4", "m5"]),
             ("grpc/src/main/java/io/etcdhbase/grpc/service/WatchService.java",
-             ["j03", "j04", "j06", "j07", "j23", "j24", "m3", "m4"]),
-            ("testkit/go/internal/wire/probe.go", ["j03", "j06", "j07", "m3", "m4"]),
+             ["j03", "j04", "j06", "j07", "j23", "j24", "m3", "m4", "m5"]),
+            ("testkit/go/internal/wire/probe.go", ["j03", "j06", "j07", "m3", "m4", "m5"]),
         )
         for path, expected in cases:
             with self.subTest(path=path):
                 self.assertEqual(expected, CI_IMPACT.classify_paths((path,))["groups"])
+
+    def test_request_scope_changes_select_authentication_regression(self):
+        selection = CI_IMPACT.classify_paths((
+            "core/src/main/java/io/etcdhbase/core/request/RequestScope.java",
+        ))
+        self.assertEqual(["j06", "m4", "m5"], selection["groups"])
 
     def test_java_contract_tests_select_the_spi_contract_stage(self):
         selection = CI_IMPACT.classify_paths((
@@ -71,7 +77,7 @@ class ImpactSelectionTest(unittest.TestCase):
         selection = CI_IMPACT.classify_paths((
             "core/src/main/java/io/etcdhbase/core/scan/ScanScheduler.java",
         ))
-        self.assertEqual(["j10", "j11", "m1", "m3", "m4"], selection["groups"])
+        self.assertEqual(["j10", "j11", "m1", "m3", "m4", "m5"], selection["groups"])
 
     def test_document_and_code_changes_union_their_checks(self):
         selection = CI_IMPACT.classify_paths((
@@ -156,6 +162,20 @@ class StableSummaryGateTest(unittest.TestCase):
         statuses["m4"] = "success"
         statuses["m3"] = "success"
         self.assertTrue(CI_IMPACT.validate_results("success", selection, statuses))
+
+    def test_selected_m5_cannot_be_skipped_or_fail(self):
+        selection = {"groups": ["m5"], "maven": True, "docs": False}
+        statuses = {
+            "maven-dependencies": "success",
+            "docs-validation": "skipped",
+            **{group: ("success" if group == "m5" else "skipped")
+               for group in CI_IMPACT.WORKFLOW_GROUPS},
+        }
+        self.assertEqual([], CI_IMPACT.validate_results("success", selection, statuses))
+        for result in ("skipped", "failure", ""):
+            with self.subTest(result=result):
+                statuses["m5"] = result
+                self.assertTrue(CI_IMPACT.validate_results("success", selection, statuses))
 
     def test_failed_plan_or_maven_preparation_cannot_pass(self):
         selection = {"groups": ["j03"], "maven": True, "docs": False}

@@ -152,6 +152,18 @@ class M5ReportTest(unittest.TestCase):
                                     "io.etcdhbase.server.commit.M5GatewayAuthenticationRpcTest"):
             m5_report._validate_registry(self.registry)
 
+    def test_registry_requires_unauthenticated_put_and_txn_regression(self) -> None:
+        required_class = "io.etcdhbase.server.commit.M5GatewayAuthenticationRpcTest"
+        method = "noTokenPutAndTxnSucceedWithServiceIdentityWhenAuthenticationIsDisabled"
+        entry = next(test for test in self.task["tests"] if test["class"] == required_class)
+        entry["methods"].remove(method)
+        (self.registry / "J50.json").write_text(
+            json.dumps(self.task, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(m5_report.ReportError,
+                                    "J50 required test methods are missing: " + required_class):
+            m5_report._validate_registry(self.registry)
+
     def test_registry_requires_real_cross_process_authenticate_gateway_suite(self) -> None:
         required_class = "io.etcdhbase.server.M5AuthenticateGatewayProcessIT"
         self.task["tests"] = [entry for entry in self.task["tests"]

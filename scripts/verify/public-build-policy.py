@@ -22,18 +22,18 @@ MAVEN_CONSUMER_WORKFLOWS = {
     name: f".github/workflows/{name}.yml"
     for name in (
         "j03", "j04", "j05", "j06", "j07", "j08", "j10", "j11",
-        "j23", "j24", "j36-proof", "m1", "m3", "m4",
+        "j23", "j24", "j36-proof", "m1", "m3", "m4", "m5",
     )
 }
 INDEPENDENT_CI_WORKFLOWS = {"j09": ".github/workflows/j09.yml"}
 CI_WORKFLOW_CALLS = {**MAVEN_CONSUMER_WORKFLOWS, **INDEPENDENT_CI_WORKFLOWS}
 CI_WORKFLOW_CALL_ORDER = (
     "j03", "j04", "j05", "j06", "j07", "j08", "j09", "j10",
-    "j11", "j23", "j24", "j36-proof", "m1", "m3", "m4",
+    "j11", "j23", "j24", "j36-proof", "m1", "m3", "m4", "m5",
 )
 MAVEN_CONSUMER_JOB_COUNTS = {name: 1 for name in MAVEN_CONSUMER_WORKFLOWS}
 MAVEN_CONSUMER_JOB_COUNTS.update({"m3": 7, "m4": 8})
-MAVEN_VALIDATION_JOB_COUNT = 27
+MAVEN_VALIDATION_JOB_COUNT = 28
 
 # Keep CI Action pins outside the Maven dependency lock so they do not invalidate its cache key.
 
@@ -134,6 +134,7 @@ def multi_job_summary_policy(workflow, content, validation_job_ids):
     required = {
         "m3.yml": ["j28-history", "j30", "j31", "j32", "j33", "j34", "j35"],
         "m4.yml": ["j40", "j41", "j42", "j43", "j44", "j45", "j46", "j47"],
+        "m5.yml": ["j50"],
     }
     if workflow.name not in required:
         return
@@ -363,8 +364,8 @@ def static_policy(root=ROOT):
             if "persist-credentials: false" not in "\n".join(block):
                 raise ValueError("checkout credentials must not persist")
     if preparation_jobs != 1 or consumer_jobs != MAVEN_VALIDATION_JOB_COUNT:
-        raise ValueError("CI must keep one Maven preparation job and all 27 Maven validation jobs")
-    if locked_jdk_jobs != 29:
+        raise ValueError("CI must keep one Maven preparation job and all 28 Maven validation jobs")
+    if locked_jdk_jobs != 30:
         raise ValueError("every Java validation job must restore the locked JDK archive")
     orchestration = ci_orchestration_policy(root)
     return {"workflows": len(workflows), "immutable_action_pins": len(action_pins),

@@ -73,10 +73,16 @@ J50_REQUIRED_TESTS = {
         {"ownerRejectsReferenceWithReusedSlotGenerationAndReleasesResolvedIdentity",
          "ownerRejectsIdentityFromAnotherTableGroupAndReleasesIt",
          "unauthenticatedPeerCannotResolveSession"},
+    ("server", "surefire", "io.etcdhbase.server.commit.AuthenticatedRequestIdentityResolverTest"):
+        {"missingTokenIsRejectedWhenAuthenticationIsEnabled",
+         "unauthenticatedModeUsesServiceIdentityForOrdinaryProvider",
+         "suppliedTokenWithoutSessionServiceRemainsUnavailable"},
     ("server", "surefire", "io.etcdhbase.server.commit.TxnGatewayAuthenticationTest"):
-        {"rangeUsesResolvedSessionIdentityAndReleasesOnlyAfterPhysicalReadDrains"},
+        {"rangeUsesResolvedSessionIdentityAndReleasesOnlyAfterPhysicalReadDrains",
+         "unauthenticatedRangeUsesServiceIdentityForOrdinaryProvider"},
     ("server", "surefire", "io.etcdhbase.server.commit.M5GatewayAuthenticationRpcTest"):
-        {"authenticateOnAThenBRangeAndOwnerForwardingUseRevalidatedIdentityUntilPhysicalDrain"},
+        {"authenticateOnAThenBRangeAndOwnerForwardingUseRevalidatedIdentityUntilPhysicalDrain",
+         "noTokenPutAndTxnSucceedWithServiceIdentityWhenAuthenticationIsDisabled"},
     ("server", "surefire", "io.etcdhbase.server.commit.OwnerForwardingProtocolMapperTest"):
         {"roundTripsInvalidTokenFailureWithoutDowngradingItsCategory"},
     ("grpc", "surefire", "io.etcdhbase.grpc.protocol.ErrorProjectionTest"):
