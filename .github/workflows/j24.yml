@@ -1,7 +1,7 @@
 name: "J24 · 提交物化与迟到写隔离"
 on:
   push:
-    branches: [main, 'codex/**']
+    branches: [main]
   pull_request:
     branches: [main]
 permissions:

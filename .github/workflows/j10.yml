@@ -1,7 +1,7 @@
 name: "J10 · 字节编码、行键与存储协议"
 on:
   push:
-    branches: [main, 'codex/**']
+    branches: [main]
   pull_request:
     branches: [main]
 permissions:

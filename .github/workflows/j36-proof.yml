@@ -1,7 +1,7 @@
 name: "J36 · 缓存组件隔离与 HBase 验证"
 on:
   push:
-    branches: [main, 'codex/**']
+    branches: [main]
   pull_request:
     branches: [main]
 permissions:
