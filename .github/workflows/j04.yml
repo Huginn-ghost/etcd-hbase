@@ -1,4 +1,4 @@
-name: J04 HBase access baseline
+name: "J04 · HBase 认证、令牌与 ACL 访问"
 
 on:
   push:
@@ -18,11 +18,12 @@ concurrency:
 
 jobs:
   maven-dependencies:
+    name: J04 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   hbase-public-local:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: Java 21 and real temporary HBase
+    name: J04 · HBase 认证、令牌与 ACL 集成验证
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

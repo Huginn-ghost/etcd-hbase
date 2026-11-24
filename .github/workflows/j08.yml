@@ -1,4 +1,4 @@
-name: J08 public SPI contracts and module boundaries
+name: "J08 · SPI 契约、模块边界与 HBase 回归"
 
 on:
   push:
@@ -18,11 +18,12 @@ concurrency:
 
 jobs:
   maven-dependencies:
+    name: J08 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   spi-contracts:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: 公开 SPI、模块边界与真实 HBase 回归
+    name: J08 · 公开 SPI、模块边界与真实 HBase 回归验证
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:

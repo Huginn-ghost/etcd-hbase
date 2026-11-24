@@ -1,4 +1,4 @@
-name: J24 commit materialization and late-writer fencing
+name: "J24 · 提交物化与迟到写隔离"
 on:
   push:
     branches: [main, 'codex/**']
@@ -11,11 +11,12 @@ concurrency:
   cancel-in-progress: true
 jobs:
   maven-dependencies:
+    name: J24 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   materialization:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J24 MiniCluster commit materialization
+    name: J24 · MiniCluster 提交物化与迟到写隔离验证
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:

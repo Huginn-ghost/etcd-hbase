@@ -1,4 +1,4 @@
-name: M3 KV protocol and recovery
+name: "M3 · KV/Range/Txn 与恢复集成"
 on:
   push:
     branches: [main, 'codex/**']
@@ -11,11 +11,12 @@ concurrency:
   cancel-in-progress: true
 jobs:
   maven-dependencies:
+    name: M3 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   j28-history:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J28.2 并发历史与真实进程故障
+    name: J28.2 · Go 客户端并发历史与进程故障恢复验证
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
@@ -52,7 +53,7 @@ jobs:
   j30:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J30 原生 etcd 对照、真实 HBase 与恢复
+    name: J30 · 原生 etcd 对照、真实 HBase 与恢复验证
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
@@ -89,7 +90,7 @@ jobs:
   j31:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J31 事务对照、真实 HBase 与恢复
+    name: J31 · 事务对照、真实 HBase 与恢复验证
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
@@ -126,7 +127,7 @@ jobs:
   j32:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J32 嵌套事务、分页工作集与真实 HBase
+    name: J32 · 嵌套事务、分页工作集与真实 HBase 验证
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
@@ -163,7 +164,7 @@ jobs:
   j33:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J33 删除对照、有界准备与故障恢复
+    name: J33 · 删除对照、有界准备与故障恢复验证
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
@@ -200,7 +201,7 @@ jobs:
   j34:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J34 Range 选项与原生协议对照
+    name: J34 · Range 选项与原生协议对照验证
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
@@ -237,7 +238,7 @@ jobs:
   j35:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J35 全局升降序与反向存储扫描
+    name: J35 · 全局升降序与反向存储扫描验证
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:

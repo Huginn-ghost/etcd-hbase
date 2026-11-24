@@ -1,4 +1,4 @@
-name: J23 commit publication and outcome resolution
+name: "J23 · 提交发布、未知结果与服务交接"
 
 on:
   push:
@@ -15,11 +15,12 @@ concurrency:
 
 jobs:
   maven-dependencies:
+    name: J23 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   publication:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J23 发布 CAS 与结果未知查询
+    name: J23 · 发布 CAS 与结果未知查询验证
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

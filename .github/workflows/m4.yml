@@ -1,4 +1,4 @@
-name: M4 Lease and Watch
+name: "M4 · Lease 生命周期与 Watch 流"
 on:
   push:
     branches: [main, 'codex/**']
@@ -11,11 +11,12 @@ concurrency:
   cancel-in-progress: true
 jobs:
   maven-dependencies:
+    name: M4 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   j40:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J40 Lease 管理与恢复
+    name: J40 · Lease 管理与故障恢复验证
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
@@ -53,7 +54,7 @@ jobs:
   j41:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J41 Lease 绑定与注册事务
+    name: J41 · Lease 绑定与注册事务验证
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -91,7 +92,7 @@ jobs:
   j42:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J42 KeepAlive 持久续约与跨副本接管
+    name: J42 · KeepAlive 持久续约与跨副本接管验证
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -129,7 +130,7 @@ jobs:
   j43:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J43 Lease 撤销与到期接管
+    name: J43 · Lease 撤销与到期接管验证
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -167,7 +168,7 @@ jobs:
   j44:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J44 已提交事件与共享 tailer
+    name: J44 · 已提交事件与共享 tailer 验证
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -205,7 +206,7 @@ jobs:
   j45:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J45 Watch 双向流与订阅生命周期
+    name: J45 · Watch 双向流与订阅生命周期验证
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
@@ -243,7 +244,7 @@ jobs:
   j46:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J46 Watch 回放、进度、fragment 与 Go client 互通
+    name: J46 · Watch 回放、进度、fragment 与 Go 客户端互通验证
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
@@ -281,7 +282,7 @@ jobs:
   j47:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: J47 流控、取消与资源排空
+    name: J47 · 流控、取消与资源排空验证
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:

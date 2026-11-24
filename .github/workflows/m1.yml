@@ -1,4 +1,4 @@
-name: M1 storage scan and resource contracts
+name: "M1 · 存储扫描与资源约束"
 on:
   push:
     branches: [main, 'codex/**']
@@ -11,11 +11,12 @@ concurrency:
   cancel-in-progress: true
 jobs:
   maven-dependencies:
+    name: M1 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   scan:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: M1 真实存储、扫描与资源契约
+    name: M1 · 真实存储扫描与资源契约验证
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:

@@ -1,4 +1,4 @@
-name: J11 physical HBase storage contracts
+name: "J11 · HBase 访问与历史原型契约"
 on:
   push:
     branches: [main, 'codex/**']
@@ -11,11 +11,12 @@ concurrency:
   cancel-in-progress: true
 jobs:
   maven-dependencies:
+    name: J11 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   storage:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: 真实 HBase 访问与历史原型
+    name: J11 · 真实 HBase 访问与历史原型契约验证
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:

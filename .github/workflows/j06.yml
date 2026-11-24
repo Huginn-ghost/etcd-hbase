@@ -1,4 +1,4 @@
-name: J06 runtime and request lifecycle
+name: "J06 · 服务配置、请求生命周期与 HBase"
 
 on:
   push:
@@ -18,11 +18,12 @@ concurrency:
 
 jobs:
   maven-dependencies:
+    name: J06 · Maven 公共依赖准备
     uses: ./.github/workflows/maven-dependencies.yml
   java-go-smoke:
     needs: maven-dependencies
     if: ${{ !cancelled() }}
-    name: 配置、请求生命周期与真实 HBase
+    name: J06 · 服务配置、请求生命周期与真实 HBase 验证
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
