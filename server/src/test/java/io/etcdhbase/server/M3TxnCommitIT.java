@@ -377,8 +377,10 @@ class M3TxnCommitIT {
             environment.primary(), environment.current(),
             new SnapshotPinConfiguration(2, 16, Duration.ofSeconds(60)), scope).join();
         long now = System.currentTimeMillis();
-        owner = new CommitOwnerService(stores.control()).claim("m3-txn-test-owner", now,
+        var claimed = new CommitOwnerService(stores.control()).claim("m3-txn-test-owner", now,
             now + Duration.ofHours(1).toMillis(), scope).join().orElseThrow();
+        owner = new io.etcdhbase.core.commit.AuthorizationBarrierUpgrade(stores.control())
+            .enable(claimed, now, scope).join();
       }
       invocations = new InvocationService(stores.invocations());
       preparation = new TxnCommitPreparation(new ResultPreparation(stores.resultRepository()),
@@ -490,7 +492,9 @@ class M3TxnCommitIT {
             new CommitPlanVerifier(stores.manifests(), stores.materialization(), stores.results()),
             stores.invocations(), handoff, finalizer);
         assertThrows(CompletionException.class,
-            () -> interruptedPublisher.publish(sealed.invocation(), owner, sealed.manifest(), scope).join());
+            () -> interruptedPublisher.publish(sealed.invocation(), owner, sealed.manifest(), scope,
+                CommitAuthorizationProofTestSupport.serviceProof(environment.identity(), AUTHORIZATION,
+                    control.authorizationBarrierGeneration())).join());
         assertEquals(2, interrupted.applied.get());
         var pending = stores.outcomes().resolve(sealed.invocation(), scope).join();
         assertEquals(CommitOutcomeResolver.State.SELECTED_PENDING, pending.state());

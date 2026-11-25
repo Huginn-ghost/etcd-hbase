@@ -181,6 +181,8 @@ class M3PutCommitIT {
         }
         var owner = new CommitOwnerService(stores.control()).claim("m3-test-owner", now,
             Math.addExact(now, ownerLease.toMillis()), scope).join().orElseThrow();
+        owner = new io.etcdhbase.core.commit.AuthorizationBarrierUpgrade(stores.control())
+            .enable(owner, now, scope).join();
         return new StoreOwner(stores, owner);
       }
     }
