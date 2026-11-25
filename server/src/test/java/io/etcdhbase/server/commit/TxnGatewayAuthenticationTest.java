@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -22,11 +23,20 @@ import io.etcdhbase.core.auth.AuthSessionException;
 import io.etcdhbase.core.auth.CredentialEnvelope;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.error.BackendFailure;
+import io.etcdhbase.core.commit.CommitControlStore;
+import io.etcdhbase.core.commit.CommitState;
+import io.etcdhbase.core.commit.ControlSnapshot;
+import io.etcdhbase.core.commit.InvocationResultResolver;
+import io.etcdhbase.core.commit.MutationForwardRequest;
+import io.etcdhbase.core.commit.OwnerForwarding;
+import io.etcdhbase.core.commit.ResultCatalog;
 import io.etcdhbase.core.kv.ResultNode;
+import io.etcdhbase.core.kv.ResultTree;
 import io.etcdhbase.core.kv.ResultTree;
 import io.etcdhbase.core.kv.TxnEvaluator;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.scan.BudgetManager;
+import io.etcdhbase.hbase.codec.ResultMessages;
 import io.etcdhbase.server.auth.AuthSessionService;
 import io.etcdhbase.server.observability.RequestMetrics;
 import io.etcdhbase.spi.identity.AuthenticationScope;
@@ -35,6 +45,7 @@ import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 import java.time.Duration;
+import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
@@ -51,6 +62,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class TxnGatewayAuthenticationTest {
+  private static final long REVISION = 2;
   private static final String TABLE_GROUP = "auth-group";
   private static final String TOKEN = "opaque-token-from-authenticate";
 
@@ -202,8 +214,8 @@ class TxnGatewayAuthenticationTest {
           AuthorizationScopeDigest.fromSessionRead(identity("milvus-user"), session()));
       assertFalse(retirement.isDone());
       fixture.worker.runNext();
-      assertEquals(Status.Code.PERMISSION_DENIED,
-          assertInstanceOf(StatusRuntimeException.class, fixture.failure.get()).getStatus().getCode());
+      var rejected = assertInstanceOf(StatusRuntimeException.class, fixture.failure.get());
+      assertEquals(Status.Code.PERMISSION_DENIED, rejected.getStatus().getCode());
     } finally {
       retirement.complete(null);
     }
@@ -253,7 +265,7 @@ class TxnGatewayAuthenticationTest {
       fixture.revalidation.complete(fixture.current);
       scope.cleanupCompletion().toCompletableFuture().get(1, TimeUnit.SECONDS);
       assertEquals(0, fixture.responses.get());
-      assertEquals(2, fixture.releases.get());
+      assertEquals(2, fixture.releases.get(), "releases");
     }
   }
 
@@ -303,6 +315,165 @@ class TxnGatewayAuthenticationTest {
     }
     assertEquals(2, seen.size());
     assertNotEquals(seen.get(0), seen.get(1), "cache proofs must not cross authorization generations");
+  }
+
+  @Test
+  void noChangeResolutionRevalidatesBeforeDeliveryAndDoesNotRetryTheTransaction() throws Exception {
+    var fixture = new NoChangeResolutionFixture();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      fixture.start(scope, false);
+      fixture.worker.runNext();
+      fixture.forwarded.complete(null);
+      fixture.worker.runNext();
+      assertEquals(1, fixture.forwards.get());
+      assertEquals(0, fixture.responses.get());
+
+      fixture.revalidation.completeExceptionally(
+          new AuthSessionException(AuthSessionException.Reason.PERMISSION_DENIED));
+
+      assertEquals(1, fixture.forwards.get(), "a resolved durable result is never replayed or recomputed");
+      assertEquals(0, fixture.responses.get());
+      assertEquals(Status.Code.PERMISSION_DENIED,
+          assertInstanceOf(StatusRuntimeException.class, fixture.failure.get()).getStatus().getCode());
+      assertTrue(fixture.closed.get(), "rejected delivery releases the retained durable result");
+      scope.cancel();
+      scope.cleanupCompletion().toCompletableFuture().get(1, TimeUnit.SECONDS);
+      assertEquals(1, fixture.releases.get(),
+          "a rejected recheck releases only the request identity");
+    }
+  }
+
+  @Test
+  void unchangedMutationResultStillDeliversAfterRevalidation() throws Exception {
+    var fixture = new NoChangeResolutionFixture();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      fixture.start(scope, false);
+      fixture.worker.runNext();
+      fixture.forwarded.complete(null);
+      fixture.worker.runNext();
+      assertEquals(1, fixture.forwards.get());
+      assertEquals(0, fixture.responses.get());
+
+      fixture.revalidation.complete(fixture.current);
+
+      assertEquals(1, fixture.forwards.get());
+      assertEquals(1, fixture.responses.get(), String.valueOf(fixture.failure.get()));
+      assertTrue(fixture.completed.get());
+      assertNull(fixture.failure.get());
+      assertTrue(fixture.closed.get());
+      scope.cancel();
+      scope.cleanupCompletion().toCompletableFuture().get(1, TimeUnit.SECONDS);
+      assertEquals(2, fixture.releases.get(),
+          "the request identity and the identity resolved by the recheck both release after drain");
+    }
+  }
+
+  @Test
+  void changedTransactionResultKeepsItsDecidedAuthorizationWithoutRecheck() {
+    var fixture = new NoChangeResolutionFixture();
+    try (RequestScope scope = RequestScope.withTimeout(Duration.ofSeconds(5))) {
+      fixture.start(scope, true, true);
+      fixture.worker.runNext();
+      fixture.forwarded.complete(null);
+      fixture.worker.runNext();
+      assertEquals(1, fixture.responses.get(), String.valueOf(fixture.failure.get()));
+      assertEquals(0, fixture.revalidations.get());
+      assertTrue(fixture.closed.get());
+    }
+  }
+
+  private static final class NoChangeResolutionFixture {
+    private final QueueExecutor worker = new QueueExecutor();
+    private final AuthSessionService sessions = mock(AuthSessionService.class);
+    private final AuthSessionService.ResolvedIdentity original = mock(AuthSessionService.ResolvedIdentity.class);
+    private final AuthSessionService.ResolvedIdentity current = mock(AuthSessionService.ResolvedIdentity.class);
+    private final InvocationResultResolver resolver = mock(InvocationResultResolver.class);
+    private final CompletableFuture<AuthSessionService.ResolvedIdentity> revalidation = new CompletableFuture<>();
+    private final CompletableFuture<Void> forwarded = new CompletableFuture<>();
+    private final AtomicInteger forwards = new AtomicInteger();
+    private final AtomicInteger revalidations = new AtomicInteger();
+    private final AtomicInteger releases = new AtomicInteger();
+    private final AtomicInteger responses = new AtomicInteger();
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean completed = new AtomicBoolean();
+    private final AtomicReference<Throwable> failure = new AtomicReference<>();
+
+    private void start(RequestScope scope, boolean changed) {
+      start(scope, true, changed);
+    }
+
+    private void start(RequestScope scope, boolean revalidate, boolean changed) {
+      var user = identity("milvus-user");
+      for (var resolved : List.of(original, current)) {
+        when(resolved.identity()).thenReturn(user);
+        when(resolved.session()).thenReturn(session());
+        when(resolved.release()).thenAnswer(ignored -> {
+          releases.incrementAndGet();
+          return CompletableFuture.completedFuture(null);
+        });
+      }
+      when(sessions.resolve(eq(TOKEN), any(RequestScope.class)))
+          .thenReturn(CompletableFuture.completedFuture(original));
+      when(sessions.resolveByDigest(any(), any(RequestScope.class))).thenAnswer(ignored -> {
+        revalidations.incrementAndGet();
+        return revalidation;
+      });
+      var state = CommitState.restore(ByteKey.copyOf(new byte[32]), Optional.of("owner"), 3,
+          Long.MAX_VALUE, 2, 2, 2, 2, 2, Optional.empty(), 0);
+      var control = mock(CommitControlStore.class);
+      when(control.read(any(RequestScope.class)))
+          .thenReturn(CompletableFuture.completedFuture(Optional.of(new ControlSnapshot(state, new byte[] {1}))));
+      MutationOwnerLane lane = mock(MutationOwnerLane.class);
+      when(lane.receive(any(), any(), any(RequestScope.class))).thenAnswer(call -> {
+        forwards.incrementAndGet();
+        byte[] invocation = ((MutationForwardRequest) call.getArgument(1)).invocationId().bytes();
+        return forwarded.thenApply(ignored -> new OwnerForwarding.Completed(invocation));
+      });
+      var relay = new MutationRelay(control,
+          (group, instance, epoch) -> CompletableFuture.completedFuture(
+              new OwnerForwarding.Route("owner", 3, "fixture", "fixture-peer")),
+          (selected, request, requestScope) -> lane.receive("fixture-peer", request, requestScope));
+      var encoded = ResultMessages.encode(transactionResult(changed));
+      var payload = mock(ResultCatalog.RetainedResult.class);
+      when(payload.belongsTo(scope)).thenReturn(true);
+      when(payload.retainForConsumer(any())).thenReturn(true);
+      when(payload.buffer()).thenReturn(ByteBuffer.wrap(encoded));
+      doAnswer(ignored -> {
+        closed.set(true);
+        return null;
+      }).when(payload).close();
+      when(resolver.resolveTransaction(any(), any(), any(), any(), any())).thenAnswer(ignored ->
+          CompletableFuture.completedFuture(
+              new InvocationResultResolver.ResolvedTransaction(REVISION, changed, payload)));
+      var gateway = new TxnGateway(TABLE_GROUP, identity("service-user"), ByteKey.copyOf(new byte[32]),
+          1, 1, 1 << 20, control, relay, resolver, mock(TxnReadExecutor.class),
+          budgets(), new BudgetManager.Reservation(1L << 16, 1L << 16, 1L << 16, 1L << 18, 1L << 16),
+          worker, new RequestMetrics(), sessions);
+      var key = ByteString.copyFromUtf8("key");
+      var put = Rpc.RequestOp.newBuilder().setRequestPut(Rpc.PutRequest.newBuilder()
+          .setKey(key).setValue(ByteString.copyFromUtf8("v"))).build();
+      var range = Rpc.RequestOp.newBuilder().setRequestRange(Rpc.RangeRequest.newBuilder()
+          .setKey(key)).build();
+      var absent = Rpc.Compare.newBuilder().setKey(key).setTarget(Rpc.Compare.CompareTarget.VERSION)
+          .setResult(Rpc.Compare.CompareResult.EQUAL).setVersion(0).build();
+      Rpc.TxnRequest request = changed
+          ? Rpc.TxnRequest.newBuilder().addSuccess(put).build()
+          : Rpc.TxnRequest.newBuilder().addCompare(absent).addSuccess(put).addFailure(range).build();
+      gateway.accept(request, Optional.of(TOKEN), scope, new StreamObserver<>() {
+        @Override public void onNext(Rpc.TxnResponse response) { responses.incrementAndGet(); }
+        @Override public void onError(Throwable problem) { failure.set(problem); }
+        @Override public void onCompleted() { completed.set(true); }
+      });
+    }
+  }
+
+  private static ResultTree transactionResult(boolean changed) {
+    var header = new ResultNode.Header(true, REVISION);
+    var key = ByteKey.copyOf("key".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    ResultNode child = changed
+        ? new ResultNode.Put(0, header, key, Optional.empty())
+        : new ResultNode.Range(0, header, List.of(), 0, false);
+    return new ResultTree(new ResultNode.Txn(0, header, changed, List.of(child)));
   }
 
   private static final class ReadDeliveryFixture {

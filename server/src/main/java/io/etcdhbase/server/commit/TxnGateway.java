@@ -241,11 +241,14 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
               state.ownerEpoch(), remaining, 0, operation);
           return relay.forward(envelope, scope).thenCompose(reply -> resolveReply(reply, invocation,
               digest, requestIdentity.authorizationDigest(), scope, account));
-        });
+        }).thenApply(resolved -> new AuthorizedResolution(resolved, requestIdentity));
       }).whenComplete((resolved, failure) -> dispatchResponse(observer, scope, terminal, gatewayDrained,
-          resolved, failure, true, null, value -> TxnResponseEmitter.sendResolved(command, value,
+          resolved, failure, true, value -> value.resolution().changed()
+              ? CompletableFuture.completedFuture(null)
+              : requestIdentities.revalidate(value.identity(), scope),
+          value -> TxnResponseEmitter.sendResolved(command, value.resolution(),
               ResultMessages::decodeTree, clusterId, memberId, scope, account, countOutput(observer, delete == null)),
-          value -> { if (value != null) value.close(); }));
+          value -> { if (value != null) value.resolution().close(); }));
     } catch (RuntimeException failure) {
       gatewayDrained.complete(null);
       signalError(scope, observer, terminal, failure);
@@ -257,6 +260,10 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
   }
 
   private record AuthorizedRead(TxnEvaluator.ValidatedRead read,
+      AuthenticatedRequestIdentityResolver.ResolvedRequestIdentity identity) {}
+
+  /** A durable decision keeps the identity that authorized it so a no-change read result is rechecked. */
+  private record AuthorizedResolution(InvocationResultResolver.ResolvedTransaction resolution,
       AuthenticatedRequestIdentityResolver.ResolvedRequestIdentity identity) {}
 
   private CompletableFuture<InvocationResultResolver.ResolvedTransaction> resolveReply(
@@ -386,8 +393,10 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
       AtomicBoolean terminal, CompletableFuture<Void> responseDrained, T value, Throwable failure,
       boolean recordTxnMetrics, Consumer<T> send, Consumer<T> discard) {
     try {
-      if (failure != null) signalCompletionError(observer, terminal, failure);
-      else if (terminal.compareAndSet(false, true)) {
+      if (failure != null) {
+        try { signalCompletionError(observer, terminal, failure); }
+        finally { discard.accept(value); }
+      } else if (terminal.compareAndSet(false, true)) {
         long started = System.nanoTime();
         try { send.accept(value); }
         finally { if (recordTxnMetrics) metrics.recordTxnStage(RequestMetrics.TxnStage.RESPONSE, Math.max(0, System.nanoTime() - started)); }
