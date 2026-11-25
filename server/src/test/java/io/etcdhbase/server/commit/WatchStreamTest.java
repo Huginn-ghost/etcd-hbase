@@ -44,8 +44,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
 
 class WatchStreamTest {
   private static final long CLUSTER_ID = 11;
@@ -140,9 +138,17 @@ class WatchStreamTest {
     }
   }
 
-  @ParameterizedTest
-  @ValueSource(booleans = {false, true})
-  void authorizationCompletedWhileTransportIsBlockedMustBeRecheckedAtReadiness(
+  @Test
+  void authorizationCompletedWhileTransportStillBlockedMustBeRecheckedAtReadiness() {
+    assertAuthorizationRecheckedAtReadiness(false);
+  }
+
+  @Test
+  void authorizationCompletedBeforeTransportResumedMustBeRecheckedAtReadiness() {
+    assertAuthorizationRecheckedAtReadiness(true);
+  }
+
+  private static void assertAuthorizationRecheckedAtReadiness(
       boolean readyBeforeAuthorizationCompletes) {
     var subscription = new RecordingSubscription();
     var session = new RecordingSession(4, subscription);

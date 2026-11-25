@@ -23,98 +23,56 @@
   ],
   "tests": [
     {
-      "module": "server", "kind": "surefire",
-      "class": "io.etcdhbase.server.AuthRegistryAdminCommandTest",
-      "methods": ["commandPersistsInventoryAndWorkersRecoverAnUnknownUpdateBeforeStatusChanges",
-        "productionLeaseRequiresVersionedSecureIdentityAndIsolatedRecovery",
-        "disabledGroupCanRecoverLaterConfigurationUpdates",
-        "timedOutWriteKeepsControlResourcesUntilItsPhysicalProducerDrains",
-        "inventoryRejectsDifferentControlBindingsAndDuplicateGroupsBeforeBackendAccess"]
-    },
-    {
-      "module": "server", "kind": "surefire",
-      "class": "io.etcdhbase.server.AuthRegistryInventoryTest",
-      "methods": ["inventoryUsesTheRuntimeDatasetAndConfigurationBindings"]
-    },
-    {
-      "module": "core", "kind": "surefire",
-      "class": "io.etcdhbase.core.auth.AuthDeploymentRegistryAdminTest",
-      "methods": ["explicitInitializationAndUpdateUseFullInventoryAndRejectInFlightRevocation",
-        "reserveDoesNotPublishTheReplacementOrPermitAnotherOperation"]
-    },
-    {
-      "module": "core", "kind": "surefire",
+      "module": "core",
+      "kind": "surefire",
       "class": "io.etcdhbase.core.auth.AuthConfigurationUpdateExecutorTest",
-      "methods": ["workersResumePartialFailureAndSwitchOnlyAfterAllOldGroupsAreFenced"]
+      "methods": [
+        "workersResumePartialFailureAndSwitchOnlyAfterAllOldGroupsAreFenced"
+      ]
     },
     {
-      "module": "core", "kind": "surefire",
+      "module": "core",
+      "kind": "surefire",
+      "class": "io.etcdhbase.core.auth.AuthDeploymentRegistryAdminTest",
+      "methods": [
+        "explicitInitializationAndUpdateUseFullInventoryAndRejectInFlightRevocation",
+        "reserveDoesNotPublishTheReplacementOrPermitAnotherOperation"
+      ]
+    },
+    {
+      "module": "core",
+      "kind": "surefire",
       "class": "io.etcdhbase.core.auth.AuthDeploymentRegistryTest",
-      "methods": ["configurationReservationExcludesRevocationAndRequiresEveryBarrierBeforeSwitch"]
+      "methods": [
+        "configurationReservationExcludesRevocationAndRequiresEveryBarrierBeforeSwitch"
+      ]
     },
     {
-      "module": "hbase", "kind": "surefire",
-      "class": "io.etcdhbase.hbase.codec.AuthDeploymentRegistryMessagesTest",
-      "methods": ["preservesPartiallyInstalledConfigurationUpdate"]
-    },
-    {
-      "module": "core", "kind": "surefire",
-      "class": "io.etcdhbase.core.auth.RegistryRevocationStoreTest",
-      "methods": ["reservationAndConfigurationUpdateCompeteOnTheSameRow",
-        "staleReservationRetriesAfterAnotherOperationOrConfigurationUpdate"]
-    },
-    {
-      "module": "core", "kind": "surefire",
-      "class": "io.etcdhbase.core.auth.RegistryAuthConfigurationStoreTest",
-      "methods": ["projectsDeploymentGenerationFromTheRegistry"]
-    },
-    {
-      "module": "core", "kind": "surefire",
+      "module": "core",
+      "kind": "surefire",
       "class": "io.etcdhbase.core.auth.AuthorizationRevocationExecutorTest",
-      "methods": ["partialFailureKeepsTheSnapshotAndRestartResumesTheSameBarriers",
+      "methods": [
+        "partialFailureKeepsTheSnapshotAndRestartResumesTheSameBarriers",
         "unknownCasOutcomeIsRecoveredFromTheSameDurableOperation",
-        "workersForDifferentGroupsCooperateWithoutReleasingBeforeAllBarriers"]
+        "workersForDifferentGroupsCooperateWithoutReleasingBeforeAllBarriers"
+      ]
     },
     {
-      "module": "hbase", "kind": "surefire",
-      "class": "io.etcdhbase.hbase.storage.HBaseAuthDeploymentRegistryStoreTest",
-      "methods": ["usesStrongReadsAndExactDurableCasAndRejectsInvalidTransitions"]
+      "module": "core",
+      "kind": "surefire",
+      "class": "io.etcdhbase.core.auth.RegistryAuthConfigurationStoreTest",
+      "methods": [
+        "projectsDeploymentGenerationFromTheRegistry"
+      ]
     },
     {
-      "module": "server", "kind": "surefire",
-      "class": "io.etcdhbase.server.auth.TargetAuthorizationBarriersTest",
-      "methods": ["partialFailureAndRestartFenceAndReleaseEveryRegisteredGroup"]
-    },
-    {
-      "module": "server", "kind": "surefire",
-      "class": "io.etcdhbase.server.auth.DeploymentAuthorizationAdmissionTest",
-      "methods": ["blocksOnlyAffectedSubjectsAndRejectsStaleIncarnations",
-        "rejectsAllSubjectsWhileConfigurationBarriersAreInstalling"]
-    },
-    {
-      "module": "server", "kind": "surefire",
-      "class": "io.etcdhbase.server.auth.AuthorizationRevocationSnapshotTest",
-      "methods": ["snapshotsAllAndOnlyRegisteredFamilyScopesWithTheirIncarnations"]
-    },
-    {
-      "module": "server", "kind": "surefire",
-      "class": "io.etcdhbase.server.auth.VersionedHBaseAuthenticatorTest",
-      "methods": ["configuredCredentialIsBoundToItsVersionAndDelegatesCleanup",
-        "oldSecretCannotBePromotedToTheNewGeneration",
-        "unconfiguredOrMissingVersionDoesNotBecomeAClaimedGeneration",
-        "mismatchedBackendUserIsClosedWithoutAttestingAVersion"]
-    },
-    {
-      "module": "server", "kind": "surefire",
-      "class": "io.etcdhbase.server.M3RuntimeGroupsTest",
-      "methods": ["secureGroupWaitsForRecoveryAndDrainsItsProducerBeforeClosing"]
-    },
-    {
-      "module": "server", "kind": "surefire",
-      "class": "io.etcdhbase.server.auth.AuthDeploymentRecoveryWorkerTest",
-      "methods": ["retriesARecoveredOperationAfterFailure",
-        "stopCancelsTheScopeAndWaitsForThePhysicalProducer",
-        "cleanupFailureStopsRecoveryAndIsReportedToTheOwner"]
+      "module": "core",
+      "kind": "surefire",
+      "class": "io.etcdhbase.core.auth.RegistryRevocationStoreTest",
+      "methods": [
+        "reservationAndConfigurationUpdateCompeteOnTheSameRow",
+        "staleReservationRetriesAfterAnotherOperationOrConfigurationUpdate"
+      ]
     },
     {
       "module": "core",
@@ -158,11 +116,74 @@
     {
       "module": "hbase",
       "kind": "surefire",
+      "class": "io.etcdhbase.hbase.codec.AuthDeploymentRegistryMessagesTest",
+      "methods": [
+        "preservesPartiallyInstalledConfigurationUpdate"
+      ]
+    },
+    {
+      "module": "hbase",
+      "kind": "surefire",
       "class": "io.etcdhbase.hbase.identity.HBaseBackendIdentityProviderTest",
       "methods": [
         "retirementStopsNewBorrowsAndWaitsForExistingBorrowToDrain",
         "identityCleanupFailureKeepsCapacityAndCanBeRetried",
         "accessRecheckUsesTheRealConnectionAndRetiresOnPermissionLoss"
+      ]
+    },
+    {
+      "module": "hbase",
+      "kind": "surefire",
+      "class": "io.etcdhbase.hbase.storage.HBaseAuthDeploymentRegistryStoreTest",
+      "methods": [
+        "usesStrongReadsAndExactDurableCasAndRejectsInvalidTransitions"
+      ]
+    },
+    {
+      "module": "server",
+      "kind": "surefire",
+      "class": "io.etcdhbase.server.AuthManagementWireTest",
+      "methods": [
+        "configuredAuthServiceRejectsEveryUnsupportedManagementMethodOverWire",
+        "authStatusReturnsThePersistedBridgeRevisionAndUnavailableWhenMissing"
+      ]
+    },
+    {
+      "module": "server",
+      "kind": "surefire",
+      "class": "io.etcdhbase.server.AuthRegistryAdminCommandTest",
+      "methods": [
+        "commandPersistsInventoryAndWorkersRecoverAnUnknownUpdateBeforeStatusChanges",
+        "productionLeaseRequiresVersionedSecureIdentityAndIsolatedRecovery",
+        "disabledGroupCanRecoverLaterConfigurationUpdates",
+        "timedOutWriteKeepsControlResourcesUntilItsPhysicalProducerDrains",
+        "inventoryRejectsDifferentControlBindingsAndDuplicateGroupsBeforeBackendAccess"
+      ]
+    },
+    {
+      "module": "server",
+      "kind": "surefire",
+      "class": "io.etcdhbase.server.AuthRegistryInventoryTest",
+      "methods": [
+        "inventoryUsesTheRuntimeDatasetAndConfigurationBindings"
+      ]
+    },
+    {
+      "module": "server",
+      "kind": "surefire",
+      "class": "io.etcdhbase.server.M3RuntimeGroupsTest",
+      "methods": [
+        "secureGroupWaitsForRecoveryAndDrainsItsProducerBeforeClosing"
+      ]
+    },
+    {
+      "module": "server",
+      "kind": "surefire",
+      "class": "io.etcdhbase.server.auth.AuthDeploymentRecoveryWorkerTest",
+      "methods": [
+        "retriesARecoveredOperationAfterFailure",
+        "stopCancelsTheScopeAndWaitsForThePhysicalProducer",
+        "cleanupFailureStopsRecoveryAndIsReportedToTheOwner"
       ]
     },
     {
@@ -187,6 +208,23 @@
     {
       "module": "server",
       "kind": "surefire",
+      "class": "io.etcdhbase.server.auth.AuthorizationRevocationSnapshotTest",
+      "methods": [
+        "snapshotsAllAndOnlyRegisteredFamilyScopesWithTheirIncarnations"
+      ]
+    },
+    {
+      "module": "server",
+      "kind": "surefire",
+      "class": "io.etcdhbase.server.auth.DeploymentAuthorizationAdmissionTest",
+      "methods": [
+        "blocksOnlyAffectedSubjectsAndRejectsStaleIncarnations",
+        "rejectsAllSubjectsWhileConfigurationBarriersAreInstalling"
+      ]
+    },
+    {
+      "module": "server",
+      "kind": "surefire",
       "class": "io.etcdhbase.server.auth.ProviderSessionIdentityManagerTest",
       "methods": [
         "explicitRetirementStopsNewBorrowsAndWaitsForExistingOnes",
@@ -196,10 +234,31 @@
     {
       "module": "server",
       "kind": "surefire",
-      "class": "io.etcdhbase.server.commit.SessionAuthorizationResolverTest",
+      "class": "io.etcdhbase.server.auth.TargetAuthorizationBarriersTest",
       "methods": [
-        "userSessionCannotAuthorizeInternalLeaseExpiryStep",
-        "ownerRetiresCapturedIdentityWhenPublicationRecheckFindsRevokedSession"
+        "partialFailureAndRestartFenceAndReleaseEveryRegisteredGroup"
+      ]
+    },
+    {
+      "module": "server",
+      "kind": "surefire",
+      "class": "io.etcdhbase.server.auth.VersionedHBaseAuthenticatorTest",
+      "methods": [
+        "configuredCredentialIsBoundToItsVersionAndDelegatesCleanup",
+        "oldSecretCannotBePromotedToTheNewGeneration",
+        "unconfiguredOrMissingVersionDoesNotBecomeAClaimedGeneration",
+        "mismatchedBackendUserIsClosedWithoutAttestingAVersion"
+      ]
+    },
+    {
+      "module": "server",
+      "kind": "surefire",
+      "class": "io.etcdhbase.server.commit.LeaseKeepAliveStreamTest",
+      "methods": [
+        "rejectsZeroTtlWhenIdentityRevalidationFails",
+        "discardsValidationThatSpansAnOutboundNotReadyTransition",
+        "successfulAuthorizationHandsOffWriterWithoutRequeueingResponse",
+        "timeoutDuringAuthorizationTerminatesWithoutFakingProducerDrain"
       ]
     },
     {
@@ -214,19 +273,34 @@
     {
       "module": "server",
       "kind": "surefire",
-      "class": "io.etcdhbase.server.commit.TxnGatewayAuthenticationTest",
+      "class": "io.etcdhbase.server.commit.OutboundAuthorizationHandoffTest",
       "methods": [
-        "queuedReadsOnBothGatewaysRejectSharedSessionRevocation",
-        "queuedReadRevalidatesBeforeDeliveryAndRejectsRevokedSession"
+        "synchronousCompletionKeepsTheCurrentWriterAndIgnoresDuplicateCompletion",
+        "asynchronousCompletionOwnsTheWriterExactlyOnce",
+        "completionOnAnotherThreadBeforeHandoffStillUsesTheCurrentWriter",
+        "startFailureDoesNotTransferOrResumeTheWriter",
+        "asynchronousValidationFailureStillResumesTheOwnerForTerminalCleanup"
       ]
     },
     {
       "module": "server",
       "kind": "surefire",
-      "class": "io.etcdhbase.server.commit.LeaseKeepAliveStreamTest",
+      "class": "io.etcdhbase.server.commit.SessionAuthorizationResolverTest",
       "methods": [
-        "rejectsZeroTtlWhenIdentityRevalidationFails",
-        "discardsValidationThatSpansAnOutboundNotReadyTransition"
+        "userSessionCannotAuthorizeInternalLeaseExpiryStep",
+        "ownerRetiresCapturedIdentityWhenPublicationRecheckFindsRevokedSession"
+      ]
+    },
+    {
+      "module": "server",
+      "kind": "surefire",
+      "class": "io.etcdhbase.server.commit.TxnGatewayAuthenticationTest",
+      "methods": [
+        "queuedReadsOnBothGatewaysRejectSharedSessionRevocation",
+        "queuedReadRevalidatesBeforeDeliveryAndRejectsRevokedSession",
+        "noChangeResolutionRevalidatesBeforeDeliveryAndDoesNotRetryTheTransaction",
+        "unchangedMutationResultStillDeliversAfterRevalidation",
+        "changedTransactionResultKeepsItsDecidedAuthorizationWithoutRecheck"
       ]
     },
     {
@@ -240,10 +314,11 @@
     {
       "module": "server",
       "kind": "surefire",
-      "class": "io.etcdhbase.server.AuthManagementWireTest",
+      "class": "io.etcdhbase.server.commit.WatchStreamTest",
       "methods": [
-        "configuredAuthServiceRejectsEveryUnsupportedManagementMethodOverWire",
-        "authStatusReturnsThePersistedBridgeRevisionAndUnavailableWhenMissing"
+        "successfulAuthorizationHandsOffWriterWithoutRequeueingEvent",
+        "authorizationCompletedWhileTransportStillBlockedMustBeRecheckedAtReadiness",
+        "authorizationCompletedBeforeTransportResumedMustBeRecheckedAtReadiness"
       ]
     }
   ]
