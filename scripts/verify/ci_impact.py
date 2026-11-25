@@ -16,11 +16,11 @@ from typing import Iterable
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_GROUPS = (
     "j03", "j04", "j05", "j06", "j07", "j08", "j09", "j10", "j11",
-    "j23", "j24", "j36-proof", "m1", "m3", "m4",
+    "j23", "j24", "j36-proof", "m1", "m3", "m4", "m5",
 )
 MAVEN_GROUPS = frozenset(WORKFLOW_GROUPS) - {"j09"}
-PROTOCOL_DEPENDENT_GROUPS = frozenset({"j03", "j04", "j06", "j07", "j23", "j24", "m3", "m4"})
-GO_JAVA_INTEROP_GROUPS = frozenset({"j03", "j06", "j07", "m3", "m4"})
+PROTOCOL_DEPENDENT_GROUPS = frozenset({"j03", "j04", "j06", "j07", "j23", "j24", "m3", "m4", "m5"})
+GO_JAVA_INTEROP_GROUPS = frozenset({"j03", "j06", "j07", "m3", "m4", "m5"})
 FULL_PATH_PREFIXES = (
     ".github/workflows/", ".github/actions/", ".mvn/", "build/", "scripts/",
     "hbase/", "spi/",
@@ -75,9 +75,9 @@ def _groups_for_path(path: str) -> frozenset[str] | None:
         if any(f"{core_prefix}{package}/" in f"/{path}" for package in ("lease", "watch")):
             return frozenset({"m4"})
         if f"{core_prefix}request/" in f"/{path}":
-            return frozenset({"j06", "m4"})
+            return frozenset({"j06", "m4", "m5"})
         if f"{core_prefix}scan/" in f"/{path}":
-            return frozenset({"j10", "j11", "m1", "m3", "m4"})
+            return frozenset({"j10", "j11", "m1", "m3", "m4", "m5"})
 
     if path.startswith((
         "testkit/go/internal/client/",

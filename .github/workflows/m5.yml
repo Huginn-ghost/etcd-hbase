@@ -1,0 +1,91 @@
+name: M5 authentication, GC and lifecycle
+on:
+  workflow_call:
+    inputs:
+      maven_preparation_result:
+        description: Result of the shared Maven preparation job.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+concurrency:
+  group: m5-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  j50:
+    if: ${{ !cancelled() }}
+    name: J50 认证会话与跨副本身份
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: 确认 Maven 依赖准备成功
+        env:
+          PREPARATION_RESULT: ${{ inputs.maven_preparation_result }}
+        run: test "$PREPARATION_RESULT" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore the locked Temurin JDK archive
+        id: jdk-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          key: locked-jdk21-${{ runner.os }}-${{ hashFiles('build/dependency-lock.json') }}
+      - name: 下载锁定的 Java 21
+        if: steps.jdk-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/dev/download-locked-jdk.py --output "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - name: Verify the locked Temurin JDK archive checksum
+        run: python3 scripts/dev/download-locked-jdk.py --verify "$RUNNER_TEMP/locked-temurin-jdk.tar.gz"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: jdkfile
+          java-version: '21'
+          jdk-file: ${{ runner.temp }}/locked-temurin-jdk.tar.gz
+          cache: maven
+          cache-read-only: true
+          cache-dependency-path: |
+            **/pom.xml
+            .mvn/maven.config
+            .mvn/wrapper/maven-wrapper.properties
+            build/dependency-lock.json
+            build/maven-settings-public.xml
+            scripts/dev/mvn21.sh
+            scripts/dev/maven-repository.sh
+            scripts/dev/prepare-maven-dependencies.py
+            .github/workflows/maven-dependencies.yml
+      - name: 验证 J50
+        env:
+          ETCD_HBASE_JDK21_HOME: ${{ env.JAVA_HOME }}
+        run: scripts/verify/m5.sh --scope public --task J50 --artifact-root ".artifacts/m5/ci-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: 保存当前运行报告
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: m5-j50-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/m5/ci-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 14
+  summary:
+    name: M5 required
+    needs:
+      - j50
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 检查 J50 已执行并成功
+        env:
+          J50_RESULT: ${{ needs.j50.result }}
+        run: |
+          set -u
+          failed=0
+          for check in "j50=$J50_RESULT"
+          do
+            IFS='=' read -r check_id result <<< "$check"
+            printf '%s: %s\n' "$check_id" "$result"
+            if [[ "$result" != success ]]; then
+              failed=1
+            fi
+          done
+          exit "$failed"
