@@ -13,9 +13,9 @@ import org.junit.jupiter.api.Test;
 
 class AuthControlKeyCodecTest {
   private static final int SALT_WIDTH_BYTES = 2;
-  private static final AuthControlKeyCodec CODEC = new AuthControlKeyCodec(
-      new HashSaltStrategy(new SaltProfile(HashSaltStrategy.STRATEGY_ID, 1, 8,
-          SALT_WIDTH_BYTES)));
+  private static final HashSaltStrategy SALT = new HashSaltStrategy(
+      new SaltProfile(HashSaltStrategy.STRATEGY_ID, 1, 8, SALT_WIDTH_BYTES));
+  private static final AuthControlKeyCodec CODEC = new AuthControlKeyCodec(SALT);
 
   @Test
   void configurationAddressesSeparateDomainsAndGroups() {
@@ -48,35 +48,21 @@ class AuthControlKeyCodecTest {
   }
 
   @Test
-  void deploymentNamespacesRoundTripWithoutCollidingWithExistingRecords() {
-    ByteKey identity = bytes(32, 0x5a);
-    byte[] binding = CODEC.deploymentBindingV1(identity);
-    byte[] operation = CODEC.deploymentRevocationV1(identity);
-    assertEquals(new AuthControlKeyCodec.DecodedKey(
-        AuthControlKeyCodec.Kind.DEPLOYMENT_BINDING_V1, identity), CODEC.decode(binding));
-    assertEquals(new AuthControlKeyCodec.DecodedKey(
-        AuthControlKeyCodec.Kind.DEPLOYMENT_REVOCATION_V1, identity), CODEC.decode(operation));
-    assertNotEquals(ByteKey.copyOf(binding), ByteKey.copyOf(operation));
-    assertNotEquals(ByteKey.copyOf(binding), ByteKey.copyOf(CODEC.session(identity)));
-    assertNotEquals(ByteKey.copyOf(binding), ByteKey.copyOf(CODEC.authority(identity)));
-    assertNotEquals(ByteKey.copyOf(operation), ByteKey.copyOf(CODEC.session(identity)));
-    assertNotEquals(ByteKey.copyOf(operation), ByteKey.copyOf(CODEC.authority(identity)));
-    assertThrows(IllegalArgumentException.class, () -> CODEC.deploymentBindingV1(bytes(31, 1)));
-    assertThrows(IllegalArgumentException.class, () -> CODEC.deploymentRevocationV1(bytes(33, 1)));
-  }
-
-  @Test
-  void deploymentQualifiersSeparateIndividualBindingsAndOperations() {
-    ByteKey first = bytes(32, 1);
-    ByteKey second = bytes(32, 2);
-    byte[] firstBinding = CODEC.deploymentBindingQualifierV1(first);
-    assertArrayEquals(firstBinding, CODEC.deploymentBindingQualifierV1(first));
-    assertNotEquals(ByteKey.copyOf(firstBinding),
-        ByteKey.copyOf(CODEC.deploymentBindingQualifierV1(second)));
-    assertNotEquals(ByteKey.copyOf(firstBinding),
-        ByteKey.copyOf(CODEC.deploymentRevocationQualifierV1(first)));
-    assertThrows(IllegalArgumentException.class,
-        () -> CODEC.deploymentBindingQualifierV1(bytes(31, 1)));
+  void deploymentRegistryKeysSeparateTrustDomainsWithoutReusingRemovedNamespaces() {
+    byte[] registry = CODEC.deploymentRegistry("trust");
+    assertArrayEquals(registry, CODEC.deploymentRegistry("trust"));
+    assertEquals(AuthControlKeyCodec.Kind.AUTH_DEPLOYMENT_REGISTRY, CODEC.decode(registry).kind());
+    assertEquals(8, CODEC.decode(registry).kind().id());
+    assertNotEquals(ByteKey.copyOf(registry), ByteKey.copyOf(CODEC.deploymentRegistry("other")));
+    assertThrows(IllegalArgumentException.class, () -> CODEC.deploymentRegistry(""));
+    for (int removedKind : new int[] {4, 5}) {
+      byte[] unsupported = registry.clone();
+      unsupported[SALT_WIDTH_BYTES] = (byte) removedKind;
+      byte[] identifier = java.util.Arrays.copyOfRange(
+          unsupported, SALT_WIDTH_BYTES, unsupported.length);
+      System.arraycopy(SALT.salt(identifier), 0, unsupported, 0, SALT_WIDTH_BYTES);
+      assertThrows(IllegalArgumentException.class, () -> CODEC.decode(unsupported));
+    }
   }
 
   @Test

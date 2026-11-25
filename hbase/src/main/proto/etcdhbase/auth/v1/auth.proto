@@ -160,23 +160,3 @@ message AuthDeploymentRegistryEnvelope {
   optional bytes content = 1;
   optional bytes sha256 = 2;
 }
-
-// Deployment payloads are owned and validated by the consuming domain.
-message DeploymentControlContent {
-  optional uint32 format_version = 1;
-  optional uint32 kind = 2;
-  optional string trust_domain = 3;
-  optional string table_group = 4;
-  optional bytes dataset_digest = 5;
-  optional fixed64 member_id = 6;
-  optional string incarnation = 7;
-  optional int64 revision = 8;
-  optional uint32 state = 9;
-  optional bytes operation_id = 10;
-  optional bytes payload = 11;
-}
-
-message DeploymentControlEnvelope {
-  optional bytes content = 1;
-  optional bytes sha256 = 2;
-}

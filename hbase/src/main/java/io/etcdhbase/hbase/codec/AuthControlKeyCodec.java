@@ -16,8 +16,6 @@ public final class AuthControlKeyCodec {
     SESSION(1, 32),
     SUBJECT_AUTHORITY(2, 32),
     SLOT(3, Integer.BYTES),
-    DEPLOYMENT_BINDING_V1(4, 32),
-    DEPLOYMENT_REVOCATION_V1(5, 32),
     AUTH_CONFIGURATION(6, 32),
     AUTHORIZATION_REVOCATION(7, 16),
     AUTH_DEPLOYMENT_REGISTRY(8, 32);
@@ -104,29 +102,6 @@ public final class AuthControlKeyCodec {
     }
   }
 
-  public byte[] deploymentBindingV1(ByteKey bindingIdentityDigest) {
-    return encode(Kind.DEPLOYMENT_BINDING_V1, bindingIdentityDigest);
-  }
-
-  public byte[] deploymentRevocationV1(ByteKey operationIdentityDigest) {
-    return encode(Kind.DEPLOYMENT_REVOCATION_V1, operationIdentityDigest);
-  }
-
-  /** A per-binding qualifier allows an independently provisioned reader grant. */
-  public byte[] deploymentBindingQualifierV1(ByteKey bindingIdentityDigest) {
-    return deploymentQualifier(Kind.DEPLOYMENT_BINDING_V1, bindingIdentityDigest);
-  }
-
-  public byte[] deploymentRevocationQualifierV1(ByteKey operationIdentityDigest) {
-    return deploymentQualifier(Kind.DEPLOYMENT_REVOCATION_V1, operationIdentityDigest);
-  }
-
-  private static byte[] deploymentQualifier(Kind kind, ByteKey identity) {
-    validate(kind, identity);
-    return ByteBuffer.allocate(1 + identity.length()).put((byte) kind.id())
-        .put(identity.bytes()).array();
-  }
-
   public byte[] encode(Kind kind, ByteKey identity) {
     validate(kind, identity);
     byte[] identifier = identifier(kind, identity);
@@ -189,8 +164,6 @@ public final class AuthControlKeyCodec {
       case 1 -> Kind.SESSION;
       case 2 -> Kind.SUBJECT_AUTHORITY;
       case 3 -> Kind.SLOT;
-      case 4 -> Kind.DEPLOYMENT_BINDING_V1;
-      case 5 -> Kind.DEPLOYMENT_REVOCATION_V1;
       case 6 -> Kind.AUTH_CONFIGURATION;
       case 7 -> Kind.AUTHORIZATION_REVOCATION;
       case 8 -> Kind.AUTH_DEPLOYMENT_REGISTRY;
