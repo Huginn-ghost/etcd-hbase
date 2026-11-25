@@ -27,7 +27,7 @@ class AuthorizationRevocationSnapshotTest {
     assertEquals(List.of("a", "b"), operation.targets().stream()
         .map(target -> target.identity().tableGroupId()).toList());
     assertEquals(b.datasetDigest(), operation.targets().get(1).identity().datasetDigest());
-    assertEquals(SubjectIdentityDigests.scoped("trust", "provider",
+    assertEquals(SubjectIdentityDigests.scoped("trust", "provider", "realm",
         new AuthenticationScope("b", "profile"), "alice"),
         operation.targets().get(1).identity().authorityDigest());
     assertNotEquals(operation.targets().get(0).identity().authorityDigest(),

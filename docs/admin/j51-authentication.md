@@ -8,6 +8,10 @@
 
 同一凭据族的版本必须由可信的部署凭据供应方维护，并在所有副本之间可比较：轮换时先发布新的独立凭据引用并递增版本，不能原地修改旧版本的材料或重复使用版本。旧副本不得覆盖已推进的持久授权状态。当前授权代次在新版本通过认证后推进；仅修改配置本身不构成已经完成的撤销。
 
+凭据族由 `trust_domain`、provider、`backend_identity_domain` 和经过后端验证的主体共同确定；`credentialGeneration` 仅在同族内可比较。authority 的 scoped 摘要同时绑定该族与表组、连接 profile。通过完整 registry 配置更新及旧表组屏障安装后切换 `backend_identity_domain`，新族可从较低的凭据版本开始；同族的旧版本仍被拒绝。旧族 authority 保留，切换回旧域也须重新认证并推进授权代次，原 token 不会恢复有效。
+
+当前未发布的 J51 将 scoped 摘要前缀从 `etcd-hbase-auth-subject-v1` 显式改为 `etcd-hbase-auth-subject-v2`，并纳入 `backend_identity_domain`。原实验摘要下的 token 失败关闭，客户端须重新 Authenticate；这不是对旧 token 的兼容升级。不提供双摘要读取或自动迁移。auth-control 记录编码、类别编号及授权屏障语义保持不变；已有实验记录仍按原格式解码，身份激活后必须匹配当前摘要才能使用。实验环境须同时更新所有副本，避免混用摘要算法。
+
 ## 2. 持久表组清单
 
 部署 registry 是表组清单、配置代次和撤销进度的唯一持久入口；这些状态在同一行上进行精确 CAS。`AuthStatus` 只读取该清单的表组投影，不维护独立的配置行或写入接口。

@@ -134,6 +134,15 @@ class M5AuthProcessIT {
             configurationFile, "m5-other-process", profileId, dataTable.getNameAsString(),
             authControl, keyFile, dataset, servicePrincipal, "kerberos-password", clusterId)) {
           assertEquals("INVALID_TOKEN", wrongScope.resolveFailure(aliceToken));
+          assertEquals("DEPENDENCY_UNAVAILABLE", wrongScope.authenticateFailure("alice@" + realm, fixturePassword()));
+          assertEquals(registryAfterLogin, verifyDeploymentProgress(configuration, adminPrincipal,
+              adminKeytab, authTable, systemTable, readerToken));
+        }
+        try (ProcessNode wrongProfile = startNode(logDirectory.resolve("wrong-profile.log"),
+            configurationFile, scopeId, "other-profile", dataTable.getNameAsString(),
+            authControl, keyFile, dataset, servicePrincipal, "kerberos-password", clusterId)) {
+          assertEquals("INVALID_TOKEN", wrongProfile.resolveFailure(aliceToken));
+          assertEquals("DEPENDENCY_UNAVAILABLE", wrongProfile.authenticateFailure("alice@" + realm, fixturePassword()));
           assertEquals(registryAfterLogin, verifyDeploymentProgress(configuration, adminPrincipal,
               adminKeytab, authTable, systemTable, readerToken));
         }
@@ -396,6 +405,17 @@ class M5AuthProcessIT {
       assertEquals(5, response.length);
       return new Observation(response[1], response[2], Boolean.parseBoolean(response[3]),
           Boolean.parseBoolean(response[4]));
+    }
+
+    private String authenticateFailure(String principal, String password) throws Exception {
+      output.writeUTF("AUTH");
+      output.writeUTF(principal);
+      output.writeUTF(password);
+      output.flush();
+      String[] response = read().split("\t", -1);
+      assertEquals("ERROR", response[0], "mismatched binding unexpectedly issued a token");
+      assertEquals(2, response.length);
+      return response[1];
     }
 
     private String resolveFailure(String token) throws Exception {

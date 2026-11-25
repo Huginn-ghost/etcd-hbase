@@ -170,6 +170,9 @@
       "kind": "surefire",
       "class": "io.etcdhbase.server.auth.AuthSessionServiceTest",
       "methods": [
+        "changedIdentityDomainStartsItsOwnCredentialVersionsAndNeverRevivesOldTokens",
+        "replacementFamilyFirstLoginRecoversUnknownReservationAndWaitsForEveryGroup",
+        "experimentalSubjectV1TokenFailsClosedAndRequiresReauthentication",
         "rotationResumesAfterAnUnknownAuthorityWriteAtEveryPersistedPhase",
         "rotationResumesAfterAnUnknownRegistryWriteAtEveryPersistedPhase",
         "failedBarrierInstallationIsRecoveredByAnotherRuntimeFromTheSameRegistry",

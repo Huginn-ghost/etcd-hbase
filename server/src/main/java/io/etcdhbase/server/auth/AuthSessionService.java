@@ -47,6 +47,7 @@ public final class AuthSessionService {
   private final SessionIdentityManager identities;
   private final String trustDomain;
   private final String providerId;
+  private final String backendIdentityDomain;
   private final AuthenticationScope scope;
   private final ByteKey datasetDigest;
   private final Duration sessionTtl;
@@ -101,6 +102,7 @@ public final class AuthSessionService {
     this.identities = Objects.requireNonNull(identities, "identities");
     this.trustDomain = requireId(trustDomain, "trustDomain");
     this.providerId = requireId(providerId, "providerId");
+    this.backendIdentityDomain = requireId(backendIdentityDomain, "backendIdentityDomain");
     this.scope = Objects.requireNonNull(scope, "scope");
     this.datasetDigest = requireDigest(datasetDigest, "datasetDigest");
     this.sessionTtl = Objects.requireNonNull(sessionTtl, "sessionTtl");
@@ -116,7 +118,7 @@ public final class AuthSessionService {
     this.configurationDigest = requireDigest(configurationDigest, "configurationDigest");
     this.deploymentCoordinator = Objects.requireNonNull(deploymentCoordinator, "deploymentCoordinator");
     this.deploymentAdmission = new DeploymentAuthorizationAdmission(registry, trustDomain, providerId,
-        requireId(backendIdentityDomain, "backendIdentityDomain"), scope, datasetDigest,
+        this.backendIdentityDomain, scope, datasetDigest,
         this.configurationDigest);
   }
 
@@ -721,7 +723,7 @@ public final class AuthSessionService {
   }
 
   private ByteKey subjectDigest(String subject) {
-    return SubjectIdentityDigests.scoped(trustDomain, providerId, scope, subject);
+    return SubjectIdentityDigests.scoped(trustDomain, providerId, backendIdentityDomain, scope, subject);
   }
 
   private boolean identityMatchesScope(AuthorizedBackendIdentity identity) {

@@ -2,6 +2,8 @@ package io.etcdhbase.server.auth;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -10,6 +12,8 @@ import io.etcdhbase.core.auth.AuthSession;
 import io.etcdhbase.core.auth.AuthDeploymentRegistry;
 import io.etcdhbase.core.auth.AuthorizationRevocation;
 import io.etcdhbase.core.auth.AuthDeploymentRegistryStore;
+import io.etcdhbase.core.auth.AuthDeploymentRegistryAdmin;
+import io.etcdhbase.core.auth.AuthConfigurationUpdateExecutor;
 import io.etcdhbase.core.auth.TargetAuthorizationBarriers;
 import io.etcdhbase.core.auth.TargetConfigurationBarriers;
 import io.etcdhbase.core.auth.AuthSessionException;
@@ -52,8 +56,142 @@ class AuthSessionServiceTest {
   private static final AuthenticationScope SCOPE = new AuthenticationScope("group", "profile");
   private static final ByteKey DATASET = key(32, 9);
   private static final ByteKey CONFIGURATION = key(32, 77);
+  private static final ByteKey REPLACEMENT_CONFIGURATION = key(32, 78);
 
   @TempDir Path temporary;
+
+  @Test
+  void changedIdentityDomainStartsItsOwnCredentialVersionsAndNeverRevivesOldTokens() throws Exception {
+    var store = new FakeStore();
+    var identities = new FakeIdentityManager();
+    var control = new FakeControlStore();
+    var installer = new AuthorizationBarrierInstaller(control, Clock.fixed(
+        Instant.ofEpochMilli(20), ZoneOffset.UTC));
+    var barriers = new TargetAuthorizationBarriers(store, "milvus", Map.of("group",
+        new TargetAuthorizationBarriers.Group("hbase-provider", SCOPE, DATASET, installer)));
+    var configurationBarriers = new TargetConfigurationBarriers(Map.of("group",
+        new TargetConfigurationBarriers.Group(DATASET, installer)));
+    try (var keys = keyProvider("key-1", temporary.resolve("family-key.bin"));
+        var request = RequestScope.withTimeout(Duration.ofSeconds(10)); var credential = credentials()) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      var original = familyService(store, protector, identities, SCOPE, DATASET, "realm", barriers);
+      var oldToken = original.authenticate(credential, request).toCompletableFuture().get();
+      var oldAuthority = store.authorities.values().iterator().next();
+      assertEquals(3, oldAuthority.credentialGeneration());
+      var replacementGroups = java.util.List.of(familyGroup(SCOPE, DATASET, "replacement-realm"));
+      var admin = new AuthDeploymentRegistryAdmin(store.registry);
+      assertTrue(admin.reserveUpdate(1, replacementGroups, request).toCompletableFuture().get());
+      var update = store.registry.current.configurationUpdate();
+      var replacement = familyService(store, protector, identities, SCOPE, DATASET, "replacement-realm", barriers);
+      assertAuthenticationUnavailable(replacement, credential, request);
+      new AuthConfigurationUpdateExecutor(store.registry, configurationBarriers)
+          .resume(update.operationSequence(), Set.of("group"), request).toCompletableFuture().get();
+      assertEquals(2, store.registry.current.configurationGeneration());
+      assertEquals(2, control.current().authorizationBarrierGeneration());
+
+      identities.credentialGeneration = 1;
+      var newToken = replacement.authenticate(credential, request).toCompletableFuture().get();
+      var resolved = replacement.resolve(newToken.tokenForResponse(), request).toCompletableFuture().get();
+      assertEquals(1, resolved.session().credentialGeneration());
+      assertNotEquals(oldAuthority.subjectDigest(), resolved.session().subjectDigest());
+      resolved.release().toCompletableFuture().get();
+      assertEquals(oldAuthority, store.authorities.get(oldAuthority.subjectDigest()));
+      assertResolutionRejected(original, oldToken, request, AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE);
+      assertResolutionRejected(replacement, oldToken, request, AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE);
+
+      verifySameFamilyStillRejectsStaleCredentials(store, identities, replacement, credential,
+          request, newToken, oldToken);
+      verifyReturningDomainRequiresReauthentication(store, configurationBarriers, identities,
+          original, credential, request, oldToken, oldAuthority);
+    }
+  }
+
+  @Test
+  void replacementFamilyFirstLoginRecoversUnknownReservationAndWaitsForEveryGroup() throws Exception {
+    var store = new FakeStore();
+    var scopeB = new AuthenticationScope("other", "profile");
+    var datasetB = key(32, 10);
+    store.registry.current = AuthDeploymentRegistry.initial("milvus", java.util.List.of(
+        familyGroup(SCOPE, DATASET, "realm"), familyGroup(scopeB, datasetB, "realm")));
+    var installerA = store.installer;
+    var installerB = new AuthorizationBarrierInstaller(new FakeControlStore(), Clock.fixed(
+        Instant.ofEpochMilli(20), ZoneOffset.UTC));
+    var barriersA = new TargetAuthorizationBarriers(store, "milvus", Map.of("group",
+        new TargetAuthorizationBarriers.Group("hbase-provider", SCOPE, DATASET, installerA)));
+    var barriersB = new TargetAuthorizationBarriers(store, "milvus", Map.of("other",
+        new TargetAuthorizationBarriers.Group("hbase-provider", scopeB, datasetB, installerB)));
+    var configurationA = new TargetConfigurationBarriers(Map.of("group",
+        new TargetConfigurationBarriers.Group(DATASET, installerA)));
+    var configurationB = new TargetConfigurationBarriers(Map.of("other",
+        new TargetConfigurationBarriers.Group(datasetB, installerB)));
+    var identities = new FakeIdentityManager();
+    try (var keys = keyProvider("key-1", temporary.resolve("family-recovery-key.bin"));
+        var request = RequestScope.withTimeout(Duration.ofSeconds(10)); var credential = credentials()) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      var bothBarriers = new TargetAuthorizationBarriers(store, "milvus", Map.of(
+          "group", new TargetAuthorizationBarriers.Group("hbase-provider", SCOPE, DATASET, installerA),
+          "other", new TargetAuthorizationBarriers.Group("hbase-provider", scopeB, datasetB, installerB)));
+      var old = familyService(store, protector, identities, SCOPE, DATASET, "realm", bothBarriers)
+          .authenticate(credential, request).toCompletableFuture().get();
+      var previousAuthorities = Map.copyOf(store.authorities);
+      var admin = new AuthDeploymentRegistryAdmin(store.registry);
+      var replacements = java.util.List.of(familyGroup(SCOPE, DATASET, "replacement-realm"),
+          familyGroup(scopeB, datasetB, "replacement-realm"));
+      assertTrue(admin.reserveUpdate(1, replacements, request).toCompletableFuture().get());
+      long sequence = store.registry.current.configurationUpdate().operationSequence();
+      new AuthConfigurationUpdateExecutor(store.registry, configurationA)
+          .resume(sequence, Set.of("group"), request).toCompletableFuture().get();
+      assertEquals(1, store.registry.current.configurationGeneration());
+      assertFalse(admin.reserveUpdate(1, replacements, request).toCompletableFuture().get());
+      new AuthConfigurationUpdateExecutor(store.registry, configurationB)
+          .resume(sequence, Set.of("other"), request).toCompletableFuture().get();
+
+      identities.credentialGeneration = 1;
+      var a = localFamilyService(store, protector, identities, SCOPE, DATASET, barriersA, configurationA);
+      var b = localFamilyService(store, protector, identities, scopeB, datasetB, barriersB, configurationB);
+      recoverReplacementFamilyAcrossGroups(store, a, b, credential, request);
+      previousAuthorities.forEach((digest, authority) -> assertEquals(authority, store.authorities.get(digest)));
+      var token = a.authenticate(credential, request).toCompletableFuture().get();
+      var resolved = a.resolve(token.tokenForResponse(), request).toCompletableFuture().get();
+      resolved.release().toCompletableFuture().get();
+      assertResolutionRejected(a, old, request, AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE);
+    }
+  }
+
+  @Test
+  void experimentalSubjectV1TokenFailsClosedAndRequiresReauthentication() throws Exception {
+    var store = new FakeStore();
+    var identities = new FakeIdentityManager();
+    try (var keys = keyProvider("key-1", temporary.resolve("subject-v1-key.bin"));
+        var request = RequestScope.withTimeout(Duration.ofSeconds(10)); var credential = credentials()) {
+      var service = service(store, new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom()), identities, 4);
+      var original = service.authenticate(credential, request).toCompletableFuture().get();
+      var session = store.sessions.values().iterator().next();
+      var authority = store.authorities.remove(session.subjectDigest());
+      var legacyDigest = ByteKey.copyOf(java.util.HexFormat.of().parseHex(
+          "71a3ca62fc917fbc5e735f8bde003d198f1f11b341e94a451dd49807f4512217"));
+      var legacy = new AuthSession(session.sessionId(), session.tokenDigest(), legacyDigest,
+          session.trustDomain(), session.providerId(), session.scope(), session.datasetDigest(),
+          session.credentialGeneration(), session.authorizationGeneration(), session.createdAtEpochMillis(),
+          session.expiresAtEpochMillis(), session.slotIndex(), session.slotGeneration(), session.status(),
+          session.credentialEnvelope());
+      store.sessions.put(legacy.tokenDigest(), legacy);
+      store.authorities.put(legacyDigest, new SubjectAuthority(legacyDigest, authority.trustDomain(),
+          authority.providerId(), authority.scope(), authority.credentialGeneration(),
+          authority.authorizationGeneration(), authority.state(), authority.revocationTargets(),
+          authority.revocationOperationId(), authority.revocationOperationSequence(),
+          authority.revocationConfigurationGeneration()));
+      var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> service.resolve(original.tokenForResponse(), request).toCompletableFuture().get());
+      assertEquals(AuthSessionException.Reason.PERMISSION_DENIED, ((AuthSessionException) failure.getCause()).reason());
+      assertEquals(1, identities.releasedIdentityLeases);
+      var fresh = service.authenticate(credential, request).toCompletableFuture().get();
+      var resolved = service.resolve(fresh.tokenForResponse(), request).toCompletableFuture().get();
+      assertNotEquals(legacyDigest, resolved.session().subjectDigest());
+      resolved.release().toCompletableFuture().get();
+      assertResolutionRejected(service, original, request, AuthSessionException.Reason.PERMISSION_DENIED);
+    }
+  }
 
   @Test
   void localServicesCooperativelyRecoverConfigurationBarriers() throws Exception {
@@ -1048,6 +1186,96 @@ class AuthSessionServiceTest {
       assertEquals(1, activating.releasedIdentityLeases);
       assertEquals(0, activating.providerCloses);
     }
+  }
+
+  private static void verifySameFamilyStillRejectsStaleCredentials(FakeStore store,
+      FakeIdentityManager identities, AuthSessionService replacement, BackendCredentials credential,
+      RequestScope request, AuthSessionService.IssuedToken newToken, AuthSessionService.IssuedToken oldToken)
+      throws Exception {
+    identities.credentialGeneration = 2;
+    replacement.authenticate(credential, request).toCompletableFuture().get();
+    identities.credentialGeneration = 1;
+    var beforeStaleLogin = store.registry.current;
+    assertAuthenticationUnavailable(replacement, credential, request);
+    assertEquals(beforeStaleLogin, store.registry.current);
+    assertResolutionRejected(replacement, newToken, request, AuthSessionException.Reason.INVALID_TOKEN);
+    assertResolutionRejected(replacement, oldToken, request, AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE);
+  }
+
+  private static void verifyReturningDomainRequiresReauthentication(FakeStore store,
+      TargetConfigurationBarriers configurationBarriers, FakeIdentityManager identities,
+      AuthSessionService original, BackendCredentials credential, RequestScope request,
+      AuthSessionService.IssuedToken oldToken, SubjectAuthority oldAuthority) throws Exception {
+    assertTrue(new AuthDeploymentRegistryAdmin(store.registry).reserveUpdate(2, java.util.List.of(familyGroup(SCOPE, DATASET, "realm")), request)
+        .toCompletableFuture().get());
+    new AuthConfigurationUpdateExecutor(store.registry, configurationBarriers)
+        .resume(store.registry.current.configurationUpdate().operationSequence(), Set.of("group"), request)
+        .toCompletableFuture().get();
+    identities.credentialGeneration = 3;
+    var reauthenticated = original.authenticate(credential, request).toCompletableFuture().get();
+    assertResolutionRejected(original, oldToken, request, AuthSessionException.Reason.INVALID_TOKEN);
+    var resolved = original.resolve(reauthenticated.tokenForResponse(), request).toCompletableFuture().get();
+    assertTrue(resolved.session().authorizationGeneration() > oldAuthority.authorizationGeneration());
+    resolved.release().toCompletableFuture().get();
+  }
+
+  private static void recoverReplacementFamilyAcrossGroups(FakeStore store, AuthSessionService a,
+      AuthSessionService b, BackendCredentials credential, RequestScope request) throws Exception {
+    store.registry.failCasAfterWrite = 1;
+    assertAuthenticationUnavailable(a, credential, request);
+    var pending = store.registry.current.revocation();
+    assertNotNull(pending, "the replacement family must reserve its own durable operation");
+    assertEquals(AuthorizationRevocation.State.INSTALLING, pending.state());
+    assertEquals("replacement-realm", pending.backendIdentityDomain());
+    assertEquals(1, pending.credentialGeneration());
+    assertFalse(new AuthDeploymentRegistryAdmin(store.registry).reserveUpdate(2, java.util.List.of(familyGroup(SCOPE, DATASET, "realm")), request)
+        .toCompletableFuture().get());
+    assertThrows(java.util.concurrent.ExecutionException.class,
+        () -> b.resumePendingDeploymentRevocation(request).toCompletableFuture().get());
+    assertTrue(store.registry.current.revocation().targets().stream().noneMatch(target -> target.released()));
+    assertEquals(1, store.sessions.size());
+    assertThrows(java.util.concurrent.ExecutionException.class,
+        () -> a.resumePendingDeploymentRevocation(request).toCompletableFuture().get());
+    b.resumePendingDeploymentRevocation(request).toCompletableFuture().get();
+    assertEquals(pending.operationId(), store.registry.current.revocation().operationId());
+    assertEquals(AuthorizationRevocation.State.COMPLETED, store.registry.current.revocation().state());
+    assertTrue(store.registry.current.revocation().targets().stream().allMatch(target -> target.released()));
+  }
+
+  private static AuthDeploymentRegistry.Group familyGroup(AuthenticationScope scope, ByteKey dataset, String domain) {
+    return new AuthDeploymentRegistry.Group(scope.tableGroupId(), "hbase-provider", domain,
+        scope.connectionProfileId(), dataset, domain.equals("realm") ? CONFIGURATION : REPLACEMENT_CONFIGURATION, true);
+  }
+
+  private static AuthSessionService familyService(FakeStore store, AesGcmCredentialEnvelopeProtector protector,
+      FakeIdentityManager identities, AuthenticationScope scope, ByteKey dataset, String domain,
+      TargetAuthorizationBarriers barriers) {
+    return new AuthSessionService(store, protector, identities, "milvus", "hbase-provider", scope,
+        dataset, Duration.ofMinutes(5), 8, Clock.systemUTC(), new SecureRandom(), store.registry,
+        barriers, domain, familyGroup(scope, dataset, domain).configurationDigest());
+  }
+
+  private static AuthSessionService localFamilyService(FakeStore store, AesGcmCredentialEnvelopeProtector protector,
+      FakeIdentityManager identities, AuthenticationScope scope, ByteKey dataset, TargetAuthorizationBarriers barriers,
+      TargetConfigurationBarriers configurationBarriers) {
+    return new AuthSessionService(store, protector, identities, "milvus", "hbase-provider", scope,
+        dataset, Duration.ofMinutes(5), 8, Clock.systemUTC(), new SecureRandom(), store.registry,
+        barriers, "replacement-realm", REPLACEMENT_CONFIGURATION, Set.of(scope.tableGroupId()), configurationBarriers);
+  }
+
+  private static void assertAuthenticationUnavailable(AuthSessionService service, BackendCredentials credential,
+      RequestScope request) {
+    var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+        () -> service.authenticate(credential, request).toCompletableFuture().get());
+    assertEquals(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE,
+        ((AuthSessionException) failure.getCause()).reason());
+  }
+
+  private static void assertResolutionRejected(AuthSessionService service, AuthSessionService.IssuedToken token,
+      RequestScope request, AuthSessionException.Reason reason) {
+    var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+        () -> service.resolve(token.tokenForResponse(), request).toCompletableFuture().get());
+    assertEquals(reason, ((AuthSessionException) failure.getCause()).reason());
   }
 
   private AuthSessionService service(FakeStore store, AesGcmCredentialEnvelopeProtector protector,

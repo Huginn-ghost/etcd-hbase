@@ -24,11 +24,14 @@ final class SubjectIdentityDigests {
         backendIdentityDomain, identity.subject());
   }
 
-  static ByteKey scoped(String trustDomain, String providerId, AuthenticationScope scope,
-      String verifiedSubject) {
+  static ByteKey scoped(String trustDomain, String providerId, String backendIdentityDomain,
+      AuthenticationScope scope, String verifiedSubject) {
+    requireId(trustDomain);
+    requireId(backendIdentityDomain);
     Objects.requireNonNull(scope, "scope");
-    return digest("etcd-hbase-auth-subject-v1", trustDomain, providerId, scope.tableGroupId(),
-        scope.connectionProfileId(), verifiedSubject);
+    // Credential generations are comparable only within this explicitly configured family.
+    return digest("etcd-hbase-auth-subject-v2", trustDomain, providerId, backendIdentityDomain,
+        scope.tableGroupId(), scope.connectionProfileId(), verifiedSubject);
   }
 
   private static ByteKey digest(String prefix, String... values) {

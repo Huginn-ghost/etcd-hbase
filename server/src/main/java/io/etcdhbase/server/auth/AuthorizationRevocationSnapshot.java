@@ -32,6 +32,7 @@ final class AuthorizationRevocationSnapshot {
             && group.backendIdentityDomain().equals(identityDomain))
         .map(group -> new AuthorizationRevocation.TargetIdentity(group.tableGroupId(), group.datasetDigest(),
             SubjectIdentityDigests.scoped(registry.trustDomain(), group.providerId(),
+                group.backendIdentityDomain(),
                 new AuthenticationScope(group.tableGroupId(), group.connectionProfileId()), verified.subject())))
         .toList();
     return AuthorizationRevocation.start(operationId,

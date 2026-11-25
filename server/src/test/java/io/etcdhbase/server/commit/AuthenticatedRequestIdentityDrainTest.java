@@ -214,9 +214,10 @@ class AuthenticatedRequestIdentityDrainTest {
     try {
       var output = new ByteArrayOutputStream();
       var data = new DataOutputStream(output);
-      data.write("etcd-hbase-auth-subject-v1".getBytes(StandardCharsets.UTF_8));
+      data.write("etcd-hbase-auth-subject-v2".getBytes(StandardCharsets.UTF_8));
       write(data, TRUST_DOMAIN);
       write(data, PROVIDER_ID);
+      write(data, AuthDeploymentFixture.IDENTITY_DOMAIN);
       write(data, SCOPE.tableGroupId());
       write(data, SCOPE.connectionProfileId());
       write(data, subject);
