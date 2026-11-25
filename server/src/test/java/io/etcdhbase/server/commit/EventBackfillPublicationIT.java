@@ -67,6 +67,7 @@ class EventBackfillPublicationIT {
         long now = System.currentTimeMillis();
         var owner = new CommitOwnerService(original.control())
             .claim("backfill-cycle-test-owner", now, now + TIMEOUT.toMillis(), scope).join().orElseThrow();
+        owner = new AuthorizationBarrierUpgrade(original.control()).enable(owner, now, scope).join();
         writeLegacyPut(fixture, original, owner);
         enableCapabilities(fixture, scope);
         var stores = TableGroupStores.open(fixture.factory(), fixture.identity(), fixture.system(),
@@ -155,6 +156,7 @@ class EventBackfillPublicationIT {
         long now = System.currentTimeMillis();
         var owner = new CommitOwnerService(original.control())
             .claim("backfill-test-owner", now, now + TIMEOUT.toMillis(), scope).join().orElseThrow();
+        owner = new AuthorizationBarrierUpgrade(original.control()).enable(owner, now, scope).join();
         writeLegacyPut(fixture, original, owner);
         enableCapabilities(fixture, scope);
         var stores = TableGroupStores.open(fixture.factory(), fixture.identity(), fixture.system(),
@@ -228,6 +230,7 @@ class EventBackfillPublicationIT {
     }
   }
 
+  // Legacy here means no event-index capability; new publication still requires the auth fence.
   private static void writeLegacyPut(M3TestEnvironment fixture, TableGroupStores stores,
       CommitOwnerService.OwnerToken owner) throws Exception {
     var limits = new BudgetManager.Limits(4, 4, 4, 4, 4, 1L << 20, 256L << 20);
