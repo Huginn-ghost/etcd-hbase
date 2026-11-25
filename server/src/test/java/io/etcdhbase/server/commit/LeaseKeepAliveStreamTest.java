@@ -94,6 +94,81 @@ class LeaseKeepAliveStreamTest {
   }
 
   @Test
+  void sendsZeroTtlOnlyAfterIdentityRevalidationSucceeds() {
+    var observer = new RecordingObserver();
+    observer.ready = false;
+    var validation = new CompletableFuture<Void>();
+    var validationCalls = new AtomicInteger();
+    var releases = new AtomicInteger();
+    try (var scope = RequestScope.withoutDeadline(); var timers = timers()) {
+      var stream = new LeaseKeepAliveStream(observer, scope, Runnable::run, timers,
+          request -> CompletableFuture.completedFuture(new LeaseKeepAliveStream.Delivery(
+              Rpc.LeaseKeepAliveResponse.newBuilder().setID(request.getID()).setTTL(0).build(),
+              releases::incrementAndGet, () -> {
+                validationCalls.incrementAndGet();
+                return validation;
+              })), new RequestMetrics());
+      stream.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(23).build());
+      assertEquals(0, validationCalls.get());
+      assertTrue(observer.responses.isEmpty());
+
+      observer.ready = true;
+      observer.readyHandler.run();
+      assertEquals(1, validationCalls.get());
+      assertTrue(observer.responses.isEmpty());
+      assertEquals(0, releases.get());
+
+      validation.complete(null);
+      assertEquals(1, observer.responses.size());
+      assertEquals(23, observer.responses.getFirst().getID());
+      assertEquals(0, observer.responses.getFirst().getTTL());
+      assertEquals(1, releases.get());
+      stream.onCompleted();
+      assertTrue(observer.completed);
+      assertEquals(1, releases.get());
+    }
+  }
+
+  @Test
+  void rejectsZeroTtlWhenIdentityRevalidationFails() throws Exception {
+    var observer = new RecordingObserver();
+    observer.ready = false;
+    var validation = new CompletableFuture<Void>();
+    var validationCalls = new AtomicInteger();
+    var releases = new AtomicInteger();
+    try (var scope = RequestScope.withoutDeadline(); var timers = timers()) {
+      var stream = new LeaseKeepAliveStream(observer, scope, Runnable::run, timers,
+          request -> CompletableFuture.completedFuture(new LeaseKeepAliveStream.Delivery(
+              Rpc.LeaseKeepAliveResponse.newBuilder().setID(request.getID()).setTTL(0).build(),
+              releases::incrementAndGet, () -> {
+                validationCalls.incrementAndGet();
+                return validation;
+              })), new RequestMetrics());
+      stream.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(24).build());
+      assertEquals(0, validationCalls.get());
+      assertTrue(observer.responses.isEmpty());
+
+      observer.ready = true;
+      observer.readyHandler.run();
+      assertEquals(1, validationCalls.get());
+      assertTrue(observer.responses.isEmpty());
+      assertEquals(0, releases.get());
+
+      validation.completeExceptionally(new BackendFailure(BackendFailure.Category.INVALID_AUTH_TOKEN));
+      assertTrue(observer.failed.await(2, TimeUnit.SECONDS));
+      assertTrue(observer.responses.isEmpty());
+      assertEquals(io.grpc.Status.Code.UNAUTHENTICATED,
+          ((io.grpc.StatusRuntimeException) observer.failure).getStatus().getCode());
+      assertTrue(scope.isCancelled());
+      assertEquals(1, releases.get());
+      stream.onNext(Rpc.LeaseKeepAliveRequest.newBuilder().setID(25).build());
+      observer.cancel();
+      assertEquals(1, releases.get());
+      assertTrue(observer.responses.isEmpty());
+    }
+  }
+
+  @Test
   void preservesGrantedKeepAliveTtlWhenTheNextRenewalWindowStillFits() {
     var observer = new RecordingObserver();
     observer.ready = false;

@@ -5,6 +5,9 @@ import io.etcdhbase.spi.salt.SaltStrategy;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Objects;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import org.apache.hadoop.hbase.HConstants;
 
 /** Salted, length-prefixed row keys for the isolated authentication-control table. */
@@ -12,7 +15,12 @@ public final class AuthControlKeyCodec {
   public enum Kind {
     SESSION(1, 32),
     SUBJECT_AUTHORITY(2, 32),
-    SLOT(3, Integer.BYTES);
+    SLOT(3, Integer.BYTES),
+    DEPLOYMENT_BINDING_V1(4, 32),
+    DEPLOYMENT_REVOCATION_V1(5, 32),
+    AUTH_CONFIGURATION(6, 32),
+    AUTHORIZATION_REVOCATION(7, 16),
+    AUTH_DEPLOYMENT_REGISTRY(8, 32);
 
     private final int id;
     private final int identityLength;
@@ -54,9 +62,69 @@ public final class AuthControlKeyCodec {
     return encode(Kind.SUBJECT_AUTHORITY, subjectDigest);
   }
 
+  public byte[] authorizationRevocation(ByteKey operationId) {
+    return encode(Kind.AUTHORIZATION_REVOCATION, operationId);
+  }
+
+  public byte[] deploymentRegistry(String trustDomain) {
+    if (trustDomain == null || !trustDomain.matches("[A-Za-z][A-Za-z0-9._-]{0,63}")) {
+      throw new IllegalArgumentException("invalid auth deployment binding");
+    }
+    try {
+      var digest = MessageDigest.getInstance("SHA-256");
+      digest.update("etcd-hbase/auth-deployment-registry/v1\0".getBytes(StandardCharsets.UTF_8));
+      return encode(Kind.AUTH_DEPLOYMENT_REGISTRY,
+          ByteKey.copyOf(digest.digest(trustDomain.getBytes(StandardCharsets.UTF_8))));
+    } catch (NoSuchAlgorithmException impossible) {
+      throw new IllegalStateException("SHA-256 unavailable", impossible);
+    }
+  }
+
   public byte[] slot(int index) {
     if (index < 0) throw new IllegalArgumentException("slot index must not be negative");
     return encode(Kind.SLOT, ByteKey.copyOf(ByteBuffer.allocate(Integer.BYTES).putInt(index).array()));
+  }
+
+  /** Domain-separated address for the configuration of a single bound table group. */
+  public byte[] configuration(String trustDomain, String tableGroupId) {
+    if (trustDomain == null || !trustDomain.matches("[A-Za-z][A-Za-z0-9._-]{0,63}")
+        || tableGroupId == null || !tableGroupId.matches("[A-Za-z][A-Za-z0-9._-]{0,63}")) {
+      throw new IllegalArgumentException("invalid auth configuration binding");
+    }
+    try {
+      byte[] domain = trustDomain.getBytes(StandardCharsets.UTF_8);
+      byte[] group = tableGroupId.getBytes(StandardCharsets.UTF_8);
+      byte[] prefix = "etcd-hbase/auth-configuration/v1".getBytes(StandardCharsets.UTF_8);
+      byte[] input = ByteBuffer.allocate(prefix.length + 8 + domain.length + group.length)
+          .put(prefix).putInt(domain.length).put(domain).putInt(group.length).put(group).array();
+      return encode(Kind.AUTH_CONFIGURATION, ByteKey.copyOf(
+          MessageDigest.getInstance("SHA-256").digest(input)));
+    } catch (NoSuchAlgorithmException impossible) {
+      throw new IllegalStateException("SHA-256 unavailable", impossible);
+    }
+  }
+
+  public byte[] deploymentBindingV1(ByteKey bindingIdentityDigest) {
+    return encode(Kind.DEPLOYMENT_BINDING_V1, bindingIdentityDigest);
+  }
+
+  public byte[] deploymentRevocationV1(ByteKey operationIdentityDigest) {
+    return encode(Kind.DEPLOYMENT_REVOCATION_V1, operationIdentityDigest);
+  }
+
+  /** A per-binding qualifier allows an independently provisioned reader grant. */
+  public byte[] deploymentBindingQualifierV1(ByteKey bindingIdentityDigest) {
+    return deploymentQualifier(Kind.DEPLOYMENT_BINDING_V1, bindingIdentityDigest);
+  }
+
+  public byte[] deploymentRevocationQualifierV1(ByteKey operationIdentityDigest) {
+    return deploymentQualifier(Kind.DEPLOYMENT_REVOCATION_V1, operationIdentityDigest);
+  }
+
+  private static byte[] deploymentQualifier(Kind kind, ByteKey identity) {
+    validate(kind, identity);
+    return ByteBuffer.allocate(1 + identity.length()).put((byte) kind.id())
+        .put(identity.bytes()).array();
   }
 
   public byte[] encode(Kind kind, ByteKey identity) {
@@ -121,6 +189,11 @@ public final class AuthControlKeyCodec {
       case 1 -> Kind.SESSION;
       case 2 -> Kind.SUBJECT_AUTHORITY;
       case 3 -> Kind.SLOT;
+      case 4 -> Kind.DEPLOYMENT_BINDING_V1;
+      case 5 -> Kind.DEPLOYMENT_REVOCATION_V1;
+      case 6 -> Kind.AUTH_CONFIGURATION;
+      case 7 -> Kind.AUTHORIZATION_REVOCATION;
+      case 8 -> Kind.AUTH_DEPLOYMENT_REGISTRY;
       default -> throw invalidRow();
     };
   }

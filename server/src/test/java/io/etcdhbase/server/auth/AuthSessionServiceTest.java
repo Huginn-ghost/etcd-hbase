@@ -7,12 +7,23 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import etcdserverpb.Rpc;
 import io.etcdhbase.core.auth.AuthSession;
+import io.etcdhbase.core.auth.AuthConfigurationRecord;
+import io.etcdhbase.core.auth.AuthConfigurationStore;
+import io.etcdhbase.core.auth.AuthDeploymentRegistry;
+import io.etcdhbase.core.auth.AuthDeploymentRegistryStore;
+import io.etcdhbase.core.auth.TargetAuthorizationBarriers;
+import io.etcdhbase.core.auth.TargetConfigurationBarriers;
 import io.etcdhbase.core.auth.AuthSessionException;
 import io.etcdhbase.core.auth.AuthSessionStore;
 import io.etcdhbase.core.auth.AuthSlot;
 import io.etcdhbase.core.auth.CredentialEnvelope;
 import io.etcdhbase.core.auth.SubjectAuthority;
 import io.etcdhbase.core.bytes.ByteKey;
+import io.etcdhbase.core.commit.AuthorizationBarrierInstaller;
+import io.etcdhbase.core.commit.CommitControlStore;
+import io.etcdhbase.core.commit.CommitState;
+import io.etcdhbase.core.commit.ControlSnapshot;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.spi.identity.AuthenticationScope;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
@@ -24,6 +35,8 @@ import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
@@ -32,6 +45,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -40,6 +54,208 @@ class AuthSessionServiceTest {
   private static final ByteKey DATASET = key(32, 9);
 
   @TempDir Path temporary;
+
+  @Test
+  void localServicesCooperativelyRecoverConfigurationBarriers() throws Exception {
+    var store = new FakeStore();
+    var scopeB = new AuthenticationScope("other", "profile");
+    var datasetB = key(32, 10);
+    var digestA = key(32, 20);
+    var digestB = key(32, 21);
+    var groupA = new AuthDeploymentRegistry.Group("group", "hbase-provider", "realm", "profile",
+        DATASET, digestA, true);
+    var groupB = new AuthDeploymentRegistry.Group("other", "hbase-provider", "realm", "profile",
+        datasetB, digestB, true);
+    var registry = new FakeDeploymentRegistry(AuthDeploymentRegistry.initial("milvus", java.util.List.of(groupA, groupB))
+        .beginConfigurationUpdate(java.util.List.of(groupA)));
+    var fixedClock = Clock.fixed(Instant.ofEpochMilli(20), ZoneOffset.UTC);
+    var installerA = new AuthorizationBarrierInstaller(new FakeControlStore(), fixedClock);
+    var installerB = new AuthorizationBarrierInstaller(new FakeControlStore(), fixedClock);
+    var revocationA = new TargetAuthorizationBarriers(store, "milvus", Map.of("group",
+        new TargetAuthorizationBarriers.Group("hbase-provider", SCOPE, DATASET, installerA)));
+    var revocationB = new TargetAuthorizationBarriers(store, "milvus", Map.of("other",
+        new TargetAuthorizationBarriers.Group("hbase-provider", scopeB, datasetB, installerB)));
+    var configurationA = new TargetConfigurationBarriers(Map.of("group",
+        new TargetConfigurationBarriers.Group(DATASET, installerA)));
+    var configurationB = new TargetConfigurationBarriers(Map.of("other",
+        new TargetConfigurationBarriers.Group(datasetB, installerB)));
+    try (var keys = keyProvider("key-1", temporary.resolve("configuration-recovery-key.bin"));
+        var request = RequestScope.withTimeout(Duration.ofSeconds(10))) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      var a = new AuthSessionService(store, protector, new FakeIdentityManager(), "milvus", "hbase-provider",
+          SCOPE, DATASET, Duration.ofMinutes(5), 4, Clock.systemUTC(), new SecureRandom(),
+          registry, revocationA, "realm", digestA, Set.of("group"), configurationA);
+      var b = new AuthSessionService(store, protector, new FakeIdentityManager(), "milvus", "hbase-provider",
+          scopeB, datasetB, Duration.ofMinutes(5), 4, Clock.systemUTC(), new SecureRandom(),
+          registry, revocationB, "realm", digestB, Set.of("other"), configurationB);
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> a.resumePendingDeploymentRevocation(request).toCompletableFuture().get());
+      assertEquals(1, registry.current.configurationGeneration());
+      assertTrue(registry.current.configurationUpdate().targets().getFirst().installed());
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> a.readAuthConfiguration(request).toCompletableFuture().get());
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> b.resumePendingDeploymentRevocation(request).toCompletableFuture().get());
+      assertEquals(2, registry.current.configurationGeneration());
+      assertEquals(java.util.List.of(groupA), registry.current.groups());
+      assertEquals(2, a.readAuthConfiguration(request).toCompletableFuture().get().revision());
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> b.readAuthConfiguration(request).toCompletableFuture().get());
+    }
+  }
+
+  @Test
+  void independentGroupServicesResumeOnlyTheirOwnRegisteredBarriers() throws Exception {
+    var store = new FakeStore();
+    var scopeB = new AuthenticationScope("other", "profile");
+    var datasetB = key(32, 10);
+    var digestA = key(32, 20);
+    var digestB = key(32, 21);
+    var groupA = new AuthDeploymentRegistry.Group("group", "hbase-provider", "realm", "profile",
+        DATASET, digestA, true);
+    var groupB = new AuthDeploymentRegistry.Group("other", "hbase-provider", "realm", "profile",
+        datasetB, digestB, true);
+    var registry = new FakeDeploymentRegistry(AuthDeploymentRegistry.initial("milvus", java.util.List.of(groupA, groupB)));
+    var fixedClock = Clock.fixed(Instant.ofEpochMilli(20), ZoneOffset.UTC);
+    var barriersA = new TargetAuthorizationBarriers(store, "milvus", Map.of("group",
+        new TargetAuthorizationBarriers.Group("hbase-provider", SCOPE, DATASET,
+            new AuthorizationBarrierInstaller(new FakeControlStore(), fixedClock))));
+    var barriersB = new TargetAuthorizationBarriers(store, "milvus", Map.of("other",
+        new TargetAuthorizationBarriers.Group("hbase-provider", scopeB, datasetB,
+            new AuthorizationBarrierInstaller(new FakeControlStore(), fixedClock))));
+    try (var keys = keyProvider("key-1", temporary.resolve("independent-group-key.bin"));
+        var request = RequestScope.withTimeout(Duration.ofSeconds(10));
+        var credential = credentials()) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      var a = new AuthSessionService(store, protector, new FakeIdentityManager(), "milvus", "hbase-provider",
+          SCOPE, DATASET, Duration.ofMinutes(5), 4, Clock.systemUTC(), new SecureRandom(),
+          registry, barriersA, "realm", digestA, Set.of("group"));
+      var b = new AuthSessionService(store, protector, new FakeIdentityManager(), "milvus", "hbase-provider",
+          scopeB, datasetB, Duration.ofMinutes(5), 4, Clock.systemUTC(), new SecureRandom(),
+          registry, barriersB, "realm", digestB, Set.of("other"));
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> a.authenticate(credential, request).toCompletableFuture().get());
+      assertTrue(registry.current.revocation().targets().get(0).installed());
+      assertFalse(registry.current.revocation().targets().get(1).installed());
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> b.resumePendingDeploymentRevocation(request).toCompletableFuture().get());
+      assertFalse(registry.current.revocation().targets().get(0).released());
+      a.resumePendingDeploymentRevocation(request).toCompletableFuture().get();
+      var token = a.authenticate(credential, request).toCompletableFuture().get();
+      var resolved = a.resolve(token.tokenForResponse(), request).toCompletableFuture().get();
+      resolved.release().toCompletableFuture().get();
+    }
+  }
+
+  @Test
+  void deploymentRotationBlocksBothGroupsUntilTheirBarriersComplete() throws Exception {
+    var store = new FakeStore();
+    var profileB = new AuthenticationScope("other", "profile");
+    var datasetB = key(32, 10);
+    var digestA = key(32, 20);
+    var digestB = key(32, 21);
+    var groupA = new AuthDeploymentRegistry.Group("group", "hbase-provider", "realm", "profile",
+        DATASET, digestA, true);
+    var groupB = new AuthDeploymentRegistry.Group("other", "hbase-provider", "realm", "profile",
+        datasetB, digestB, true);
+    var registry = new FakeDeploymentRegistry(AuthDeploymentRegistry.initial("milvus", java.util.List.of(groupA, groupB)));
+    var controlA = new FakeControlStore();
+    var controlB = new FakeControlStore();
+    var fixedClock = Clock.fixed(Instant.ofEpochMilli(20), ZoneOffset.UTC);
+    var barriers = new TargetAuthorizationBarriers(store, "milvus", Map.of(
+        "group", new TargetAuthorizationBarriers.Group("hbase-provider", SCOPE, DATASET,
+            new AuthorizationBarrierInstaller(controlA, fixedClock)),
+        "other", new TargetAuthorizationBarriers.Group("hbase-provider", profileB, datasetB,
+            new AuthorizationBarrierInstaller(controlB, fixedClock))));
+    var identitiesA = new FakeIdentityManager();
+    var identitiesB = new FakeIdentityManager();
+    try (var keys = keyProvider("key-1", temporary.resolve("deployment-key.bin"));
+        var request = RequestScope.withTimeout(Duration.ofSeconds(10));
+        var credential = credentials()) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      var a = new AuthSessionService(store, protector, identitiesA, "milvus", "hbase-provider",
+          SCOPE, DATASET, Duration.ofMinutes(5), 4, Clock.systemUTC(), new SecureRandom(),
+          registry, barriers, "realm", digestA);
+      var b = new AuthSessionService(store, protector, identitiesB, "milvus", "hbase-provider",
+          profileB, datasetB, Duration.ofMinutes(5), 4, Clock.systemUTC(), new SecureRandom(),
+          registry, barriers, "realm", digestB);
+      var oldA = a.authenticate(credential, request).toCompletableFuture().get();
+      var oldB = b.authenticate(credential, request).toCompletableFuture().get();
+      identitiesA.credentialGeneration = 4;
+      controlB.holdNextCas = true;
+      var rotation = a.authenticate(credential, request).toCompletableFuture();
+      assertFalse(rotation.isDone());
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> a.resolve(oldA.tokenForResponse(), request).toCompletableFuture().get());
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> b.resolve(oldB.tokenForResponse(), request).toCompletableFuture().get());
+      controlB.completeHeldCas();
+      var replacement = rotation.get(3, java.util.concurrent.TimeUnit.SECONDS);
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> a.resolve(oldA.tokenForResponse(), request).toCompletableFuture().get());
+      assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> b.resolve(oldB.tokenForResponse(), request).toCompletableFuture().get());
+      var resolved = a.resolve(replacement.tokenForResponse(), request).toCompletableFuture().get();
+      resolved.release().toCompletableFuture().get();
+    }
+  }
+
+  @Test
+  void authStatusConfigurationMustMatchThePersistedBridge() throws Exception {
+    var digest = key(32, 77);
+    var source = new FakeConfigurationStore();
+    source.record = Optional.of(new AuthConfigurationRecord("milvus", "group", digest, true, 7));
+    try (var keys = keyProvider("key-1", temporary.resolve("status-key.bin"));
+        var request = RequestScope.withTimeout(Duration.ofSeconds(3))) {
+      var service = new AuthSessionService(new FakeStore(),
+          new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom()), new FakeIdentityManager(),
+          "milvus", "hbase-provider", SCOPE, DATASET, Duration.ofMinutes(5), 1,
+          Clock.systemUTC(), new SecureRandom(), null, source, digest);
+      assertEquals(7, service.readAuthConfiguration(request).toCompletableFuture().get().revision());
+      source.record = Optional.of(new AuthConfigurationRecord("milvus", "group", digest, false, 8));
+      var disabled = service.readAuthConfiguration(request).toCompletableFuture().get();
+      assertFalse(disabled.enabled());
+      assertEquals(8, disabled.revision());
+      for (var invalid : java.util.List.of(
+          new AuthConfigurationRecord("milvus", "group", key(32, 78), true, 8),
+          new AuthConfigurationRecord("milvus", "other", digest, true, 8))) {
+        source.record = Optional.of(invalid);
+        var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+            () -> service.readAuthConfiguration(request).toCompletableFuture().get());
+        assertEquals(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE,
+            ((AuthSessionException) failure.getCause()).reason());
+      }
+      source.record = Optional.empty();
+      var missing = assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> service.readAuthConfiguration(request).toCompletableFuture().get());
+      assertEquals(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE,
+          ((AuthSessionException) missing.getCause()).reason());
+    }
+  }
+
+  @Test
+  void unknownCredentialGenerationRejectsSessionAndReleasesItsResources() throws Exception {
+    FakeStore store = new FakeStore();
+    FakeIdentityManager identities = new FakeIdentityManager();
+    identities.authentication = CompletableFuture.completedFuture(
+        AuthorizedBackendIdentity.withUnknownCredentialGeneration(
+            "hbase-provider", "milvus-service", "opaque-context", SCOPE, Set.of("group")));
+    try (var keys = keyProvider("key-1", temporary.resolve("unknown-key.bin"));
+        var request = RequestScope.withTimeout(Duration.ofSeconds(3));
+        var credentials = credentials()) {
+      var service = service(store, new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom()),
+          identities, 1);
+      var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+          () -> service.authenticate(credentials, request).toCompletableFuture().get());
+      assertEquals(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE,
+          ((AuthSessionException) failure.getCause()).reason());
+      assertTrue(store.sessions.isEmpty());
+      assertTrue(store.authorities.isEmpty());
+      assertEquals(AuthSlot.State.EMPTY, store.slots.get(0).state());
+      assertEquals(1, identities.discardedIdentities);
+      assertEquals(0, identities.restorableVerifications);
+    }
+  }
 
   @Test
   void authenticatesPersistsOnlyDigestAndEnvelopeAndResolvesOnAnotherReplica() throws Exception {
@@ -383,6 +599,235 @@ class AuthSessionServiceTest {
   }
 
   @Test
+  void credentialRotationInstallsDurableGroupBarrierBeforeNewSessionIsIssued() throws Exception {
+    FakeStore store = new FakeStore();
+    try (var keys = keyProvider("key-1", temporary.resolve("key.bin"))) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      FakeIdentityManager identities = new FakeIdentityManager();
+      FakeControlStore commitControl = new FakeControlStore();
+      AuthSessionService auth = service(store, protector, identities, 2,
+          new AuthorizationBarrierInstaller(commitControl, Clock.fixed(
+              Instant.ofEpochMilli(10), ZoneOffset.UTC)));
+      AuthSessionService.IssuedToken previous;
+      try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
+          var credentials = credentials()) {
+        previous = auth.authenticate(credentials, request).toCompletableFuture()
+            .get(3, java.util.concurrent.TimeUnit.SECONDS);
+      }
+
+      identities.credentialGeneration = 4;
+      AuthSessionService.IssuedToken rotated;
+      try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
+          var credentials = credentials()) {
+        rotated = auth.authenticate(credentials, request).toCompletableFuture()
+            .get(3, java.util.concurrent.TimeUnit.SECONDS);
+      }
+
+      SubjectAuthority authority = store.authorities.values().iterator().next();
+      assertEquals(SubjectAuthority.State.ACTIVE, authority.state());
+      assertEquals(4, authority.credentialGeneration());
+      assertEquals(2, authority.authorizationGeneration());
+      assertTrue(authority.revocationTargets().isEmpty());
+      assertEquals(1, commitControl.current().authorizationBarrierGeneration());
+      assertEquals(4, store.sessions.values().stream()
+          .filter(session -> session.status() == AuthSession.Status.ACTIVE)
+          .filter(session -> session.credentialGeneration() == 4)
+          .findFirst().orElseThrow().credentialGeneration());
+
+      try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3))) {
+        var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+            () -> auth.resolve(previous.tokenForResponse(), request).toCompletableFuture()
+                .get(3, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals(AuthSessionException.Reason.INVALID_TOKEN,
+            ((AuthSessionException) failure.getCause()).reason());
+      }
+      assertEquals(43, rotated.tokenForResponse().length());
+    }
+  }
+
+  @Test
+  void compatibilityConstructorLeavesRotationRevokingAndAConfiguredReplicaResumesIt()
+      throws Exception {
+    FakeStore store = new FakeStore();
+    try (var keys = keyProvider("key-1", temporary.resolve("key.bin"))) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      FakeIdentityManager identities = new FakeIdentityManager();
+      AuthSessionService compatibility = service(store, protector, identities, 2);
+      AuthSessionService.IssuedToken previous;
+      try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
+          var credentials = credentials()) {
+        previous = compatibility.authenticate(credentials, request).toCompletableFuture()
+            .get(3, java.util.concurrent.TimeUnit.SECONDS);
+      }
+
+      identities.credentialGeneration = 4;
+      try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
+          var credentials = credentials()) {
+        var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+            () -> compatibility.authenticate(credentials, request).toCompletableFuture()
+                .get(3, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE,
+            ((AuthSessionException) failure.getCause()).reason());
+      }
+      SubjectAuthority pending = store.authorities.values().iterator().next();
+      assertEquals(SubjectAuthority.State.REVOKING, pending.state());
+      assertEquals(0, pending.revocationTargets().getFirst().barrierGeneration());
+
+      var commitControl = new FakeControlStore();
+      AuthSessionService recovering = service(store, protector, identities, 2,
+          new AuthorizationBarrierInstaller(commitControl, Clock.fixed(
+              Instant.ofEpochMilli(10), ZoneOffset.UTC)));
+      try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
+          var credentials = credentials()) {
+        recovering.authenticate(credentials, request).toCompletableFuture()
+            .get(3, java.util.concurrent.TimeUnit.SECONDS);
+      }
+
+      SubjectAuthority recovered = store.authorities.values().iterator().next();
+      assertEquals(SubjectAuthority.State.ACTIVE, recovered.state());
+      assertEquals(4, recovered.credentialGeneration());
+      assertEquals(1, commitControl.current().authorizationBarrierGeneration());
+      try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3))) {
+        var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+            () -> recovering.resolve(previous.tokenForResponse(), request).toCompletableFuture()
+                .get(3, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals(AuthSessionException.Reason.INVALID_TOKEN,
+            ((AuthSessionException) failure.getCause()).reason());
+      }
+    }
+  }
+
+  @Test
+  void rotationResumesAfterAnUnknownAuthorityWriteAtEveryPersistedPhase() throws Exception {
+    try (var keys = keyProvider("key-1", temporary.resolve("key.bin"))) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      for (int failedWrite = 1; failedWrite <= 4; failedWrite++) {
+        FakeStore store = new FakeStore();
+        FakeIdentityManager identities = new FakeIdentityManager();
+        FakeControlStore control = new FakeControlStore();
+        var installer = new AuthorizationBarrierInstaller(control, Clock.fixed(
+            Instant.ofEpochMilli(10), ZoneOffset.UTC));
+        AuthSessionService first = service(store, protector, identities, 3, installer);
+        AuthSessionService.IssuedToken oldToken;
+        try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
+            var credentials = credentials()) {
+          oldToken = first.authenticate(credentials, request).toCompletableFuture()
+              .get(3, java.util.concurrent.TimeUnit.SECONDS);
+        }
+
+        identities.credentialGeneration = 4;
+        store.failAuthorityCasAfterWrite = failedWrite;
+        try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
+            var credentials = credentials()) {
+          assertThrows(java.util.concurrent.ExecutionException.class,
+              () -> first.authenticate(credentials, request).toCompletableFuture()
+                  .get(3, java.util.concurrent.TimeUnit.SECONDS));
+        }
+        SubjectAuthority persisted = store.authorities.values().iterator().next();
+        assertEquals(4, persisted.credentialGeneration());
+        assertEquals(2, persisted.authorizationGeneration());
+        assertEquals(failedWrite == 4 ? SubjectAuthority.State.ACTIVE : SubjectAuthority.State.REVOKING,
+            persisted.state());
+        assertEquals(failedWrite >= 3 ? 1 : 0, control.current().authorizationBarrierGeneration());
+        assertEquals(1, store.sessions.size());
+        try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3))) {
+          var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+              () -> first.resolve(oldToken.tokenForResponse(), request).toCompletableFuture()
+                  .get(3, java.util.concurrent.TimeUnit.SECONDS));
+          assertEquals(AuthSessionException.Reason.INVALID_TOKEN,
+              ((AuthSessionException) failure.getCause()).reason());
+        }
+
+        AuthSessionService recovering = service(store, protector, identities, 3, installer);
+        AuthSessionService.IssuedToken newToken;
+        try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
+            var credentials = credentials()) {
+          newToken = recovering.authenticate(credentials, request).toCompletableFuture()
+              .get(3, java.util.concurrent.TimeUnit.SECONDS);
+        }
+        SubjectAuthority recovered = store.authorities.values().iterator().next();
+        assertEquals(SubjectAuthority.State.ACTIVE, recovered.state());
+        assertEquals(4, recovered.credentialGeneration());
+        assertEquals(2, recovered.authorizationGeneration());
+        assertEquals(1, control.current().authorizationBarrierGeneration());
+        assertEquals(2, store.sessions.size());
+        try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3))) {
+          var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+              () -> recovering.resolve(oldToken.tokenForResponse(), request).toCompletableFuture()
+                  .get(3, java.util.concurrent.TimeUnit.SECONDS));
+          assertEquals(AuthSessionException.Reason.INVALID_TOKEN,
+              ((AuthSessionException) failure.getCause()).reason());
+          var resolved = recovering.resolve(newToken.tokenForResponse(), request).toCompletableFuture()
+              .get(3, java.util.concurrent.TimeUnit.SECONDS);
+          resolved.release().toCompletableFuture().get(3, java.util.concurrent.TimeUnit.SECONDS);
+        }
+      }
+    }
+  }
+
+  @Test
+  void newerRotationFencesAnOlderRotationWaitingForBarrierCas() throws Exception {
+    FakeStore store = new FakeStore();
+    FakeControlStore control = new FakeControlStore();
+    FakeIdentityManager olderIdentities = new FakeIdentityManager();
+    FakeIdentityManager newerIdentities = new FakeIdentityManager();
+    try (var keys = keyProvider("key-1", temporary.resolve("key.bin"))) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      var installer = new AuthorizationBarrierInstaller(control, Clock.fixed(
+          Instant.ofEpochMilli(10), ZoneOffset.UTC));
+      AuthSessionService older = service(store, protector, olderIdentities, 3, installer);
+      AuthSessionService newer = service(store, protector, newerIdentities, 3, installer);
+      AuthSessionService.IssuedToken original;
+      try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
+          var credentials = credentials()) {
+        original = older.authenticate(credentials, request).toCompletableFuture()
+            .get(3, java.util.concurrent.TimeUnit.SECONDS);
+      }
+
+      olderIdentities.credentialGeneration = 4;
+      newerIdentities.credentialGeneration = 5;
+      control.holdNextCas = true;
+      try (RequestScope oldRequest = RequestScope.withTimeout(Duration.ofSeconds(3));
+          var oldCredentials = credentials();
+          RequestScope newRequest = RequestScope.withTimeout(Duration.ofSeconds(3));
+          var newCredentials = credentials()) {
+        var delayed = older.authenticate(oldCredentials, oldRequest).toCompletableFuture();
+        assertFalse(delayed.isDone());
+        assertEquals(SubjectAuthority.State.REVOKING,
+            store.authorities.values().iterator().next().state());
+
+        var current = newer.authenticate(newCredentials, newRequest).toCompletableFuture()
+            .get(3, java.util.concurrent.TimeUnit.SECONDS);
+        control.completeHeldCas();
+        var olderFailure = assertThrows(java.util.concurrent.ExecutionException.class,
+            () -> delayed.get(3, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals(AuthSessionException.Reason.PERMISSION_DENIED,
+            ((AuthSessionException) olderFailure.getCause()).reason());
+        var authority = store.authorities.values().iterator().next();
+        assertEquals(SubjectAuthority.State.ACTIVE, authority.state());
+        assertEquals(5, authority.credentialGeneration());
+        assertEquals(3, authority.authorizationGeneration());
+        assertEquals(1, control.current().authorizationBarrierGeneration());
+        assertEquals(2, store.sessions.size());
+        var originalFailure = assertThrows(java.util.concurrent.ExecutionException.class,
+            () -> newer.resolve(original.tokenForResponse(), newRequest).toCompletableFuture()
+                .get(3, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals(AuthSessionException.Reason.INVALID_TOKEN,
+            ((AuthSessionException) originalFailure.getCause()).reason());
+        var resolved = newer.resolve(current.tokenForResponse(), newRequest).toCompletableFuture()
+            .get(3, java.util.concurrent.TimeUnit.SECONDS);
+        resolved.release().toCompletableFuture().get(3, java.util.concurrent.TimeUnit.SECONDS);
+        var staleReplicaFailure = assertThrows(java.util.concurrent.ExecutionException.class,
+            () -> older.authenticate(oldCredentials, oldRequest).toCompletableFuture()
+                .get(3, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals(AuthSessionException.Reason.PERMISSION_DENIED,
+            ((AuthSessionException) staleReplicaFailure.getCause()).reason());
+        assertEquals(2, store.sessions.size());
+      }
+    }
+  }
+
+  @Test
   void activationIsDiscardedWhenAuthorityChangesBeforeIdentityIsPublished() throws Exception {
     FakeStore store = new FakeStore();
     try (var keys = keyProvider("key-1", temporary.resolve("key.bin"))) {
@@ -498,8 +943,14 @@ class AuthSessionServiceTest {
 
   private AuthSessionService service(FakeStore store, FakeIdentityManager identities,
       AesGcmCredentialEnvelopeProtector protector, int slots) {
+    return service(store, protector, identities, slots, null);
+  }
+
+  private AuthSessionService service(FakeStore store, AesGcmCredentialEnvelopeProtector protector,
+      FakeIdentityManager identities, int slots, AuthorizationBarrierInstaller barrierInstaller) {
     return new AuthSessionService(store, protector, identities, "milvus", "hbase-provider", SCOPE,
-        DATASET, Duration.ofMinutes(5), slots, Clock.systemUTC(), new SecureRandom());
+        DATASET, Duration.ofMinutes(5), slots, Clock.systemUTC(), new SecureRandom(),
+        barrierInstaller);
   }
 
   private FileCredentialKeyProvider keyProvider(String id, Path path) throws Exception {
@@ -534,6 +985,7 @@ class AuthSessionServiceTest {
     private CompletableFuture<SessionIdentityLease> activation;
     private int releasedIdentityLeases;
     private int providerCloses;
+    private long credentialGeneration = 3;
     private AuthorizedBackendIdentity liveIdentity;
 
     @Override
@@ -542,7 +994,8 @@ class AuthSessionServiceTest {
       if (authentication != null) return authentication;
       if (rejectCredentials) return CompletableFuture.failedFuture(new BackendIdentityException(
           BackendIdentityException.Reason.INVALID_CREDENTIALS));
-      return CompletableFuture.completedFuture(identity(credentials.principal(), scope));
+      return CompletableFuture.completedFuture(
+          identity(credentials.principal(), scope, credentialGeneration));
     }
 
     @Override
@@ -559,7 +1012,8 @@ class AuthSessionServiceTest {
         AuthSession session, BackendCredentials credentials) {
       activations++;
       if (activation != null) return activation;
-      AuthorizedBackendIdentity activated = identity(credentials.principal(), session.scope());
+      AuthorizedBackendIdentity activated = identity(
+          credentials.principal(), session.scope(), session.credentialGeneration());
       liveIdentity = activated;
       return CompletableFuture.completedFuture(new SessionIdentityLease(activated, () -> {
         releasedIdentityLeases++;
@@ -577,8 +1031,51 @@ class AuthSessionServiceTest {
     @Override public void close() { providerCloses++; }
 
     private static AuthorizedBackendIdentity identity(String subject, AuthenticationScope scope) {
+      return identity(subject, scope, 3);
+    }
+
+    private static AuthorizedBackendIdentity identity(
+        String subject, AuthenticationScope scope, long credentialGeneration) {
       return new AuthorizedBackendIdentity("hbase-provider", subject, "opaque-context",
-          scope, Set.of(scope.tableGroupId()), 3);
+          scope, Set.of(scope.tableGroupId()), credentialGeneration);
+    }
+  }
+
+  private static final class FakeConfigurationStore implements AuthConfigurationStore {
+    private Optional<AuthConfigurationRecord> record = Optional.empty();
+
+    @Override public CompletionStage<Optional<AuthConfigurationRecord>> readConfiguration(
+        String tableGroupId, RequestScope scope) {
+      return CompletableFuture.completedFuture(record);
+    }
+
+    @Override public CompletionStage<Boolean> createConfigurationIfAbsent(
+        AuthConfigurationRecord initial, RequestScope scope) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override public CompletionStage<Boolean> compareAndSetConfiguration(
+        AuthConfigurationRecord observed, AuthConfigurationRecord replacement, RequestScope scope) {
+      throw new UnsupportedOperationException();
+    }
+  }
+
+  private static final class FakeDeploymentRegistry implements AuthDeploymentRegistryStore {
+    private AuthDeploymentRegistry current;
+    private FakeDeploymentRegistry(AuthDeploymentRegistry current) { this.current = current; }
+    @Override public synchronized CompletionStage<Optional<AuthDeploymentRegistry>> readRegistry(RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.of(current));
+    }
+    @Override public CompletionStage<Boolean> createRegistryIfAbsent(AuthDeploymentRegistry initial, RequestScope scope) {
+      throw new AssertionError("normal login must not create the deployment registry");
+    }
+    @Override public synchronized CompletionStage<Boolean> compareAndSetRegistry(AuthDeploymentRegistry observed,
+        AuthDeploymentRegistry replacement, RequestScope scope) {
+      if (!current.equals(observed) || !observed.permitsReplacement(replacement)) {
+        return CompletableFuture.completedFuture(false);
+      }
+      current = replacement;
+      return CompletableFuture.completedFuture(true);
     }
   }
 
@@ -587,6 +1084,7 @@ class AuthSessionServiceTest {
     private final Map<Integer, AuthSlot> slots = new HashMap<>();
     private final Map<ByteKey, SubjectAuthority> authorities = new HashMap<>();
     private boolean failSessionCreateWithoutWriting;
+    private int failAuthorityCasAfterWrite;
 
     @Override public synchronized CompletionStage<Optional<AuthSession>> readSession(
         ByteKey digest, RequestScope scope) {
@@ -635,17 +1133,81 @@ class AuthSessionServiceTest {
     }
     @Override public synchronized CompletionStage<Boolean> createAuthorityIfAbsent(
         SubjectAuthority authority, RequestScope scope) {
-      if (authorities.containsKey(authority.subjectDigest())) return CompletableFuture.completedFuture(false);
+      if (authority.state() != SubjectAuthority.State.ACTIVE
+          || !authority.revocationTargets().isEmpty()
+          || authorities.containsKey(authority.subjectDigest())) {
+        return CompletableFuture.completedFuture(false);
+      }
       authorities.put(authority.subjectDigest(), authority);
       return CompletableFuture.completedFuture(true);
     }
     @Override public synchronized CompletionStage<Boolean> compareAndSetAuthority(
         SubjectAuthority observed, SubjectAuthority replacement, RequestScope scope) {
-      if (!observed.equals(authorities.get(observed.subjectDigest()))) {
+      if (!observed.equals(authorities.get(observed.subjectDigest()))
+          || !observed.allowsTransitionTo(replacement)) {
         return CompletableFuture.completedFuture(false);
       }
       authorities.put(observed.subjectDigest(), replacement);
+      if (failAuthorityCasAfterWrite > 0 && --failAuthorityCasAfterWrite == 0) {
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+      }
       return CompletableFuture.completedFuture(true);
+    }
+  }
+
+  private static final class FakeControlStore implements CommitControlStore {
+    private final AtomicReference<ControlSnapshot> current = new AtomicReference<>(
+        snapshot(initialBarrierState()));
+    private boolean holdNextCas;
+    private ControlSnapshot heldObserved;
+    private CommitState heldReplacement;
+    private CompletableFuture<Boolean> heldResult;
+
+    private CommitState current() { return current.get().state(); }
+
+    @Override public CompletableFuture<Optional<ControlSnapshot>> read(RequestScope scope) {
+      return CompletableFuture.completedFuture(Optional.of(current.get()));
+    }
+
+    @Override public CompletableFuture<Boolean> initializeIfAbsent(
+        CommitState initialState, RequestScope scope) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override public CompletableFuture<Boolean> compareAndSet(
+        ControlSnapshot observed, CommitState replacement, RequestScope scope) {
+      synchronized (current) {
+        if (holdNextCas) {
+          holdNextCas = false;
+          heldObserved = observed;
+          heldReplacement = replacement;
+          heldResult = new CompletableFuture<>();
+          return heldResult;
+        }
+        if (current.get() != observed) return CompletableFuture.completedFuture(false);
+        current.set(snapshot(replacement));
+        return CompletableFuture.completedFuture(true);
+      }
+    }
+
+    private void completeHeldCas() {
+      boolean applied;
+      synchronized (current) {
+        applied = current.get() == heldObserved;
+        if (applied) current.set(snapshot(heldReplacement));
+      }
+      heldResult.complete(applied);
+    }
+
+    private static ControlSnapshot snapshot(CommitState state) {
+      return new ControlSnapshot(state, java.nio.ByteBuffer.allocate(Long.BYTES)
+          .putLong(state.stateVersion()).array());
+    }
+
+    private static CommitState initialBarrierState() {
+      String owner = "auth-session-test-owner";
+      return CommitState.initial(key(32, 7), 1).claimOwner(owner, 1, 100_000)
+          .enableAuthorizationBarrier(owner, 1, 2);
     }
   }
 }

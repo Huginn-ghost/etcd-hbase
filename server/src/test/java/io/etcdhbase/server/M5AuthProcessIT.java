@@ -105,6 +105,19 @@ class M5AuthProcessIT {
         assertIdentity(second.resolve(aliceToken), "alice", "KERBEROS");
         assertIdentity(second.resolve(readerToken), "reader", "KERBEROS");
 
+        // Keep the original activation alive in both JVMs while the backend ACL changes.
+        first.hold(aliceToken);
+        second.hold(aliceToken);
+        setUserAccess(configuration, adminPrincipal, adminKeytab, dataTable, "alice", false);
+        assertEquals("PERMISSION_DENIED", first.resolveFailure(aliceToken));
+        assertEquals("PERMISSION_DENIED", second.resolveFailure(aliceToken));
+        first.assertHeldConnectionOpen();
+        second.assertHeldConnectionOpen();
+        assertIdentity(second.resolve(readerToken), "reader", "KERBEROS");
+        first.releaseHeld();
+        second.releaseHeld();
+        setUserAccess(configuration, adminPrincipal, adminKeytab, dataTable, "alice", true);
+
         try (ProcessNode wrongScope = startNode(logDirectory.resolve("wrong-scope.log"),
             configurationFile, "m5-other-process", profileId, dataTable.getNameAsString(),
             authControl, keyFile, dataset, adminPrincipal, "kerberos-password", clusterId)) {
@@ -131,6 +144,28 @@ class M5AuthProcessIT {
       verifySessionRestartForAdapter(logDirectory, configurationFile, scopeId, profileId,
           dataTable.getNameAsString(), authControl, keyFile, dataset, adminPrincipal,
           clusterId, "alice@" + realm, "password-sasl", fixturePassword(), "TOKEN");
+    }
+  }
+
+  private void setUserAccess(org.apache.hadoop.conf.Configuration configuration,
+      String adminPrincipal, Path adminKeytab, TableName table, String userName,
+      boolean granted) throws Exception {
+    try (var user = KerberosUserContext.fromKeytab(adminPrincipal, adminKeytab);
+        var connection = ConnectionFactory.createAsyncConnection(configuration, user.user())
+            .get(30, TimeUnit.SECONDS)) {
+      var admin = connection.getAdmin();
+      var permission = Permission.newBuilder(table)
+          .withActions(Action.READ, Action.WRITE, Action.EXEC).build();
+      var entry = new UserPermission(userName, permission);
+      if (granted) admin.grant(entry, false).get(30, TimeUnit.SECONDS);
+      else admin.revoke(entry).get(30, TimeUnit.SECONDS);
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+      while (System.nanoTime() < deadline) {
+        if (admin.hasUserPermissions(userName, List.of(permission))
+            .get(30, TimeUnit.SECONDS).equals(List.of(granted))) return;
+        Thread.sleep(50);
+      }
+      throw new IllegalStateException("temporary HBase ACL change did not become visible");
     }
   }
 
@@ -304,6 +339,25 @@ class M5AuthProcessIT {
       assertEquals("ERROR", response[0], "mismatched scope unexpectedly resolved the token");
       assertEquals(2, response.length);
       return response[1];
+    }
+
+    private void hold(String token) throws Exception {
+      output.writeUTF("HOLD");
+      output.writeUTF(token);
+      output.flush();
+      assertEquals("HELD", read(), "identity was not held; log=" + log);
+    }
+
+    private void releaseHeld() throws Exception {
+      output.writeUTF("RELEASE");
+      output.flush();
+      assertEquals("RELEASED", read(), "identity was not released; log=" + log);
+    }
+
+    private void assertHeldConnectionOpen() throws Exception {
+      output.writeUTF("HELD_OPEN");
+      output.flush();
+      assertEquals("OPEN", read(), "held connection closed before drain; log=" + log);
     }
 
     private String read() throws Exception {

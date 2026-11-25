@@ -2,11 +2,14 @@ package io.etcdhbase.hbase.storage;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.etcdhbase.core.auth.AuthSession;
 import io.etcdhbase.core.auth.AuthSlot;
 import io.etcdhbase.core.auth.CredentialEnvelope;
+import io.etcdhbase.core.auth.DeploymentControlRecord;
+import io.etcdhbase.core.auth.DeploymentIdentity;
 import io.etcdhbase.core.auth.SubjectAuthority;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.request.RequestScope;
@@ -18,6 +21,8 @@ import io.etcdhbase.spi.identity.BackendCredentials;
 import io.etcdhbase.spi.salt.HashSaltStrategy;
 import io.etcdhbase.spi.salt.SaltProfile;
 import java.time.Duration;
+import java.util.Optional;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.hbase.TableName;
 import org.junit.jupiter.api.Test;
@@ -48,6 +53,7 @@ class HBaseAuthControlIT {
             .get(30, TimeUnit.SECONDS);
         var store = HBaseAuthSessionStore.open(provider, operator, binding, scope)
             .get(30, TimeUnit.SECONDS);
+        verifyDeploymentControl(provider, operator, binding, scope);
 
         AuthSession session = session();
         assertTrue(store.createSessionIfAbsent(session, scope).toCompletableFuture()
@@ -76,10 +82,28 @@ class HBaseAuthControlIT {
             session.authorizationGeneration(), SubjectAuthority.State.ACTIVE);
         assertTrue(store.createAuthorityIfAbsent(authority, scope).toCompletableFuture()
             .get(10, TimeUnit.SECONDS));
-        SubjectAuthority revoked = new SubjectAuthority(authority.subjectDigest(), TRUST_DOMAIN,
-            authority.providerId(), SCOPE, authority.credentialGeneration(),
-            authority.authorizationGeneration() + 1, SubjectAuthority.State.REVOKED);
-        assertTrue(store.compareAndSetAuthority(authority, revoked, scope).toCompletableFuture()
+        SubjectAuthority revoking = authority.beginRevocation(
+            authority.credentialGeneration() + 1, authority.authorizationGeneration() + 1);
+        assertTrue(store.compareAndSetAuthority(authority, revoking, scope).toCompletableFuture()
+            .get(10, TimeUnit.SECONDS));
+        SubjectAuthority targeted = revoking.assignRevocationBarrierTarget(1);
+        assertTrue(store.compareAndSetAuthority(revoking, targeted, scope).toCompletableFuture()
+            .get(10, TimeUnit.SECONDS));
+        SubjectAuthority installed = targeted.markRevocationInstalled(SCOPE.tableGroupId(), 1);
+        assertTrue(store.compareAndSetAuthority(targeted, installed, scope).toCompletableFuture()
+            .get(10, TimeUnit.SECONDS));
+        SubjectAuthority lowerGenerationTerminal = new SubjectAuthority(
+            authority.subjectDigest(), TRUST_DOMAIN, authority.providerId(), SCOPE,
+            authority.credentialGeneration(), authority.authorizationGeneration(),
+            SubjectAuthority.State.REVOKED);
+        ExecutionException rejectedTransition = assertThrows(ExecutionException.class,
+            () -> store.compareAndSetAuthority(installed, lowerGenerationTerminal, scope)
+                .toCompletableFuture().get(10, TimeUnit.SECONDS));
+        assertEquals(IllegalArgumentException.class, rejectedTransition.getCause().getClass());
+        assertEquals(installed, store.readAuthority(authority.subjectDigest(), scope)
+            .toCompletableFuture().get(10, TimeUnit.SECONDS).orElseThrow());
+        SubjectAuthority revoked = installed.finishRevocation(SubjectAuthority.State.REVOKED);
+        assertTrue(store.compareAndSetAuthority(installed, revoked, scope).toCompletableFuture()
             .get(10, TimeUnit.SECONDS));
         assertEquals(revoked, store.readAuthority(authority.subjectDigest(), scope)
             .toCompletableFuture().get(10, TimeUnit.SECONDS).orElseThrow());
@@ -93,6 +117,37 @@ class HBaseAuthControlIT {
             .get(10, TimeUnit.SECONDS).isEmpty());
       }
     }
+  }
+
+  private static void verifyDeploymentControl(HBaseBackendIdentityProvider provider,
+      io.etcdhbase.spi.identity.AuthorizedBackendIdentity installer, AuthControlBinding binding,
+      RequestScope scope) throws Exception {
+    var store = HBaseDeploymentControlStore.openInstaller(provider, installer, binding, scope)
+        .get(30, TimeUnit.SECONDS);
+    var identity = new DeploymentIdentity(TRUST_DOMAIN, "group", ByteKey.copyOf(new byte[32]),
+        1, "incarnation");
+    var payload = ByteKey.copyOf(new byte[] {1});
+    var operation = ByteKey.copyOf(new byte[16]);
+    var active = new DeploymentControlRecord(DeploymentControlRecord.Kind.BINDING_V1,
+        identity, 1, DeploymentControlRecord.State.ACTIVE, Optional.empty(), payload);
+    var revoking = new DeploymentControlRecord(active.kind(), identity, 2,
+        DeploymentControlRecord.State.REVOKING, Optional.of(operation), payload);
+    var revoked = new DeploymentControlRecord(active.kind(), identity, 3,
+        DeploymentControlRecord.State.REVOKED, Optional.of(operation), payload);
+    var pending = new DeploymentControlRecord(DeploymentControlRecord.Kind.REVOCATION_V1,
+        identity, 1, DeploymentControlRecord.State.REVOKING, Optional.of(operation), payload);
+    assertTrue(store.createIfAbsent(active, scope).toCompletableFuture().get(10, TimeUnit.SECONDS));
+    assertTrue(store.compareAndSet(active, revoking, scope).toCompletableFuture().get(10, TimeUnit.SECONDS));
+    assertTrue(store.createIfAbsent(pending, scope).toCompletableFuture().get(10, TimeUnit.SECONDS));
+    assertFalse(store.compareAndSet(active, revoking, scope).toCompletableFuture().get(10, TimeUnit.SECONDS));
+    assertTrue(store.compareAndSet(revoking, revoked, scope).toCompletableFuture().get(10, TimeUnit.SECONDS));
+    assertFalse(store.createIfAbsent(active, scope).toCompletableFuture().get(10, TimeUnit.SECONDS));
+    var reopened = HBaseDeploymentControlStore.openInstaller(provider, installer, binding, scope)
+        .get(30, TimeUnit.SECONDS);
+    assertEquals(revoked, reopened.readRequired(active.kind(), identity, Optional.empty(), scope)
+        .toCompletableFuture().get(10, TimeUnit.SECONDS));
+    assertEquals(pending, reopened.readRequired(pending.kind(), identity, Optional.of(operation), scope)
+        .toCompletableFuture().get(10, TimeUnit.SECONDS));
   }
 
   private static AuthSession session() {

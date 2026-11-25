@@ -71,6 +71,9 @@ public final class M5AuthProcessNode implements AutoCloseable {
   private final HBaseConnectionRouter connections;
   private final HBaseBackendIdentityProvider controlProvider;
   private final CredentialKeyProvider keys;
+  private AuthSessionService.ResolvedIdentity heldIdentity;
+  private RequestScope heldScope;
+  private AsyncConnection heldConnection;
 
   private M5AuthProcessNode(AuthenticationScope scope, TableName dataTable,
       TableName controlTable, AuthSessionService sessions,
@@ -171,11 +174,26 @@ public final class M5AuthProcessNode implements AutoCloseable {
   }
 
   private static HBaseCredentialAuthenticator userAuthenticator(String adapter, String clusterId) {
-    return switch (adapter) {
+    HBaseCredentialAuthenticator delegate = switch (adapter) {
       case "kerberos-password" -> HBaseAuthenticators.kerberosPassword();
       case "delegation-token" -> HBaseAuthenticators.delegationToken(clusterId);
       case "password-sasl" -> passwordSaslAuthenticator(clusterId);
       default -> throw new IllegalArgumentException("unsupported test authentication adapter");
+    };
+    // This fixture holds a single immutable credential generation for each test principal.
+    return new HBaseCredentialAuthenticator() {
+      @Override public void validateConfiguration(Configuration configuration) {
+        delegate.validateConfiguration(configuration);
+      }
+      @Override public HBaseUserContext authenticate(BackendCredentials credentials,
+          AuthenticationScope requestedScope) throws Exception {
+        HBaseUserContext context = delegate.authenticate(credentials, requestedScope);
+        return new HBaseUserContext() {
+          @Override public org.apache.hadoop.hbase.security.User user() { return context.user(); }
+          @Override public java.util.OptionalLong credentialGeneration() { return java.util.OptionalLong.of(1); }
+          @Override public void close() throws java.io.IOException { context.close(); }
+        };
+      }
     };
   }
 
@@ -206,6 +224,10 @@ public final class M5AuthProcessNode implements AutoCloseable {
         switch (command) {
           case "AUTH" -> authenticate(input, output);
           case "RESOLVE" -> resolve(input, output);
+          case "HOLD" -> hold(input, output);
+          case "HELD_OPEN" -> output.writeUTF(heldIdentity != null && !heldConnection.isClosed()
+              ? "OPEN" : "CLOSED");
+          case "RELEASE" -> releaseHeld(output);
           default -> writeError(output, "INVALID_COMMAND");
         }
       } catch (Exception failure) {
@@ -213,6 +235,43 @@ public final class M5AuthProcessNode implements AutoCloseable {
       }
       output.flush();
     }
+  }
+
+  private void hold(DataInputStream input, DataOutputStream output) throws Exception {
+    String token = input.readUTF();
+    if (heldIdentity != null) throw new IllegalStateException("identity already held");
+    RequestScope request = RequestScope.withTimeout(Duration.ofMinutes(5));
+    AuthSessionService.ResolvedIdentity resolved = null;
+    try {
+      resolved = sessions.resolve(token, request).toCompletableFuture().get(60, TimeUnit.SECONDS);
+      AsyncConnection connection = connections.connectionFor(resolved.identity())
+          .toCompletableFuture().get(30, TimeUnit.SECONDS);
+      heldIdentity = resolved;
+      heldScope = request;
+      heldConnection = connection;
+      output.writeUTF("HELD");
+    } catch (Exception | Error failure) {
+      if (heldIdentity == null && resolved != null) {
+        try { resolved.release().toCompletableFuture().join(); }
+        catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+      }
+      request.close();
+      throw failure;
+    }
+  }
+
+  private void releaseHeld(DataOutputStream output) throws Exception {
+    if (heldIdentity == null) throw new IllegalStateException("no held identity");
+    try {
+      heldIdentity.release().toCompletableFuture().get(30, TimeUnit.SECONDS);
+      if (!heldConnection.isClosed()) throw new IllegalStateException("retired connection did not close");
+    } finally {
+      heldScope.close();
+      heldIdentity = null;
+      heldScope = null;
+      heldConnection = null;
+    }
+    output.writeUTF("RELEASED");
   }
 
   private void authenticate(DataInputStream input, DataOutputStream output) throws Exception {
@@ -297,7 +356,20 @@ public final class M5AuthProcessNode implements AutoCloseable {
   @Override
   public void close() {
     Throwable failure = null;
-    try { identities.close(); } catch (RuntimeException | Error closeFailure) { failure = closeFailure; }
+    if (heldIdentity != null) {
+      try { heldIdentity.release().toCompletableFuture().join(); }
+      catch (RuntimeException | Error closeFailure) { failure = closeFailure; }
+      finally {
+        heldScope.close();
+        heldIdentity = null;
+        heldScope = null;
+        heldConnection = null;
+      }
+    }
+    try { identities.close(); } catch (RuntimeException | Error closeFailure) {
+      if (failure == null) failure = closeFailure;
+      else failure.addSuppressed(closeFailure);
+    }
     try { connections.close(); } catch (RuntimeException | Error closeFailure) {
       if (failure == null) failure = closeFailure;
       else failure.addSuppressed(closeFailure);

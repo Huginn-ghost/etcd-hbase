@@ -146,7 +146,25 @@ class AuthenticatedRequestIdentityDrainTest {
   }
 
   private static HBaseBackendIdentityProvider provider() {
-    return mock(HBaseBackendIdentityProvider.class);
+    var provider = mock(HBaseBackendIdentityProvider.class);
+    try {
+      when(provider.borrow(any())).thenAnswer(call -> {
+        AuthorizedBackendIdentity identity = call.getArgument(0);
+        return new io.etcdhbase.spi.identity.BackendIdentityBorrow() {
+          @Override public AuthorizedBackendIdentity identity() { return identity; }
+          @Override public java.util.concurrent.CompletionStage<Void> release() {
+            return CompletableFuture.completedFuture(null);
+          }
+        };
+      });
+    } catch (BackendIdentityException impossible) {
+      throw new AssertionError(impossible);
+    }
+    when(provider.retire(any())).thenReturn(CompletableFuture.completedFuture(null));
+    when(provider.verifyCurrentAccess(any())).thenReturn(CompletableFuture.completedFuture(null));
+    when(provider.accessChecksDrained()).thenReturn(CompletableFuture.completedFuture(null));
+    when(provider.isFullyDrained()).thenReturn(true);
+    return provider;
   }
 
   private static AuthorizedBackendIdentity identity(

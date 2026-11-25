@@ -1,6 +1,8 @@
 package io.etcdhbase.hbase.codec;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.etcdhbase.core.bytes.ByteKey;
@@ -14,6 +16,15 @@ class AuthControlKeyCodecTest {
   private static final AuthControlKeyCodec CODEC = new AuthControlKeyCodec(
       new HashSaltStrategy(new SaltProfile(HashSaltStrategy.STRATEGY_ID, 1, 8,
           SALT_WIDTH_BYTES)));
+
+  @Test
+  void configurationAddressesSeparateDomainsAndGroups() {
+    byte[] first = CODEC.configuration("trust", "group-a");
+    assertArrayEquals(first, CODEC.configuration("trust", "group-a"));
+    assertEquals(AuthControlKeyCodec.Kind.AUTH_CONFIGURATION, CODEC.decode(first).kind());
+    assertNotEquals(ByteKey.copyOf(first), ByteKey.copyOf(CODEC.configuration("trust", "group-b")));
+    assertNotEquals(ByteKey.copyOf(first), ByteKey.copyOf(CODEC.configuration("other", "group-a")));
+  }
 
   @Test
   void sessionAndAuthorityKeysRoundTripWithTheirFullDigestIdentity() {
@@ -34,6 +45,38 @@ class AuthControlKeyCodecTest {
     assertEquals(AuthControlKeyCodec.Kind.SLOT, decoded.kind());
     assertEquals(index, ByteBuffer.wrap(decoded.identity().bytes()).getInt());
     assertThrows(IllegalArgumentException.class, () -> CODEC.slot(-1));
+  }
+
+  @Test
+  void deploymentNamespacesRoundTripWithoutCollidingWithExistingRecords() {
+    ByteKey identity = bytes(32, 0x5a);
+    byte[] binding = CODEC.deploymentBindingV1(identity);
+    byte[] operation = CODEC.deploymentRevocationV1(identity);
+    assertEquals(new AuthControlKeyCodec.DecodedKey(
+        AuthControlKeyCodec.Kind.DEPLOYMENT_BINDING_V1, identity), CODEC.decode(binding));
+    assertEquals(new AuthControlKeyCodec.DecodedKey(
+        AuthControlKeyCodec.Kind.DEPLOYMENT_REVOCATION_V1, identity), CODEC.decode(operation));
+    assertNotEquals(ByteKey.copyOf(binding), ByteKey.copyOf(operation));
+    assertNotEquals(ByteKey.copyOf(binding), ByteKey.copyOf(CODEC.session(identity)));
+    assertNotEquals(ByteKey.copyOf(binding), ByteKey.copyOf(CODEC.authority(identity)));
+    assertNotEquals(ByteKey.copyOf(operation), ByteKey.copyOf(CODEC.session(identity)));
+    assertNotEquals(ByteKey.copyOf(operation), ByteKey.copyOf(CODEC.authority(identity)));
+    assertThrows(IllegalArgumentException.class, () -> CODEC.deploymentBindingV1(bytes(31, 1)));
+    assertThrows(IllegalArgumentException.class, () -> CODEC.deploymentRevocationV1(bytes(33, 1)));
+  }
+
+  @Test
+  void deploymentQualifiersSeparateIndividualBindingsAndOperations() {
+    ByteKey first = bytes(32, 1);
+    ByteKey second = bytes(32, 2);
+    byte[] firstBinding = CODEC.deploymentBindingQualifierV1(first);
+    assertArrayEquals(firstBinding, CODEC.deploymentBindingQualifierV1(first));
+    assertNotEquals(ByteKey.copyOf(firstBinding),
+        ByteKey.copyOf(CODEC.deploymentBindingQualifierV1(second)));
+    assertNotEquals(ByteKey.copyOf(firstBinding),
+        ByteKey.copyOf(CODEC.deploymentRevocationQualifierV1(first)));
+    assertThrows(IllegalArgumentException.class,
+        () -> CODEC.deploymentBindingQualifierV1(bytes(31, 1)));
   }
 
   @Test

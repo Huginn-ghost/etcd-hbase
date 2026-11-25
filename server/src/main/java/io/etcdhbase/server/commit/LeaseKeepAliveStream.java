@@ -40,7 +40,6 @@ final class LeaseKeepAliveStream implements StreamObserver<Rpc.LeaseKeepAliveReq
     }
 
     CompletionStage<Void> validateBeforeSend() {
-      if (response.getTTL() <= 0) return CompletableFuture.completedFuture(null);
       return Objects.requireNonNull(beforeSendValidation.get(), "before-send validation");
     }
 
