@@ -438,7 +438,18 @@ class HBaseBackendIdentityProviderTest {
       assertTrue(retryClosed.await(5, TimeUnit.SECONDS));
       verify(connection, times(2)).close();
       verify(context).close();
-      assertTrue(provider.isFullyDrained());
+      awaitFullyDrained(provider);
+    }
+  }
+
+  /** The closed-provider retry runs on a completion worker, so drain is not implied by close(). */
+  private static void awaitFullyDrained(HBaseBackendIdentityProvider provider) throws Exception {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (!provider.isFullyDrained()) {
+      if (System.nanoTime() > deadline) {
+        throw new AssertionError("provider did not drain every accepted attempt");
+      }
+      Thread.sleep(5);
     }
   }
 
