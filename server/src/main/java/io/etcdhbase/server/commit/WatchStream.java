@@ -209,6 +209,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
   private boolean outboundAuthorizationCheckInFlight;
   private boolean periodicAuthorizationCheckInFlight;
   private boolean outboundAuthorizationReady;
+  private long readinessGeneration;
   private boolean sendingResponse;
   private ActiveFragment activeFragment;
   private Throwable terminalFailure;
@@ -274,7 +275,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
           (ServerCallStreamObserver<Rpc.WatchResponse>) serverCall;
       serverObserver = typed;
       serverObserver.disableAutoInboundFlowControl();
-      serverObserver.setOnReadyHandler(this::scheduleDrain);
+      serverObserver.setOnReadyHandler(this::onTransportReady);
       serverObserver.setOnCancelHandler(this::cancelFromPeer);
     } else {
       serverObserver = null;
@@ -324,18 +325,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     drainRequested.set(true);
     if (!draining.compareAndSet(false, true)) return;
     try {
-      worker.execute(() -> {
-        try {
-          drainRequested.getAndSet(false);
-          drainLoop();
-        } catch (RuntimeException | Error failure) {
-          fail(failure);
-          if (failure instanceof Error fatal) throw fatal;
-        } finally {
-          draining.set(false);
-          if (drainRequested.get() || hasRunnableWork()) scheduleDrain();
-        }
-      });
+      worker.execute(this::runOwnedDrain);
     } catch (RejectedExecutionException rejected) {
       drainAfterRejectedExecution(rejected);
     } catch (Error fatal) {
@@ -348,6 +338,23 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
         drainRequested.set(false);
       }
       throw fatal;
+    }
+  }
+
+  /** Runs only while this caller owns the stream writer, including an authorization handoff. */
+  private void runOwnedDrain() {
+    boolean handedOff = false;
+    try {
+      drainRequested.getAndSet(false);
+      handedOff = drainLoop();
+    } catch (RuntimeException | Error failure) {
+      fail(failure);
+      if (failure instanceof Error fatal) throw fatal;
+    } finally {
+      if (!handedOff) {
+        draining.set(false);
+        if (drainRequested.get() || hasRunnableWork()) scheduleDrain();
+      }
     }
   }
 
@@ -373,7 +380,8 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     if (cleanupFailure instanceof RuntimeException failure) throw failure;
   }
 
-  private void drainLoop() {
+  /** Returns true only when an authorization completion now owns the writer. */
+  private boolean drainLoop() {
     int filteredRevisions = 0;
     for (;;) {
       ActiveFragment cancelledFragment = null;
@@ -389,19 +397,19 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
         catch (RuntimeException | Error failure) {
           fail(failure);
           if (failure instanceof Error fatal) throw fatal;
-          return;
+          return false;
         }
       }
       DrainAction action = nextDrainAction();
       switch (action.kind()) {
-        case STOP -> { return; }
+        case STOP -> { return false; }
         case SEND_FAILURE -> {
           sendTerminalFailure(action.failure());
-          return;
+          return false;
         }
         case AUTHORIZE_RESPONSE -> {
-          startOutboundAuthorizationCheck();
-          return;
+          if (startOutboundAuthorizationCheck()) return true;
+          continue;
         }
         case SEND_RESPONSE -> {
           sendResponse(action.response());
@@ -419,13 +427,13 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
         requestNext();
         if (++filteredRevisions >= MAX_FILTERED_REVISIONS_PER_DRAIN) {
           scheduleDrainYield();
-          return;
+          return false;
         }
         continue;
       }
       if (enqueuePendingProgress()) continue;
       requestNext();
-      return;
+      return false;
     }
   }
 
@@ -505,28 +513,62 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
     }
   }
 
-  private void startOutboundAuthorizationCheck() {
-    startAuthorizationCheck(true);
+  private void onTransportReady() {
+    synchronized (lock) {
+      readinessGeneration++;
+      outboundAuthorizationReady = false;
+    }
+    scheduleDrain();
   }
 
-  private void startAuthorizationCheck(boolean outbound) {
+  private boolean startOutboundAuthorizationCheck() {
+    final long startedAtReadinessGeneration;
+    synchronized (lock) { startedAtReadinessGeneration = readinessGeneration; }
+    return OutboundAuthorizationHandoff.start(this::requestAuthorizationCheck, failure -> {
+      synchronized (lock) {
+        outboundAuthorizationCheckInFlight = false;
+        outboundAuthorizationReady = failure == null && !terminal && !peerCancelled
+            && readinessGeneration == startedAtReadinessGeneration && isReady();
+      }
+      if (failure != null) fail(unwrap(failure));
+    }, this::runOwnedDrain);
+  }
+
+  private void startPeriodicAuthorizationCheck() {
+    requestAuthorizationCheck(failure -> executeCompletion(() -> {
+      synchronized (lock) {
+        periodicAuthorizationCheckInFlight = false;
+        outboundAuthorizationReady = false;
+      }
+      if (failure != null) {
+        fail(unwrap(failure));
+      } else {
+        refreshAuthorizationRecheckSchedule();
+        scheduleDrain();
+      }
+    }, schedulingFailure -> {
+      synchronized (lock) { periodicAuthorizationCheckInFlight = false; }
+    }));
+  }
+
+  private void requestAuthorizationCheck(Consumer<Throwable> completed) {
     var settled = new AtomicBoolean();
     final ScheduledFuture<?> timeout;
     try {
-      timeout = timers.schedule(() -> completeAuthorizationCheck(outbound, settled,
+      timeout = timers.schedule(() -> completeAuthorizationRequest(settled, completed,
           new BackendFailure(BackendFailure.Category.TIMEOUT), null),
           AUTHORIZATION_RECHECK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
     } catch (RejectedExecutionException rejected) {
-      completeAuthorizationCheck(outbound, settled, rejected, null);
+      completeAuthorizationRequest(settled, completed, rejected, null);
       return;
     } catch (Error fatal) {
-      completeAuthorizationCheck(outbound, settled, fatal, null);
+      completeAuthorizationRequest(settled, completed, fatal, null);
       throw fatal;
     }
 
     session().whenComplete((openedSession, sessionFailure) -> {
       if (sessionFailure != null) {
-        completeAuthorizationCheck(outbound, settled, unwrap(sessionFailure), timeout);
+        completeAuthorizationRequest(settled, completed, unwrap(sessionFailure), timeout);
         return;
       }
       CompletionStage<Void> authorization;
@@ -534,44 +576,20 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
         authorization = Objects.requireNonNull(openedSession.revalidateAuthorization(),
             "Watch authorization revalidation future");
       } catch (RuntimeException | Error failure) {
-        completeAuthorizationCheck(outbound, settled, failure, timeout);
+        completeAuthorizationRequest(settled, completed, failure, timeout);
         if (failure instanceof Error fatal) throw fatal;
         return;
       }
-      authorization.whenComplete((ignored, failure) ->
-          completeAuthorizationCheck(outbound, settled,
-              failure == null ? null : unwrap(failure), timeout));
+      authorization.whenComplete((ignored, failure) -> completeAuthorizationRequest(settled,
+          completed, failure == null ? null : unwrap(failure), timeout));
     });
   }
 
-  private void completeAuthorizationCheck(boolean outbound, AtomicBoolean settled,
-      Throwable failure, ScheduledFuture<?> timeout) {
+  private static void completeAuthorizationRequest(AtomicBoolean settled,
+      Consumer<Throwable> completed, Throwable failure, ScheduledFuture<?> timeout) {
     if (!settled.compareAndSet(false, true)) return;
     if (timeout != null) timeout.cancel(false);
-    executeCompletion(() -> {
-      synchronized (lock) {
-        if (outbound) {
-          outboundAuthorizationCheckInFlight = false;
-          outboundAuthorizationReady = failure == null && !terminal && !peerCancelled;
-        } else {
-          periodicAuthorizationCheckInFlight = false;
-          outboundAuthorizationReady = false;
-        }
-      }
-      if (failure != null) {
-        fail(unwrap(failure));
-      } else if (outbound) {
-        scheduleDrain();
-      } else {
-        refreshAuthorizationRecheckSchedule();
-      scheduleDrain();
-      }
-    }, schedulingFailure -> {
-      synchronized (lock) {
-        if (outbound) outboundAuthorizationCheckInFlight = false;
-        else periodicAuthorizationCheckInFlight = false;
-      }
-    });
+    completed.accept(failure);
   }
 
   private void processRequest(Rpc.WatchRequest request) {
@@ -1193,7 +1211,7 @@ final class WatchStream implements StreamObserver<Rpc.WatchRequest>, AutoCloseab
       refreshAuthorizationRecheckSchedule();
       return;
     }
-    startAuthorizationCheck(false);
+    startPeriodicAuthorizationCheck();
   }
 
 

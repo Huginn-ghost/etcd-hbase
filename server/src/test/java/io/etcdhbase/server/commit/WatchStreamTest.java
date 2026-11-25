@@ -44,6 +44,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class WatchStreamTest {
   private static final long CLUSTER_ID = 11;
@@ -135,6 +137,90 @@ class WatchStreamTest {
       assertEquals(1, observer.responses.size(), "revoked event data is never written to the stream");
       assertNotNull(observer.failure, "revocation terminates the Watch stream");
       assertEquals(1, subscription.releases.get(), "the queued event lease is released on termination");
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void authorizationCompletedWhileTransportIsBlockedMustBeRecheckedAtReadiness(
+      boolean readyBeforeAuthorizationCompletes) {
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    session.authorizationRequired = true;
+    session.authorizationChecks.add(CompletableFuture.completedFuture(null));
+    var eventAuthorization = new CompletableFuture<Void>();
+    session.authorizationChecks.add(eventAuthorization);
+    session.authorizationChecks.add(CompletableFuture.failedFuture(
+        new BackendFailure(BackendFailure.Category.PERMISSION)));
+    var observer = new RecordingObserver();
+    byte[] key = {9};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = new WatchStream(observer, scope, Runnable::run,
+          timers(), () -> CompletableFuture.completedFuture(session), CLUSTER_ID, MEMBER_ID,
+          1 << 20, new CompactedWatchIdBudget(8), TimeUnit.MINUTES.toMillis(10), 7);
+      stream.onNext(createRequest(74, key, new byte[0], 0, false));
+      assertEquals(1, observer.responses.size());
+
+      subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[] {5}, Optional.empty()));
+      subscription.signalWakeup();
+      assertEquals(2, session.authorizationCheckCount);
+
+      observer.ready = false;
+      if (readyBeforeAuthorizationCompletes) {
+        observer.ready = true;
+        observer.readyHandler.run();
+        eventAuthorization.complete(null);
+      } else {
+        eventAuthorization.complete(null);
+        assertEquals(1, observer.responses.size(), "backpressure holds the authorized event");
+        observer.ready = true;
+        observer.readyHandler.run();
+      }
+
+      assertEquals(3, session.authorizationCheckCount,
+          "authorization checked before a transport stall cannot authorize later delivery");
+      assertEquals(1, observer.responses.size(), "revoked data never reaches the resumed stream");
+      assertNotNull(observer.failure);
+      assertEquals(Status.Code.PERMISSION_DENIED, Status.fromThrowable(observer.failure).getCode());
+      assertEquals(1, subscription.releases.get());
+    }
+  }
+
+  @Test
+  void successfulAuthorizationHandsOffWriterWithoutRequeueingEvent() {
+    var work = new ArrayDeque<Runnable>();
+    var subscription = new RecordingSubscription();
+    var session = new RecordingSession(4, subscription);
+    session.authorizationRequired = true;
+    session.authorizationChecks.add(CompletableFuture.completedFuture(null));
+    var authorization = new CompletableFuture<Void>();
+    session.authorizationChecks.add(authorization);
+    var observer = new RecordingObserver();
+    byte[] key = {9};
+
+    try (var scope = RequestScope.withoutDeadline()) {
+      var stream = new WatchStream(observer, scope, work::addLast,
+          timers(), () -> CompletableFuture.completedFuture(session), CLUSTER_ID, MEMBER_ID,
+          1 << 20, new CompactedWatchIdBudget(8), TimeUnit.MINUTES.toMillis(10), 7);
+      stream.onNext(createRequest(75, key, new byte[0], 0, false));
+      while (!work.isEmpty()) work.removeFirst().run();
+      assertEquals(1, observer.responses.size());
+
+      subscription.add(event(5, PreparedEvent.Kind.PUT, key, new byte[] {5}, Optional.empty()));
+      subscription.signalWakeup();
+      while (!work.isEmpty()) work.removeFirst().run();
+      assertEquals(2, session.authorizationCheckCount);
+      assertEquals(1, observer.responses.size());
+
+      authorization.complete(null);
+
+      assertEquals(2, observer.responses.size(),
+          "fresh authorization and delivery must not be separated by another worker queue");
+      assertEquals(1, subscription.releases.get());
+      stream.close();
+      while (!work.isEmpty()) work.removeFirst().run();
+      assertEquals(1, subscription.closeCount.get());
     }
   }
 

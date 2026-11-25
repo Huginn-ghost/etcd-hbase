@@ -38,7 +38,6 @@ public final class AuthSessionService {
   public static final int MAX_SESSION_SLOTS = 1024;
   public static final int MAX_PRINCIPAL_CODE_POINTS = 256;
   public static final int MAX_SECRET_CHARACTERS = CredentialMaterialCodec.MAX_SECRET_CHARS;
-  private static final int MAX_CAS_ATTEMPTS = 8;
   private static final int MAX_TOKEN_COLLISIONS = 4;
   private static final int SESSION_ID_BYTES = 16;
   private static final int OPERATION_ID_BYTES = 16;
@@ -629,7 +628,7 @@ public final class AuthSessionService {
         ? RequestScope.withTimeout(Duration.ofSeconds(10)) : requestScope;
     CompletionStage<Void> safeToInspect = ownedScope
         ? requestScope.physicalProducersCompletion().toCompletableFuture().orTimeout(
-            10, java.util.concurrent.TimeUnit.SECONDS).thenApply(ignored -> null)
+            10, TimeUnit.SECONDS).thenApply(ignored -> null)
         : CompletableFuture.completedFuture(null);
     CompletionStage<Void> cleanup = safeToInspect.thenCompose(ignored ->
         store.readSlot(reservation.slot().index(), cleanupScope))
