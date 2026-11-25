@@ -16,8 +16,6 @@ public final class AuthControlKeyCodec {
     SESSION(1, 32),
     SUBJECT_AUTHORITY(2, 32),
     SLOT(3, Integer.BYTES),
-    AUTH_CONFIGURATION(6, 32),
-    AUTHORIZATION_REVOCATION(7, 16),
     AUTH_DEPLOYMENT_REGISTRY(8, 32);
 
     private final int id;
@@ -60,10 +58,6 @@ public final class AuthControlKeyCodec {
     return encode(Kind.SUBJECT_AUTHORITY, subjectDigest);
   }
 
-  public byte[] authorizationRevocation(ByteKey operationId) {
-    return encode(Kind.AUTHORIZATION_REVOCATION, operationId);
-  }
-
   public byte[] deploymentRegistry(String trustDomain) {
     if (trustDomain == null || !trustDomain.matches("[A-Za-z][A-Za-z0-9._-]{0,63}")) {
       throw new IllegalArgumentException("invalid auth deployment binding");
@@ -81,25 +75,6 @@ public final class AuthControlKeyCodec {
   public byte[] slot(int index) {
     if (index < 0) throw new IllegalArgumentException("slot index must not be negative");
     return encode(Kind.SLOT, ByteKey.copyOf(ByteBuffer.allocate(Integer.BYTES).putInt(index).array()));
-  }
-
-  /** Domain-separated address for the configuration of a single bound table group. */
-  public byte[] configuration(String trustDomain, String tableGroupId) {
-    if (trustDomain == null || !trustDomain.matches("[A-Za-z][A-Za-z0-9._-]{0,63}")
-        || tableGroupId == null || !tableGroupId.matches("[A-Za-z][A-Za-z0-9._-]{0,63}")) {
-      throw new IllegalArgumentException("invalid auth configuration binding");
-    }
-    try {
-      byte[] domain = trustDomain.getBytes(StandardCharsets.UTF_8);
-      byte[] group = tableGroupId.getBytes(StandardCharsets.UTF_8);
-      byte[] prefix = "etcd-hbase/auth-configuration/v1".getBytes(StandardCharsets.UTF_8);
-      byte[] input = ByteBuffer.allocate(prefix.length + 8 + domain.length + group.length)
-          .put(prefix).putInt(domain.length).put(domain).putInt(group.length).put(group).array();
-      return encode(Kind.AUTH_CONFIGURATION, ByteKey.copyOf(
-          MessageDigest.getInstance("SHA-256").digest(input)));
-    } catch (NoSuchAlgorithmException impossible) {
-      throw new IllegalStateException("SHA-256 unavailable", impossible);
-    }
   }
 
   public byte[] encode(Kind kind, ByteKey identity) {
@@ -164,8 +139,6 @@ public final class AuthControlKeyCodec {
       case 1 -> Kind.SESSION;
       case 2 -> Kind.SUBJECT_AUTHORITY;
       case 3 -> Kind.SLOT;
-      case 6 -> Kind.AUTH_CONFIGURATION;
-      case 7 -> Kind.AUTHORIZATION_REVOCATION;
       case 8 -> Kind.AUTH_DEPLOYMENT_REGISTRY;
       default -> throw invalidRow();
     };

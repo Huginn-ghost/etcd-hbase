@@ -3,7 +3,6 @@ package io.etcdhbase.hbase.codec;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
 import io.etcdhbase.core.auth.AuthSession;
-import io.etcdhbase.core.auth.AuthConfigurationRecord;
 import io.etcdhbase.core.auth.AuthSlot;
 import io.etcdhbase.core.auth.CredentialEnvelope;
 import io.etcdhbase.core.auth.SubjectAuthority;
@@ -46,32 +45,6 @@ public final class AuthMessages {
         .setCredentialEnvelope(envelope)
         .build();
     return checkedSize(encoded.toByteArray());
-  }
-
-  public static byte[] encode(AuthConfigurationRecord configuration) {
-    Objects.requireNonNull(configuration, "configuration");
-    return checkedSize(AuthProtos.AuthConfigurationRecord.newBuilder()
-        .setFormatVersion(FORMAT_VERSION).setTrustDomain(configuration.trustDomain())
-        .setTableGroupId(configuration.tableGroupId())
-        .setConfigurationDigest(bytes(configuration.configurationDigest()))
-        .setEnabled(configuration.enabled()).setRevision(configuration.revision())
-        .build().toByteArray());
-  }
-
-  public static AuthConfigurationRecord decodeConfiguration(byte[] bytes) {
-    var record = parse(bytes, AuthProtos.AuthConfigurationRecord::parseFrom);
-    if (!record.getUnknownFields().asMap().isEmpty()
-        || !record.hasFormatVersion() || record.getFormatVersion() != FORMAT_VERSION
-        || !record.hasTrustDomain() || !record.hasTableGroupId()
-        || !record.hasConfigurationDigest() || !record.hasEnabled() || !record.hasRevision()) {
-      throw invalid();
-    }
-    try {
-      return new AuthConfigurationRecord(record.getTrustDomain(), record.getTableGroupId(),
-          key(record.getConfigurationDigest()), record.getEnabled(), record.getRevision());
-    } catch (IllegalArgumentException | NullPointerException invalidRecord) {
-      throw invalid();
-    }
   }
 
   public static AuthSession decodeSession(byte[] bytes) {

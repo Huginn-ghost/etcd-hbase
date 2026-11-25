@@ -1048,16 +1048,6 @@ class AuthSessionServiceTest {
         String tableGroupId, RequestScope scope) {
       return CompletableFuture.completedFuture(record);
     }
-
-    @Override public CompletionStage<Boolean> createConfigurationIfAbsent(
-        AuthConfigurationRecord initial, RequestScope scope) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override public CompletionStage<Boolean> compareAndSetConfiguration(
-        AuthConfigurationRecord observed, AuthConfigurationRecord replacement, RequestScope scope) {
-      throw new UnsupportedOperationException();
-    }
   }
 
   private static final class FakeDeploymentRegistry implements AuthDeploymentRegistryStore {

@@ -133,7 +133,7 @@ J51_REQUIRED_TESTS = {
         {"reservationAndConfigurationUpdateCompeteOnTheSameRow",
          "staleReservationRetriesAfterAnotherOperationOrConfigurationUpdate"},
     ("core", "surefire", "io.etcdhbase.core.auth.RegistryAuthConfigurationStoreTest"):
-        {"projectsDeploymentGenerationAndPreventsSeparateGroupUpdates"},
+        {"projectsDeploymentGenerationFromTheRegistry"},
     ("core", "surefire", "io.etcdhbase.core.auth.AuthorizationRevocationExecutorTest"):
         {"partialFailureKeepsTheSnapshotAndRestartResumesTheSameBarriers",
          "unknownCasOutcomeIsRecoveredFromTheSameDurableOperation",

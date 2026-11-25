@@ -13,7 +13,9 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 import io.etcdhbase.core.auth.AuthDeploymentRegistry;
+import io.etcdhbase.core.auth.AuthSessionException;
 import io.etcdhbase.core.auth.AuthorizationRevocation;
+import io.etcdhbase.core.error.BackendFailure;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.codec.AuthDeploymentRegistryMessages;
@@ -21,6 +23,7 @@ import io.etcdhbase.spi.salt.HashSaltStrategy;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeoutException;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.AsyncConnection;
@@ -37,15 +40,21 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
 class HBaseAuthDeploymentRegistryStoreTest {
-  @Test
-  void usesStrongReadsAndExactDurableCasAndRejectsInvalidTransitions() {
-    var binding = new AuthControlBinding(TableName.valueOf("auth_control"), "trust", new HashSaltStrategy());
-    var connection = mock(AsyncConnection.class);
-    var builder = mock(AsyncTableBuilder.class, RETURNS_SELF);
-    var table = mock(AsyncTable.class);
+  private final AuthControlBinding binding = new AuthControlBinding(
+      TableName.valueOf("auth_control"), "trust", new HashSaltStrategy());
+  private final AsyncConnection connection = mock(AsyncConnection.class);
+  private final AsyncTableBuilder<?> builder = mock(AsyncTableBuilder.class, RETURNS_SELF);
+  private final AsyncTable<?> table = mock(AsyncTable.class);
+  private final HBaseAuthSessionStore store;
+
+  HBaseAuthDeploymentRegistryStoreTest() {
     doReturn(builder).when(connection).getTableBuilder(binding.table());
     doReturn(table).when(builder).build();
-    var store = new HBaseAuthSessionStore(connection, binding);
+    store = new HBaseAuthSessionStore(connection, binding);
+  }
+
+  @Test
+  void usesStrongReadsAndExactDurableCasAndRejectsInvalidTransitions() {
     var group = new AuthDeploymentRegistry.Group("group", "provider", "realm", "profile",
         bytes(1, 32), bytes(2, 32), true);
     var initial = AuthDeploymentRegistry.initial("trust", List.of(group));
@@ -74,6 +83,49 @@ class HBaseAuthDeploymentRegistryStoreTest {
       assertThrows(CompletionException.class,
           () -> store.compareAndSetRegistry(reserved, initial, scope).toCompletableFuture().join());
     }
+  }
+
+  @Test
+  void missingRegistryStaysMissingAndCorruptOrMisboundRecordsAreUnavailable() {
+    var group = new AuthDeploymentRegistry.Group("group", "provider", "realm", "profile",
+        bytes(1, 32), bytes(2, 32), true);
+    var initial = AuthDeploymentRegistry.initial("trust", List.of(group));
+    var otherDomain = AuthDeploymentRegistry.initial("other", List.of(group));
+    byte[] row = binding.keyCodec().deploymentRegistry("trust");
+    byte[] wrongRow = binding.keyCodec().deploymentRegistry("other");
+    byte[] value = AuthDeploymentRegistryMessages.encode(initial);
+    doReturn(CompletableFuture.completedFuture(Result.EMPTY_RESULT)).when(table).get(any(Get.class));
+    try (var scope = RequestScope.withoutDeadline()) {
+      assertTrue(store.readRegistry(scope).toCompletableFuture().join().isEmpty());
+      for (Result invalid : List.of(
+          result(row, AuthDeploymentRegistryMessages.encode(otherDomain)),
+          result(row, new byte[] {(byte) 0xff}), result(wrongRow, value),
+          Result.create(new org.apache.hadoop.hbase.Cell[] {
+              new KeyValue(row, binding.family(), new byte[] {'x'}, value)}))) {
+        doReturn(CompletableFuture.completedFuture(invalid)).when(table).get(any(Get.class));
+        var failure = assertThrows(CompletionException.class,
+            () -> store.readRegistry(scope).toCompletableFuture().join());
+        assertEquals(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE,
+            assertInstanceOf(AuthSessionException.class, failure.getCause()).reason());
+      }
+    }
+  }
+
+  @Test
+  void backendTimeoutIsNotMisreportedAsCorruptConfiguration() {
+    doReturn(CompletableFuture.failedFuture(new TimeoutException("backend timeout")))
+        .when(table).get(any(Get.class));
+    try (var scope = RequestScope.withoutDeadline()) {
+      var failure = assertThrows(CompletionException.class,
+          () -> store.readRegistry(scope).toCompletableFuture().join());
+      assertEquals(BackendFailure.Category.TIMEOUT,
+          assertInstanceOf(BackendFailure.class, failure.getCause()).category());
+    }
+  }
+
+  private Result result(byte[] row, byte[] value) {
+    return Result.create(new org.apache.hadoop.hbase.Cell[] {
+        new KeyValue(row, binding.family(), new byte[] {'r'}, value)});
   }
 
   private static ByteKey bytes(int value, int length) {

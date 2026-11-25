@@ -1,22 +1,17 @@
 package io.etcdhbase.hbase.storage;
 
 import io.etcdhbase.core.auth.AuthSession;
-import io.etcdhbase.core.auth.AuthConfigurationRecord;
-import io.etcdhbase.core.auth.AuthConfigurationStore;
 import io.etcdhbase.core.auth.AuthDeploymentRegistry;
 import io.etcdhbase.core.auth.AuthDeploymentRegistryStore;
 import io.etcdhbase.core.auth.AuthSessionException;
 import io.etcdhbase.core.auth.AuthSessionStore;
 import io.etcdhbase.core.auth.AuthSlot;
-import io.etcdhbase.core.auth.AuthorizationRevocation;
-import io.etcdhbase.core.auth.AuthorizationRevocationStore;
 import io.etcdhbase.core.auth.SubjectAuthority;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.hbase.api.HBaseConnectionFactory;
 import io.etcdhbase.hbase.codec.AuthMessages;
 import io.etcdhbase.hbase.codec.AuthDeploymentRegistryMessages;
-import io.etcdhbase.hbase.codec.AuthorizationRevocationMessages;
 import io.etcdhbase.hbase.connection.HBaseRequestContext;
 import io.etcdhbase.hbase.error.HBaseFailures;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
@@ -40,8 +35,7 @@ import org.apache.hadoop.hbase.client.Result;
 
 /** Strong-read, exact-byte CAS store for the isolated J50 authentication-control table. */
 public final class HBaseAuthSessionStore
-    implements AuthSessionStore, AuthConfigurationStore, AuthorizationRevocationStore,
-        AuthDeploymentRegistryStore {
+    implements AuthSessionStore, AuthDeploymentRegistryStore {
   public static final int MAX_RECORD_BYTES = AuthMessages.MAX_RECORD_BYTES;
   private static final byte[] VALUE = {'r'};
 
@@ -111,92 +105,6 @@ public final class HBaseAuthSessionStore
     return compareAndSet(binding.keyCodec().deploymentRegistry(binding.trustDomain()),
         AuthDeploymentRegistryMessages.encode(observed), AuthDeploymentRegistryMessages.encode(replacement),
         scope);
-  }
-
-  @Override
-  public CompletionStage<Optional<AuthConfigurationRecord>> readConfiguration(
-      String tableGroupId, RequestScope scope) {
-    byte[] row = binding.keyCodec().configuration(binding.trustDomain(), tableGroupId);
-    return execute(scope, (table, timeout) -> table.get(new Get(row)
-        .setConsistency(Consistency.STRONG).addColumn(binding.family(), VALUE)))
-        .thenApply(result -> {
-          try {
-            return decode(result, row).map(bytes -> {
-              AuthConfigurationRecord record = AuthMessages.decodeConfiguration(bytes);
-              if (!record.trustDomain().equals(binding.trustDomain())
-                  || !record.tableGroupId().equals(tableGroupId)) throw invalidRecord();
-              return record;
-            });
-          } catch (IllegalArgumentException malformed) {
-            throw new AuthSessionException(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE);
-          }
-        });
-  }
-
-  @Override
-  public CompletionStage<Boolean> createConfigurationIfAbsent(
-      AuthConfigurationRecord initial, RequestScope scope) {
-    Objects.requireNonNull(initial, "initial");
-    if (initial.revision() != 1 || !initial.trustDomain().equals(binding.trustDomain())) {
-      return CompletableFuture.failedFuture(new IllegalArgumentException(
-          "initial auth configuration must belong to this domain and start at revision one"));
-    }
-    return create(binding.keyCodec().configuration(initial.trustDomain(), initial.tableGroupId()),
-        AuthMessages.encode(initial), scope);
-  }
-
-  @Override
-  public CompletionStage<Boolean> compareAndSetConfiguration(
-      AuthConfigurationRecord observed, AuthConfigurationRecord replacement, RequestScope scope) {
-    Objects.requireNonNull(observed, "observed");
-    if (!observed.trustDomain().equals(binding.trustDomain())
-        || !observed.permitsReplacement(replacement)) {
-      return CompletableFuture.failedFuture(new IllegalArgumentException(
-          "auth configuration CAS must advance one revision and preserve its binding"));
-    }
-    return compareAndSet(binding.keyCodec().configuration(observed.trustDomain(), observed.tableGroupId()),
-        AuthMessages.encode(observed), AuthMessages.encode(replacement), scope);
-  }
-
-  @Override
-  public CompletionStage<Optional<AuthorizationRevocation>> readRevocation(
-      ByteKey operationId, RequestScope scope) {
-    byte[] row = binding.keyCodec().authorizationRevocation(operationId);
-    return execute(scope, (table, timeout) -> table.get(new Get(row)
-        .setConsistency(Consistency.STRONG).addColumn(binding.family(), VALUE)))
-        .thenApply(result -> {
-          try {
-            return decode(result, row).map(bytes -> {
-              var record = AuthorizationRevocationMessages.decode(bytes);
-              if (!record.operationId().equals(operationId)) throw invalidRecord();
-              return record;
-            });
-          } catch (IllegalArgumentException malformed) {
-            throw new AuthSessionException(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE);
-          }
-        });
-  }
-
-  @Override
-  public CompletionStage<Boolean> createRevocationIfAbsent(
-      AuthorizationRevocation initial, RequestScope scope) {
-    Objects.requireNonNull(initial, "initial");
-    if (!initial.isInitial()) return CompletableFuture.failedFuture(new IllegalArgumentException(
-        "new revocation must start with an untouched snapshot"));
-    return create(binding.keyCodec().authorizationRevocation(initial.operationId()),
-        AuthorizationRevocationMessages.encode(initial), scope);
-  }
-
-  @Override
-  public CompletionStage<Boolean> compareAndSetRevocation(AuthorizationRevocation observed,
-      AuthorizationRevocation replacement, RequestScope scope) {
-    Objects.requireNonNull(observed, "observed");
-    if (!observed.allowsTransitionTo(replacement)) {
-      return CompletableFuture.failedFuture(new IllegalArgumentException(
-          "revocation CAS must preserve the snapshot and advance one progress step"));
-    }
-    return compareAndSet(binding.keyCodec().authorizationRevocation(observed.operationId()),
-        AuthorizationRevocationMessages.encode(observed), AuthorizationRevocationMessages.encode(replacement), scope);
   }
 
   @Override

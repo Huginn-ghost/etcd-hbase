@@ -4,7 +4,6 @@ import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.core.error.BackendFailure;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
 /** Projects a group's status from the authoritative deployment configuration generation. */
@@ -27,22 +26,5 @@ public final class RegistryAuthConfigurationStore implements AuthConfigurationSt
           .map(group -> new AuthConfigurationRecord(record.trustDomain(), group.tableGroupId(),
               group.configurationDigest(), group.enabled(), record.configurationGeneration()));
     }));
-  }
-
-  @Override
-  public CompletionStage<Boolean> createConfigurationIfAbsent(AuthConfigurationRecord initial,
-      RequestScope scope) {
-    return unsupported();
-  }
-
-  @Override
-  public CompletionStage<Boolean> compareAndSetConfiguration(AuthConfigurationRecord observed,
-      AuthConfigurationRecord replacement, RequestScope scope) {
-    return unsupported();
-  }
-
-  private static CompletionStage<Boolean> unsupported() {
-    return CompletableFuture.failedFuture(new UnsupportedOperationException(
-        "update the deployment registry as a complete inventory"));
   }
 }

@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.etcdhbase.core.auth.AuthSession;
-import io.etcdhbase.core.auth.AuthConfigurationRecord;
 import io.etcdhbase.core.auth.AuthSlot;
 import io.etcdhbase.core.auth.CredentialEnvelope;
 import io.etcdhbase.core.auth.SubjectAuthority;
@@ -15,21 +14,6 @@ import org.junit.jupiter.api.Test;
 
 class AuthMessagesTest {
   private static final AuthenticationScope SCOPE = new AuthenticationScope("group", "profile");
-
-  @Test
-  void configurationRoundTripsAndRejectsMissingOrUnknownFields() throws Exception {
-    var config = new AuthConfigurationRecord("milvus", "group", key(32, 7), true, 5);
-    byte[] encoded = AuthMessages.encode(config);
-    assertEquals(config, AuthMessages.decodeConfiguration(encoded));
-    var missing = AuthProtos.AuthConfigurationRecord.parseFrom(encoded).toBuilder()
-        .clearEnabled().build().toByteArray();
-    assertThrows(IllegalArgumentException.class, () -> AuthMessages.decodeConfiguration(missing));
-    byte[] withUnknown = java.util.Arrays.copyOf(encoded, encoded.length + 3);
-    withUnknown[encoded.length] = (byte) 0xf0;
-    withUnknown[encoded.length + 1] = 1;
-    withUnknown[encoded.length + 2] = 1;
-    assertThrows(IllegalArgumentException.class, () -> AuthMessages.decodeConfiguration(withUnknown));
-  }
 
   @Test
   void eachControlRecordRoundTripsWithoutSerializingBearerOrBackendHandle() {

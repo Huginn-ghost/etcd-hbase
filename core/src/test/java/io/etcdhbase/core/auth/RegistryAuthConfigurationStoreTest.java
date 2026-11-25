@@ -28,7 +28,7 @@ class RegistryAuthConfigurationStoreTest {
   }
 
   @Test
-  void projectsDeploymentGenerationAndPreventsSeparateGroupUpdates() {
+  void projectsDeploymentGenerationFromTheRegistry() {
     var group = new AuthDeploymentRegistry.Group("group", "provider", "realm", "profile",
         bytes(1), bytes(2), true);
     var registry = AuthDeploymentRegistry.initial("trust", List.of(group));
@@ -42,8 +42,6 @@ class RegistryAuthConfigurationStoreTest {
       assertEquals(bytes(3), record.configurationDigest());
       assertEquals(false, record.enabled());
       assertTrue(adapter.readConfiguration("missing", scope).toCompletableFuture().join().isEmpty());
-      assertThrows(CompletionException.class,
-          () -> adapter.createConfigurationIfAbsent(record, scope).toCompletableFuture().join());
     }
   }
 

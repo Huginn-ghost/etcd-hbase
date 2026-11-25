@@ -18,15 +18,6 @@ class AuthControlKeyCodecTest {
   private static final AuthControlKeyCodec CODEC = new AuthControlKeyCodec(SALT);
 
   @Test
-  void configurationAddressesSeparateDomainsAndGroups() {
-    byte[] first = CODEC.configuration("trust", "group-a");
-    assertArrayEquals(first, CODEC.configuration("trust", "group-a"));
-    assertEquals(AuthControlKeyCodec.Kind.AUTH_CONFIGURATION, CODEC.decode(first).kind());
-    assertNotEquals(ByteKey.copyOf(first), ByteKey.copyOf(CODEC.configuration("trust", "group-b")));
-    assertNotEquals(ByteKey.copyOf(first), ByteKey.copyOf(CODEC.configuration("other", "group-a")));
-  }
-
-  @Test
   void sessionAndAuthorityKeysRoundTripWithTheirFullDigestIdentity() {
     ByteKey token = bytes(32, 0x5a);
     ByteKey subject = bytes(32, 0xa5);
@@ -55,7 +46,7 @@ class AuthControlKeyCodecTest {
     assertEquals(8, CODEC.decode(registry).kind().id());
     assertNotEquals(ByteKey.copyOf(registry), ByteKey.copyOf(CODEC.deploymentRegistry("other")));
     assertThrows(IllegalArgumentException.class, () -> CODEC.deploymentRegistry(""));
-    for (int removedKind : new int[] {4, 5}) {
+    for (int removedKind : new int[] {4, 5, 6, 7}) {
       byte[] unsupported = registry.clone();
       unsupported[SALT_WIDTH_BYTES] = (byte) removedKind;
       byte[] identifier = java.util.Arrays.copyOfRange(

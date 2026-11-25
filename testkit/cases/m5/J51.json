@@ -66,7 +66,7 @@
     {
       "module": "core", "kind": "surefire",
       "class": "io.etcdhbase.core.auth.RegistryAuthConfigurationStoreTest",
-      "methods": ["projectsDeploymentGenerationAndPreventsSeparateGroupUpdates"]
+      "methods": ["projectsDeploymentGenerationFromTheRegistry"]
     },
     {
       "module": "core", "kind": "surefire",

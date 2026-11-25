@@ -86,15 +86,6 @@ enum SubjectAuthorityStatus {
   SUBJECT_AUTHORITY_REVOKING = 3;
 }
 
-message AuthConfigurationRecord {
-  optional uint32 format_version = 1;
-  optional string trust_domain = 2;
-  optional string table_group_id = 3;
-  optional bytes configuration_digest = 4;
-  optional bool enabled = 5;
-  optional int64 revision = 6;
-}
-
 message AuthorizationRevocationRecord {
   optional uint32 format_version = 1;
   optional bytes operation_id = 2;
