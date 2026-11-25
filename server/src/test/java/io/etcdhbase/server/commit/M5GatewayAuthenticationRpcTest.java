@@ -54,6 +54,7 @@ import io.etcdhbase.grpc.service.LeaseService;
 import io.etcdhbase.hbase.codec.ResultMessages;
 import io.etcdhbase.server.auth.AesGcmCredentialEnvelopeProtector;
 import io.etcdhbase.server.auth.AuthSessionService;
+import io.etcdhbase.server.auth.AuthDeploymentFixture;
 import io.etcdhbase.server.auth.AuthenticateRpcHandler;
 import io.etcdhbase.server.auth.CredentialKeyProvider;
 import io.etcdhbase.server.auth.SessionIdentityLease;
@@ -383,7 +384,9 @@ class M5GatewayAuthenticationRpcTest {
   private static AuthSessionService sessions(InMemoryAuthSessionStore store,
       CredentialEnvelopeProtector protector, TestSessionIdentityManager identities) {
     return new AuthSessionService(store, protector, identities, "milvus", PROVIDER, AUTH_SCOPE,
-        DATASET, Duration.ofMinutes(5), 8, Clock.systemUTC(), new SecureRandom());
+        DATASET, Duration.ofMinutes(5), 8, Clock.systemUTC(), new SecureRandom(),
+        store.deployment, store.deployment.barriers(),
+        AuthDeploymentFixture.IDENTITY_DOMAIN, store.deployment.configurationDigest());
   }
 
   private static AuthorizedBackendIdentity identity(String subject, String context) {
@@ -580,6 +583,8 @@ class M5GatewayAuthenticationRpcTest {
   }
 
   private static final class InMemoryAuthSessionStore implements AuthSessionStore {
+    private final AuthDeploymentFixture deployment = new AuthDeploymentFixture(
+        this, "milvus", PROVIDER, AUTH_SCOPE, DATASET, Clock.systemUTC());
     private final Map<ByteKey, AuthSession> sessions = new HashMap<>();
     private final Map<Integer, AuthSlot> slots = new HashMap<>();
     private final Map<ByteKey, SubjectAuthority> authorities = new HashMap<>();

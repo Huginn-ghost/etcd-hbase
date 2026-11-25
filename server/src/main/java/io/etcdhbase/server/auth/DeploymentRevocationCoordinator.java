@@ -43,13 +43,6 @@ final class DeploymentRevocationCoordinator {
 
   DeploymentRevocationCoordinator(AuthDeploymentRegistryStore registry, AuthSessionStore authorities,
       AuthorizationRevocationExecutor.Barriers barriers, String trustDomain, String identityDomain,
-      ByteKey datasetDigest, ByteKey configurationDigest, SecureRandom random, Set<String> availableGroups) {
-    this(registry, authorities, barriers, trustDomain, identityDomain, datasetDigest,
-        configurationDigest, random, availableGroups, null);
-  }
-
-  DeploymentRevocationCoordinator(AuthDeploymentRegistryStore registry, AuthSessionStore authorities,
-      AuthorizationRevocationExecutor.Barriers barriers, String trustDomain, String identityDomain,
       ByteKey datasetDigest, ByteKey configurationDigest, SecureRandom random, Set<String> availableGroups,
       AuthConfigurationUpdateExecutor.Barriers configurationBarriers) {
     this.registry = Objects.requireNonNull(registry, "registry");

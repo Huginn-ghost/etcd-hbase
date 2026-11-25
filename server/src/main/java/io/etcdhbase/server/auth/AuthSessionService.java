@@ -16,7 +16,6 @@ import io.etcdhbase.core.auth.CredentialEnvelopeContext;
 import io.etcdhbase.core.auth.CredentialEnvelopeProtector;
 import io.etcdhbase.core.auth.SubjectAuthority;
 import io.etcdhbase.core.bytes.ByteKey;
-import io.etcdhbase.core.commit.AuthorizationBarrierInstaller;
 import io.etcdhbase.core.request.RequestScope;
 import io.etcdhbase.spi.identity.AuthenticationScope;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
@@ -55,45 +54,12 @@ public final class AuthSessionService {
   private final int sessionSlots;
   private final Clock clock;
   private final SecureRandom random;
-  private final AuthorizationBarrierInstaller authorizationBarrierInstaller;
   private final AuthConfigurationStore configurationStore;
   private final ByteKey configurationDigest;
   private final DeploymentRevocationCoordinator deploymentCoordinator;
   private final DeploymentAuthorizationAdmission deploymentAdmission;
 
-  public AuthSessionService(AuthSessionStore store, CredentialEnvelopeProtector protector,
-      SessionIdentityManager identities, String trustDomain, String providerId,
-      AuthenticationScope scope, ByteKey datasetDigest, Duration sessionTtl, int sessionSlots,
-      Clock clock, SecureRandom random) {
-    this(store, protector, identities, trustDomain, providerId, scope, datasetDigest, sessionTtl,
-        sessionSlots, clock, random, null);
-  }
-
-  /**
-   * Creates the durable session service with the table-group fence required for credential
-   * rotation. The compatibility constructor leaves rotations fail-closed.
-   */
-  public AuthSessionService(AuthSessionStore store, CredentialEnvelopeProtector protector,
-      SessionIdentityManager identities, String trustDomain, String providerId,
-      AuthenticationScope scope, ByteKey datasetDigest, Duration sessionTtl, int sessionSlots,
-      Clock clock, SecureRandom random,
-      AuthorizationBarrierInstaller authorizationBarrierInstaller) {
-    this(store, protector, identities, trustDomain, providerId, scope, datasetDigest, sessionTtl,
-        sessionSlots, clock, random, authorizationBarrierInstaller, null, null);
-  }
-
-  /** The configuration store is provisioned independently and is never initialized by a reader. */
-  public AuthSessionService(AuthSessionStore store, CredentialEnvelopeProtector protector,
-      SessionIdentityManager identities, String trustDomain, String providerId,
-      AuthenticationScope scope, ByteKey datasetDigest, Duration sessionTtl, int sessionSlots,
-      Clock clock, SecureRandom random, AuthorizationBarrierInstaller authorizationBarrierInstaller,
-      AuthConfigurationStore configurationStore, ByteKey configurationDigest) {
-    this(store, protector, identities, trustDomain, providerId, scope, datasetDigest, sessionTtl,
-        sessionSlots, clock, random, authorizationBarrierInstaller, configurationStore,
-        configurationDigest, null, null, null, null, null);
-  }
-
-  /** Enables the pre-provisioned deployment registry and resumable cross-group revocation. */
+  /** Creates an all-target worker backed by the pre-provisioned deployment registry. */
   public AuthSessionService(AuthSessionStore store, CredentialEnvelopeProtector protector,
       SessionIdentityManager identities, String trustDomain, String providerId,
       AuthenticationScope scope, ByteKey datasetDigest, Duration sessionTtl, int sessionSlots,
@@ -101,24 +67,12 @@ public final class AuthSessionService {
       AuthorizationRevocationExecutor.Barriers barriers, String backendIdentityDomain,
       ByteKey configurationDigest) {
     this(store, protector, identities, trustDomain, providerId, scope, datasetDigest, sessionTtl,
-        sessionSlots, clock, random, null, new RegistryAuthConfigurationStore(registry),
-        configurationDigest, registry, barriers, backendIdentityDomain, null, null);
+        sessionSlots, clock, random, registry, backendIdentityDomain, configurationDigest,
+        new DeploymentRevocationCoordinator(registry, store, barriers, trustDomain,
+            backendIdentityDomain, datasetDigest, configurationDigest, random));
   }
 
-  /** Enables a worker that can install only the current runtime's table-group barrier. */
-  public AuthSessionService(AuthSessionStore store, CredentialEnvelopeProtector protector,
-      SessionIdentityManager identities, String trustDomain, String providerId,
-      AuthenticationScope scope, ByteKey datasetDigest, Duration sessionTtl, int sessionSlots,
-      Clock clock, SecureRandom random, AuthDeploymentRegistryStore registry,
-      AuthorizationRevocationExecutor.Barriers barriers, String backendIdentityDomain,
-      ByteKey configurationDigest, Set<String> availableGroups) {
-    this(store, protector, identities, trustDomain, providerId, scope, datasetDigest, sessionTtl,
-        sessionSlots, clock, random, null, new RegistryAuthConfigurationStore(registry),
-        configurationDigest, registry, barriers, backendIdentityDomain,
-        Set.copyOf(Objects.requireNonNull(availableGroups, "availableGroups")), null);
-  }
-
-  /** Adds configuration-barrier recovery to the local group worker. */
+  /** Creates a worker that recovers only its own group's authorization and configuration fences. */
   public AuthSessionService(AuthSessionStore store, CredentialEnvelopeProtector protector,
       SessionIdentityManager identities, String trustDomain, String providerId,
       AuthenticationScope scope, ByteKey datasetDigest, Duration sessionTtl, int sessionSlots,
@@ -127,20 +81,22 @@ public final class AuthSessionService {
       ByteKey configurationDigest, Set<String> availableGroups,
       AuthConfigurationUpdateExecutor.Barriers configurationBarriers) {
     this(store, protector, identities, trustDomain, providerId, scope, datasetDigest, sessionTtl,
-        sessionSlots, clock, random, null, new RegistryAuthConfigurationStore(registry),
-        configurationDigest, registry, barriers, backendIdentityDomain,
-        Set.copyOf(Objects.requireNonNull(availableGroups, "availableGroups")),
-        Objects.requireNonNull(configurationBarriers, "configurationBarriers"));
+        sessionSlots, clock, random, registry, backendIdentityDomain, configurationDigest,
+        new DeploymentRevocationCoordinator(registry, store, barriers, trustDomain,
+            backendIdentityDomain, datasetDigest, configurationDigest, random,
+            Set.copyOf(Objects.requireNonNull(availableGroups, "availableGroups")),
+            Objects.requireNonNull(configurationBarriers, "configurationBarriers")));
+    if (!availableGroups.equals(Set.of(scope.tableGroupId()))) {
+      throw new IllegalArgumentException("recovery worker must be bound to its own table group");
+    }
   }
 
   private AuthSessionService(AuthSessionStore store, CredentialEnvelopeProtector protector,
       SessionIdentityManager identities, String trustDomain, String providerId,
       AuthenticationScope scope, ByteKey datasetDigest, Duration sessionTtl, int sessionSlots,
-      Clock clock, SecureRandom random, AuthorizationBarrierInstaller authorizationBarrierInstaller,
-      AuthConfigurationStore configurationStore, ByteKey configurationDigest,
-      AuthDeploymentRegistryStore registry, AuthorizationRevocationExecutor.Barriers barriers,
-      String backendIdentityDomain, Set<String> availableGroups,
-      AuthConfigurationUpdateExecutor.Barriers configurationBarriers) {
+      Clock clock, SecureRandom random, AuthDeploymentRegistryStore registry,
+      String backendIdentityDomain, ByteKey configurationDigest,
+      DeploymentRevocationCoordinator deploymentCoordinator) {
     this.store = Objects.requireNonNull(store, "store");
     this.protector = Objects.requireNonNull(protector, "protector");
     this.identities = Objects.requireNonNull(identities, "identities");
@@ -157,40 +113,23 @@ public final class AuthSessionService {
     this.sessionSlots = sessionSlots;
     this.clock = Objects.requireNonNull(clock, "clock");
     this.random = Objects.requireNonNull(random, "random");
-    this.authorizationBarrierInstaller = authorizationBarrierInstaller;
-    if ((configurationStore == null) != (configurationDigest == null)) {
-      throw new IllegalArgumentException("configuration store and digest must be supplied together");
-    }
-    this.configurationStore = configurationStore;
-    this.configurationDigest = configurationDigest == null ? null
-        : requireDigest(configurationDigest, "configurationDigest");
-    if ((registry == null) != (barriers == null) || (registry == null) != (backendIdentityDomain == null)) {
-      throw new IllegalArgumentException("deployment registry, barriers and identity domain must be supplied together");
-    }
-    if (availableGroups != null && (registry == null || !availableGroups.equals(Set.of(scope.tableGroupId())))) {
-      throw new IllegalArgumentException("recovery worker must be bound to its own table group");
-    }
-    this.deploymentCoordinator = registry == null ? null
-        : new DeploymentRevocationCoordinator(registry, store, barriers, trustDomain, backendIdentityDomain,
-            datasetDigest, this.configurationDigest, random, availableGroups, configurationBarriers);
-    this.deploymentAdmission = registry == null ? null
-        : new DeploymentAuthorizationAdmission(registry, trustDomain, providerId, backendIdentityDomain,
-            scope, datasetDigest, this.configurationDigest);
+    this.configurationStore = new RegistryAuthConfigurationStore(registry);
+    this.configurationDigest = requireDigest(configurationDigest, "configurationDigest");
+    this.deploymentCoordinator = Objects.requireNonNull(deploymentCoordinator, "deploymentCoordinator");
+    this.deploymentAdmission = new DeploymentAuthorizationAdmission(registry, trustDomain, providerId,
+        requireId(backendIdentityDomain, "backendIdentityDomain"), scope, datasetDigest,
+        this.configurationDigest);
   }
 
   /** Advances any pending deployment operation for this runtime's group. */
   public CompletionStage<Void> resumePendingDeploymentRevocation(RequestScope requestScope) {
     Objects.requireNonNull(requestScope, "requestScope");
-    if (deploymentCoordinator == null) return CompletableFuture.failedFuture(
-        new AuthSessionException(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE));
     return deploymentCoordinator.resumePending(providerId, scope, requestScope);
   }
 
   /** Reads the exact persisted bridge configuration; absence or a stale runtime is unavailable. */
   public CompletionStage<AuthConfigurationRecord> readAuthConfiguration(RequestScope requestScope) {
     Objects.requireNonNull(requestScope, "requestScope");
-    if (configurationStore == null) return CompletableFuture.failedFuture(
-        new AuthSessionException(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE));
     return configurationStore.readConfiguration(scope.tableGroupId(), requestScope).thenApply(found -> {
       AuthConfigurationRecord record = found.orElseThrow(() -> new AuthSessionException(
           AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE));
@@ -430,9 +369,7 @@ public final class AuthSessionService {
     } catch (RuntimeException failure) {
       return discardAndRelease(identity, reservation, requestScope, failure);
     }
-    return restorable.thenCompose(ignored -> deploymentCoordinator == null
-        ? ensureAuthority(identity, requestScope)
-        : deploymentCoordinator.ensureCurrent(identity, requestScope))
+    return restorable.thenCompose(ignored -> deploymentCoordinator.ensureCurrent(identity, requestScope))
         .thenCompose(authority -> checkDeploymentAdmission(authority.subjectDigest(),
             authority.revocationConfigurationGeneration(), requestScope).thenCompose(ignored ->
             discardAuthenticatedIdentity(identity)
@@ -451,142 +388,6 @@ public final class AuthSessionService {
       return CompletableFuture.failedFuture(new AuthSessionException(
           AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE));
     }
-  }
-
-  private CompletionStage<SubjectAuthority> ensureAuthority(
-      AuthorizedBackendIdentity identity, RequestScope requestScope) {
-    ByteKey subject = subjectDigest(identity.subject());
-    return ensureAuthority(subject, identity, requestScope, 0);
-  }
-
-  private CompletionStage<SubjectAuthority> ensureAuthority(ByteKey subject,
-      AuthorizedBackendIdentity identity, RequestScope requestScope, int attempts) {
-    if (attempts >= MAX_CAS_ATTEMPTS) {
-      return CompletableFuture.failedFuture(new AuthSessionException(
-          AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE));
-    }
-    return store.readAuthority(subject, requestScope).thenCompose(existing -> {
-      if (existing.isEmpty()) {
-        SubjectAuthority created = new SubjectAuthority(subject, trustDomain, providerId, scope,
-            identity.credentialGeneration(), 1, SubjectAuthority.State.ACTIVE);
-        return store.createAuthorityIfAbsent(created, requestScope).thenCompose(success -> success
-            ? CompletableFuture.completedFuture(created)
-            : ensureAuthority(subject, identity, requestScope, attempts + 1));
-      }
-      SubjectAuthority observed = existing.orElseThrow();
-      if (!observed.trustDomain().equals(trustDomain) || !observed.providerId().equals(providerId)
-          || !observed.scope().equals(scope)
-          || identity.credentialGeneration() < observed.credentialGeneration()) {
-        return CompletableFuture.failedFuture(new AuthSessionException(
-            AuthSessionException.Reason.PERMISSION_DENIED));
-      }
-      if (observed.state() == SubjectAuthority.State.ACTIVE
-          && observed.credentialGeneration() == identity.credentialGeneration()) {
-        return CompletableFuture.completedFuture(observed);
-      }
-      if (observed.state() == SubjectAuthority.State.REVOKING) {
-        if (identity.credentialGeneration() > observed.credentialGeneration()) {
-          SubjectAuthority advanced;
-          try {
-            advanced = observed.advanceRevocationCredentialGeneration(
-                identity.credentialGeneration(), nextAuthorizationGeneration(observed));
-          } catch (RuntimeException invalid) {
-            return CompletableFuture.failedFuture(invalid);
-          }
-          return store.compareAndSetAuthority(observed, advanced, requestScope)
-              .thenCompose(updated -> updated
-                  ? resumeRevocation(subject, identity, advanced, requestScope, attempts)
-                  : ensureAuthority(subject, identity, requestScope, attempts + 1));
-        }
-        return resumeRevocation(subject, identity, observed, requestScope, attempts);
-      }
-      if (identity.credentialGeneration() <= observed.credentialGeneration()) {
-        return CompletableFuture.failedFuture(new AuthSessionException(
-            AuthSessionException.Reason.PERMISSION_DENIED));
-      }
-      SubjectAuthority revoking;
-      try {
-        revoking = observed.beginRevocation(
-            identity.credentialGeneration(), nextAuthorizationGeneration(observed));
-      } catch (RuntimeException invalid) {
-        return CompletableFuture.failedFuture(invalid);
-      }
-      return store.compareAndSetAuthority(observed, revoking, requestScope)
-          .thenCompose(updated -> updated
-              ? resumeRevocation(subject, identity, revoking, requestScope, attempts)
-              : ensureAuthority(subject, identity, requestScope, attempts + 1));
-    });
-  }
-
-  private CompletionStage<SubjectAuthority> resumeRevocation(ByteKey subject,
-      AuthorizedBackendIdentity identity, SubjectAuthority observed, RequestScope requestScope,
-      int attempts) {
-    if (attempts >= MAX_CAS_ATTEMPTS) {
-      return CompletableFuture.failedFuture(new AuthSessionException(
-          AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE));
-    }
-    if (observed.state() != SubjectAuthority.State.REVOKING) {
-      return ensureAuthority(subject, identity, requestScope, attempts + 1);
-    }
-    SubjectAuthority.RevocationTarget target = observed.revocationTargets().getFirst();
-    if (target.barrierGeneration() == 0) {
-      if (authorizationBarrierInstaller == null) return authorityUnavailable();
-      return authorizationBarrierInstaller.nextTargetGeneration(requestScope).thenCompose(generation -> {
-        SubjectAuthority assigned = observed.assignRevocationBarrierTarget(generation);
-        return store.compareAndSetAuthority(observed, assigned, requestScope).thenCompose(updated ->
-            updated ? resumeRevocation(subject, identity, assigned, requestScope, attempts)
-                : ensureAuthority(subject, identity, requestScope, attempts + 1));
-      });
-    }
-    if (!target.installed()) {
-      if (authorizationBarrierInstaller == null) return authorityUnavailable();
-      return authorizationBarrierInstaller.installAtLeast(target.barrierGeneration(), requestScope)
-          .thenCompose(ignored -> {
-            SubjectAuthority installed = observed.markRevocationInstalled(
-                target.tableGroupId(), target.barrierGeneration());
-            return store.compareAndSetAuthority(observed, installed, requestScope)
-                .thenCompose(updated -> updated
-                    ? resumeRevocation(subject, identity, installed, requestScope, attempts)
-                    : ensureAuthority(subject, identity, requestScope, attempts + 1));
-          });
-    }
-    SubjectAuthority completed;
-    try {
-      completed = observed.finishRevocation(SubjectAuthority.State.ACTIVE);
-    } catch (RuntimeException incomplete) {
-      return CompletableFuture.failedFuture(new AuthSessionException(
-          AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE));
-    }
-    return store.compareAndSetAuthority(observed, completed, requestScope)
-        .thenCompose(updated -> updated
-            ? completedAuthorityForIdentity(completed, identity, requestScope, attempts)
-            : ensureAuthority(subject, identity, requestScope, attempts + 1));
-  }
-
-  private CompletionStage<SubjectAuthority> completedAuthorityForIdentity(
-      SubjectAuthority completed, AuthorizedBackendIdentity identity, RequestScope requestScope,
-      int attempts) {
-    if (completed.credentialGeneration() == identity.credentialGeneration()) {
-      return CompletableFuture.completedFuture(completed);
-    }
-    if (completed.credentialGeneration() > identity.credentialGeneration()) {
-      return CompletableFuture.failedFuture(new AuthSessionException(
-          AuthSessionException.Reason.PERMISSION_DENIED));
-    }
-    return ensureAuthority(completed.subjectDigest(), identity, requestScope, attempts + 1);
-  }
-
-  private static long nextAuthorizationGeneration(SubjectAuthority authority) {
-    try {
-      return Math.addExact(authority.authorizationGeneration(), 1);
-    } catch (ArithmeticException exhausted) {
-      throw new AuthSessionException(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE);
-    }
-  }
-
-  private static <T> CompletionStage<T> authorityUnavailable() {
-    return CompletableFuture.failedFuture(new AuthSessionException(
-        AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE));
   }
 
   private CompletionStage<IssuedToken> createSession(BackendCredentials credentials,
@@ -722,8 +523,7 @@ public final class AuthSessionService {
 
   private CompletionStage<Void> checkDeploymentAdmission(ByteKey subject, long configurationGeneration,
       RequestScope requestScope) {
-    return deploymentAdmission == null ? CompletableFuture.completedFuture(null)
-        : deploymentAdmission.check(subject, configurationGeneration, requestScope);
+    return deploymentAdmission.check(subject, configurationGeneration, requestScope);
   }
 
   private CompletionStage<Reservation> reserveSlot(RequestScope requestScope) {

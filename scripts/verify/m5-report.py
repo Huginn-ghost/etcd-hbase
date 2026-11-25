@@ -190,10 +190,13 @@ J51_REQUIRED_TESTS = {
     ("server", "surefire", "io.etcdhbase.server.auth.AuthSessionServiceTest"):
         {
             "rotationResumesAfterAnUnknownAuthorityWriteAtEveryPersistedPhase",
+            "rotationResumesAfterAnUnknownRegistryWriteAtEveryPersistedPhase",
+            "failedBarrierInstallationIsRecoveredByAnotherRuntimeFromTheSameRegistry",
             "newerRotationFencesAnOlderRotationWaitingForBarrierCas",
             "deploymentRotationBlocksBothGroupsUntilTheirBarriersComplete",
             "independentGroupServicesResumeOnlyTheirOwnRegisteredBarriers",
             "localServicesCooperativelyRecoverConfigurationBarriers",
+            "registryBindingMustMatchBeforeAuthenticationCanChangeAuthority",
             "authStatusConfigurationMustMatchThePersistedBridge",
         },
     ("server", "surefire", "io.etcdhbase.server.auth.ProviderSessionIdentityManagerTest"):

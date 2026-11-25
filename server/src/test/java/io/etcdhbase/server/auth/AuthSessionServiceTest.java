@@ -7,9 +7,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import etcdserverpb.Rpc;
 import io.etcdhbase.core.auth.AuthSession;
-import io.etcdhbase.core.auth.AuthConfigurationRecord;
-import io.etcdhbase.core.auth.AuthConfigurationStore;
 import io.etcdhbase.core.auth.AuthDeploymentRegistry;
+import io.etcdhbase.core.auth.AuthorizationRevocation;
 import io.etcdhbase.core.auth.AuthDeploymentRegistryStore;
 import io.etcdhbase.core.auth.TargetAuthorizationBarriers;
 import io.etcdhbase.core.auth.TargetConfigurationBarriers;
@@ -52,6 +51,7 @@ import org.junit.jupiter.api.io.TempDir;
 class AuthSessionServiceTest {
   private static final AuthenticationScope SCOPE = new AuthenticationScope("group", "profile");
   private static final ByteKey DATASET = key(32, 9);
+  private static final ByteKey CONFIGURATION = key(32, 77);
 
   @TempDir Path temporary;
 
@@ -117,22 +117,26 @@ class AuthSessionServiceTest {
         datasetB, digestB, true);
     var registry = new FakeDeploymentRegistry(AuthDeploymentRegistry.initial("milvus", java.util.List.of(groupA, groupB)));
     var fixedClock = Clock.fixed(Instant.ofEpochMilli(20), ZoneOffset.UTC);
+    var installerA = new AuthorizationBarrierInstaller(new FakeControlStore(), fixedClock);
+    var installerB = new AuthorizationBarrierInstaller(new FakeControlStore(), fixedClock);
     var barriersA = new TargetAuthorizationBarriers(store, "milvus", Map.of("group",
-        new TargetAuthorizationBarriers.Group("hbase-provider", SCOPE, DATASET,
-            new AuthorizationBarrierInstaller(new FakeControlStore(), fixedClock))));
+        new TargetAuthorizationBarriers.Group("hbase-provider", SCOPE, DATASET, installerA)));
     var barriersB = new TargetAuthorizationBarriers(store, "milvus", Map.of("other",
-        new TargetAuthorizationBarriers.Group("hbase-provider", scopeB, datasetB,
-            new AuthorizationBarrierInstaller(new FakeControlStore(), fixedClock))));
+        new TargetAuthorizationBarriers.Group("hbase-provider", scopeB, datasetB, installerB)));
     try (var keys = keyProvider("key-1", temporary.resolve("independent-group-key.bin"));
         var request = RequestScope.withTimeout(Duration.ofSeconds(10));
         var credential = credentials()) {
       var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
       var a = new AuthSessionService(store, protector, new FakeIdentityManager(), "milvus", "hbase-provider",
           SCOPE, DATASET, Duration.ofMinutes(5), 4, Clock.systemUTC(), new SecureRandom(),
-          registry, barriersA, "realm", digestA, Set.of("group"));
+          registry, barriersA, "realm", digestA, Set.of("group"),
+          new TargetConfigurationBarriers(Map.of("group", new TargetConfigurationBarriers.Group(DATASET,
+              installerA))));
       var b = new AuthSessionService(store, protector, new FakeIdentityManager(), "milvus", "hbase-provider",
           scopeB, datasetB, Duration.ofMinutes(5), 4, Clock.systemUTC(), new SecureRandom(),
-          registry, barriersB, "realm", digestB, Set.of("other"));
+          registry, barriersB, "realm", digestB, Set.of("other"),
+          new TargetConfigurationBarriers(Map.of("other", new TargetConfigurationBarriers.Group(datasetB,
+              installerB))));
       assertThrows(java.util.concurrent.ExecutionException.class,
           () -> a.authenticate(credential, request).toCompletableFuture().get());
       assertTrue(registry.current.revocation().targets().get(0).installed());
@@ -202,34 +206,82 @@ class AuthSessionServiceTest {
 
   @Test
   void authStatusConfigurationMustMatchThePersistedBridge() throws Exception {
-    var digest = key(32, 77);
-    var source = new FakeConfigurationStore();
-    source.record = Optional.of(new AuthConfigurationRecord("milvus", "group", digest, true, 7));
+    var store = new FakeStore();
+    var digest = CONFIGURATION;
+    var group = store.registry.current.groups().getFirst();
+    store.registry.current = new AuthDeploymentRegistry("milvus", 7, 9, java.util.List.of(group), null);
     try (var keys = keyProvider("key-1", temporary.resolve("status-key.bin"));
         var request = RequestScope.withTimeout(Duration.ofSeconds(3))) {
-      var service = new AuthSessionService(new FakeStore(),
-          new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom()), new FakeIdentityManager(),
-          "milvus", "hbase-provider", SCOPE, DATASET, Duration.ofMinutes(5), 1,
-          Clock.systemUTC(), new SecureRandom(), null, source, digest);
+      var service = service(store, new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom()),
+          new FakeIdentityManager(), 1);
       assertEquals(7, service.readAuthConfiguration(request).toCompletableFuture().get().revision());
-      source.record = Optional.of(new AuthConfigurationRecord("milvus", "group", digest, false, 8));
+      var disabledGroup = new AuthDeploymentRegistry.Group("group", "hbase-provider", "realm", "profile",
+          DATASET, digest, false);
+      store.registry.current = new AuthDeploymentRegistry("milvus", 8, 10,
+          java.util.List.of(disabledGroup), null);
       var disabled = service.readAuthConfiguration(request).toCompletableFuture().get();
       assertFalse(disabled.enabled());
       assertEquals(8, disabled.revision());
       for (var invalid : java.util.List.of(
-          new AuthConfigurationRecord("milvus", "group", key(32, 78), true, 8),
-          new AuthConfigurationRecord("milvus", "other", digest, true, 8))) {
-        source.record = Optional.of(invalid);
+          AuthDeploymentRegistry.initial("milvus", java.util.List.of(new AuthDeploymentRegistry.Group(
+              "group", "hbase-provider", "realm", "profile", DATASET, key(32, 78), true))),
+          AuthDeploymentRegistry.initial("milvus", java.util.List.of(new AuthDeploymentRegistry.Group(
+              "other", "hbase-provider", "realm", "profile", DATASET, digest, true))),
+          AuthDeploymentRegistry.initial("other-trust", java.util.List.of(group)))) {
+        store.registry.current = invalid;
         var failure = assertThrows(java.util.concurrent.ExecutionException.class,
             () -> service.readAuthConfiguration(request).toCompletableFuture().get());
         assertEquals(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE,
             ((AuthSessionException) failure.getCause()).reason());
       }
-      source.record = Optional.empty();
+      store.registry.current = null;
       var missing = assertThrows(java.util.concurrent.ExecutionException.class,
           () -> service.readAuthConfiguration(request).toCompletableFuture().get());
       assertEquals(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE,
           ((AuthSessionException) missing.getCause()).reason());
+    }
+  }
+
+  @Test
+  void registryBindingMustMatchBeforeAuthenticationCanChangeAuthority() throws Exception {
+    var store = new FakeStore();
+    var initial = store.registry.current;
+    var binding = initial.groups().getFirst();
+    try (var keys = keyProvider("key-1", temporary.resolve("registry-binding-key.bin"));
+        var request = RequestScope.withTimeout(Duration.ofSeconds(3)); var credentials = credentials()) {
+      var service = service(store, new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom()),
+          new FakeIdentityManager(), 1);
+      for (var invalid : new AuthDeploymentRegistry[] {
+          null,
+          AuthDeploymentRegistry.initial("other-trust", java.util.List.of(binding)),
+          AuthDeploymentRegistry.initial("milvus", java.util.List.of(new AuthDeploymentRegistry.Group(
+              "other", "hbase-provider", "realm", "profile", DATASET, CONFIGURATION, true))),
+          AuthDeploymentRegistry.initial("milvus", java.util.List.of(new AuthDeploymentRegistry.Group(
+              "group", "other-provider", "realm", "profile", DATASET, CONFIGURATION, true))),
+          AuthDeploymentRegistry.initial("milvus", java.util.List.of(new AuthDeploymentRegistry.Group(
+              "group", "hbase-provider", "other-realm", "profile", DATASET, CONFIGURATION, true))),
+          AuthDeploymentRegistry.initial("milvus", java.util.List.of(new AuthDeploymentRegistry.Group(
+              "group", "hbase-provider", "realm", "other-profile", DATASET, CONFIGURATION, true))),
+          AuthDeploymentRegistry.initial("milvus", java.util.List.of(new AuthDeploymentRegistry.Group(
+              "group", "hbase-provider", "realm", "profile", key(32, 10), CONFIGURATION, true))),
+          AuthDeploymentRegistry.initial("milvus", java.util.List.of(new AuthDeploymentRegistry.Group(
+              "group", "hbase-provider", "realm", "profile", DATASET, key(32, 78), true))),
+          AuthDeploymentRegistry.initial("milvus", java.util.List.of(new AuthDeploymentRegistry.Group(
+              "group", "hbase-provider", "realm", "profile", DATASET, CONFIGURATION, false)))}) {
+        store.registry.current = invalid;
+        var failure = assertThrows(java.util.concurrent.ExecutionException.class,
+            () -> service.authenticate(credentials, request).toCompletableFuture().get());
+        assertEquals(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE,
+            ((AuthSessionException) failure.getCause()).reason());
+        assertEquals(invalid, store.registry.current);
+        assertTrue(store.authorities.isEmpty());
+        assertTrue(store.sessions.isEmpty());
+        assertEquals(AuthSlot.State.EMPTY, store.slots.get(0).state());
+      }
+      store.registry.current = initial;
+      var issued = service.authenticate(credentials, request).toCompletableFuture().get();
+      assertEquals(AuthorizationRevocation.State.COMPLETED, store.registry.current.revocation().state());
+      assertEquals(43, issued.tokenForResponse().length());
     }
   }
 
@@ -302,8 +354,8 @@ class AuthSessionServiceTest {
     FakeStore store = new FakeStore();
     try (var keys = keyProvider("key-1", temporary.resolve("key.bin"))) {
       var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
-      AuthSessionService first = service(store, new FakeIdentityManager(), protector, 1);
-      AuthSessionService second = service(store, new FakeIdentityManager(), protector, 1);
+      AuthSessionService first = service(store, protector, new FakeIdentityManager(), 1);
+      AuthSessionService second = service(store, protector, new FakeIdentityManager(), 1);
       AuthSessionService.IssuedToken issued;
       try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
           var credentials = credentials()) {
@@ -331,7 +383,7 @@ class AuthSessionServiceTest {
 
       FakeIdentityManager bad = new FakeIdentityManager();
       bad.rejectCredentials = true;
-      AuthSessionService invalidLogin = service(store, bad, protector, 1);
+      AuthSessionService invalidLogin = service(store, protector, bad, 1);
       try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
           var credentials = credentials()) {
         var failure = assertThrows(java.util.concurrent.ExecutionException.class,
@@ -615,6 +667,18 @@ class AuthSessionServiceTest {
             .get(3, java.util.concurrent.TimeUnit.SECONDS);
       }
 
+      var initialOperation = store.registry.current.revocation();
+      assertEquals(AuthorizationRevocation.State.COMPLETED, initialOperation.state());
+      assertEquals(1, initialOperation.targets().getFirst().barrierGeneration());
+      assertTrue(initialOperation.targets().getFirst().installed());
+      assertTrue(initialOperation.targets().getFirst().released());
+      var initialAuthority = store.authorities.values().iterator().next();
+      assertEquals(2, initialAuthority.authorizationGeneration());
+      assertEquals(initialOperation.operationId(), initialAuthority.revocationOperationId());
+      assertEquals(initialOperation.operationSequence(), initialAuthority.revocationOperationSequence());
+      assertEquals(1, initialAuthority.revocationConfigurationGeneration());
+      assertEquals(1, commitControl.current().authorizationBarrierGeneration());
+
       identities.credentialGeneration = 4;
       AuthSessionService.IssuedToken rotated;
       try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
@@ -626,9 +690,9 @@ class AuthSessionServiceTest {
       SubjectAuthority authority = store.authorities.values().iterator().next();
       assertEquals(SubjectAuthority.State.ACTIVE, authority.state());
       assertEquals(4, authority.credentialGeneration());
-      assertEquals(2, authority.authorizationGeneration());
+      assertEquals(3, authority.authorizationGeneration());
       assertTrue(authority.revocationTargets().isEmpty());
-      assertEquals(1, commitControl.current().authorizationBarrierGeneration());
+      assertEquals(2, commitControl.current().authorizationBarrierGeneration());
       assertEquals(4, store.sessions.values().stream()
           .filter(session -> session.status() == AuthSession.Status.ACTIVE)
           .filter(session -> session.credentialGeneration() == 4)
@@ -646,37 +710,44 @@ class AuthSessionServiceTest {
   }
 
   @Test
-  void compatibilityConstructorLeavesRotationRevokingAndAConfiguredReplicaResumesIt()
+  void failedBarrierInstallationIsRecoveredByAnotherRuntimeFromTheSameRegistry()
       throws Exception {
     FakeStore store = new FakeStore();
     try (var keys = keyProvider("key-1", temporary.resolve("key.bin"))) {
       var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
       FakeIdentityManager identities = new FakeIdentityManager();
-      AuthSessionService compatibility = service(store, protector, identities, 2);
+      var commitControl = new FakeControlStore();
+      var installer = new AuthorizationBarrierInstaller(commitControl, Clock.fixed(
+          Instant.ofEpochMilli(10), ZoneOffset.UTC));
+      AuthSessionService first = service(store, protector, identities, 2, installer);
       AuthSessionService.IssuedToken previous;
       try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
           var credentials = credentials()) {
-        previous = compatibility.authenticate(credentials, request).toCompletableFuture()
+        previous = first.authenticate(credentials, request).toCompletableFuture()
             .get(3, java.util.concurrent.TimeUnit.SECONDS);
       }
 
       identities.credentialGeneration = 4;
+      commitControl.failNextCas = true;
       try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
           var credentials = credentials()) {
         var failure = assertThrows(java.util.concurrent.ExecutionException.class,
-            () -> compatibility.authenticate(credentials, request).toCompletableFuture()
+            () -> first.authenticate(credentials, request).toCompletableFuture()
                 .get(3, java.util.concurrent.TimeUnit.SECONDS));
         assertEquals(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE,
             ((AuthSessionException) failure.getCause()).reason());
       }
       SubjectAuthority pending = store.authorities.values().iterator().next();
       assertEquals(SubjectAuthority.State.REVOKING, pending.state());
-      assertEquals(0, pending.revocationTargets().getFirst().barrierGeneration());
+      assertEquals(2, pending.revocationTargets().getFirst().barrierGeneration());
+      var operation = store.registry.current.revocation();
+      assertEquals(AuthorizationRevocation.State.INSTALLING, operation.state());
+      assertEquals(pending.revocationOperationId(), operation.operationId());
+      assertEquals(store.registry.current.configurationGeneration(), pending.revocationConfigurationGeneration());
+      assertEquals(2, operation.targets().getFirst().barrierGeneration());
+      assertFalse(operation.targets().getFirst().installed());
 
-      var commitControl = new FakeControlStore();
-      AuthSessionService recovering = service(store, protector, identities, 2,
-          new AuthorizationBarrierInstaller(commitControl, Clock.fixed(
-              Instant.ofEpochMilli(10), ZoneOffset.UTC)));
+      AuthSessionService recovering = service(store, protector, identities, 2, installer);
       try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3));
           var credentials = credentials()) {
         recovering.authenticate(credentials, request).toCompletableFuture()
@@ -686,7 +757,10 @@ class AuthSessionServiceTest {
       SubjectAuthority recovered = store.authorities.values().iterator().next();
       assertEquals(SubjectAuthority.State.ACTIVE, recovered.state());
       assertEquals(4, recovered.credentialGeneration());
-      assertEquals(1, commitControl.current().authorizationBarrierGeneration());
+      assertEquals(operation.operationId(), store.registry.current.revocation().operationId());
+      assertEquals(AuthorizationRevocation.State.COMPLETED, store.registry.current.revocation().state());
+      assertTrue(store.registry.current.revocation().targets().getFirst().released());
+      assertEquals(2, commitControl.current().authorizationBarrierGeneration());
       try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3))) {
         var failure = assertThrows(java.util.concurrent.ExecutionException.class,
             () -> recovering.resolve(previous.tokenForResponse(), request).toCompletableFuture()
@@ -725,10 +799,10 @@ class AuthSessionServiceTest {
         }
         SubjectAuthority persisted = store.authorities.values().iterator().next();
         assertEquals(4, persisted.credentialGeneration());
-        assertEquals(2, persisted.authorizationGeneration());
+        assertEquals(3, persisted.authorizationGeneration());
         assertEquals(failedWrite == 4 ? SubjectAuthority.State.ACTIVE : SubjectAuthority.State.REVOKING,
             persisted.state());
-        assertEquals(failedWrite >= 3 ? 1 : 0, control.current().authorizationBarrierGeneration());
+        assertEquals(failedWrite >= 3 ? 2 : 1, control.current().authorizationBarrierGeneration());
         assertEquals(1, store.sessions.size());
         try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3))) {
           var failure = assertThrows(java.util.concurrent.ExecutionException.class,
@@ -748,8 +822,8 @@ class AuthSessionServiceTest {
         SubjectAuthority recovered = store.authorities.values().iterator().next();
         assertEquals(SubjectAuthority.State.ACTIVE, recovered.state());
         assertEquals(4, recovered.credentialGeneration());
-        assertEquals(2, recovered.authorizationGeneration());
-        assertEquals(1, control.current().authorizationBarrierGeneration());
+        assertEquals(3, recovered.authorizationGeneration());
+        assertEquals(2, control.current().authorizationBarrierGeneration());
         assertEquals(2, store.sessions.size());
         try (RequestScope request = RequestScope.withTimeout(Duration.ofSeconds(3))) {
           var failure = assertThrows(java.util.concurrent.ExecutionException.class,
@@ -760,6 +834,46 @@ class AuthSessionServiceTest {
           var resolved = recovering.resolve(newToken.tokenForResponse(), request).toCompletableFuture()
               .get(3, java.util.concurrent.TimeUnit.SECONDS);
           resolved.release().toCompletableFuture().get(3, java.util.concurrent.TimeUnit.SECONDS);
+        }
+      }
+    }
+  }
+
+  @Test
+  void rotationResumesAfterAnUnknownRegistryWriteAtEveryPersistedPhase() throws Exception {
+    try (var keys = keyProvider("key-1", temporary.resolve("registry-phase-key.bin"))) {
+      var protector = new AesGcmCredentialEnvelopeProtector(keys, new SecureRandom());
+      for (int phase = 1; phase <= 5; phase++) {
+        var store = new FakeStore();
+        var identities = new FakeIdentityManager();
+        var first = service(store, protector, identities, 3);
+        try (var request = RequestScope.withTimeout(Duration.ofSeconds(3)); var credentials = credentials()) {
+          var previous = first.authenticate(credentials, request).toCompletableFuture().get();
+          identities.credentialGeneration = 4;
+          store.registry.failCasAfterWrite = phase;
+          assertThrows(java.util.concurrent.ExecutionException.class,
+              () -> first.authenticate(credentials, request).toCompletableFuture().get());
+          var pending = store.registry.current.revocation();
+          assertEquals(phase == 5 ? AuthorizationRevocation.State.COMPLETED
+              : AuthorizationRevocation.State.INSTALLING, pending.state());
+          assertEquals(4, pending.credentialGeneration());
+          assertEquals(phase >= 2 ? 2 : 0, pending.targets().getFirst().barrierGeneration());
+          assertEquals(phase >= 3, pending.targets().getFirst().installed());
+          assertEquals(phase >= 4, pending.targets().getFirst().released());
+          assertEquals(1, store.sessions.size());
+          assertThrows(java.util.concurrent.ExecutionException.class,
+              () -> first.resolve(previous.tokenForResponse(), request).toCompletableFuture().get());
+          var recovering = service(store, protector, identities, 3);
+          var replacement = recovering.authenticate(credentials, request).toCompletableFuture().get();
+          var completed = store.registry.current.revocation();
+          assertEquals(pending.operationId(), completed.operationId());
+          assertEquals(AuthorizationRevocation.State.COMPLETED, completed.state());
+          assertTrue(completed.targets().getFirst().released());
+          var authority = store.authorities.values().iterator().next();
+          assertEquals(completed.operationId(), authority.revocationOperationId());
+          assertEquals(3, authority.authorizationGeneration());
+          var resolved = recovering.resolve(replacement.tokenForResponse(), request).toCompletableFuture().get();
+          resolved.release().toCompletableFuture().get();
         }
       }
     }
@@ -801,13 +915,13 @@ class AuthSessionServiceTest {
         control.completeHeldCas();
         var olderFailure = assertThrows(java.util.concurrent.ExecutionException.class,
             () -> delayed.get(3, java.util.concurrent.TimeUnit.SECONDS));
-        assertEquals(AuthSessionException.Reason.PERMISSION_DENIED,
+        assertEquals(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE,
             ((AuthSessionException) olderFailure.getCause()).reason());
         var authority = store.authorities.values().iterator().next();
         assertEquals(SubjectAuthority.State.ACTIVE, authority.state());
         assertEquals(5, authority.credentialGeneration());
-        assertEquals(3, authority.authorizationGeneration());
-        assertEquals(1, control.current().authorizationBarrierGeneration());
+        assertEquals(4, authority.authorizationGeneration());
+        assertEquals(3, control.current().authorizationBarrierGeneration());
         assertEquals(2, store.sessions.size());
         var originalFailure = assertThrows(java.util.concurrent.ExecutionException.class,
             () -> newer.resolve(original.tokenForResponse(), newRequest).toCompletableFuture()
@@ -820,7 +934,7 @@ class AuthSessionServiceTest {
         var staleReplicaFailure = assertThrows(java.util.concurrent.ExecutionException.class,
             () -> older.authenticate(oldCredentials, oldRequest).toCompletableFuture()
                 .get(3, java.util.concurrent.TimeUnit.SECONDS));
-        assertEquals(AuthSessionException.Reason.PERMISSION_DENIED,
+        assertEquals(AuthSessionException.Reason.DEPENDENCY_UNAVAILABLE,
             ((AuthSessionException) staleReplicaFailure.getCause()).reason());
         assertEquals(2, store.sessions.size());
       }
@@ -938,19 +1052,16 @@ class AuthSessionServiceTest {
 
   private AuthSessionService service(FakeStore store, AesGcmCredentialEnvelopeProtector protector,
       FakeIdentityManager identities, int slots) {
-    return service(store, identities, protector, slots);
-  }
-
-  private AuthSessionService service(FakeStore store, FakeIdentityManager identities,
-      AesGcmCredentialEnvelopeProtector protector, int slots) {
-    return service(store, protector, identities, slots, null);
+    return service(store, protector, identities, slots, store.installer);
   }
 
   private AuthSessionService service(FakeStore store, AesGcmCredentialEnvelopeProtector protector,
       FakeIdentityManager identities, int slots, AuthorizationBarrierInstaller barrierInstaller) {
+    var barriers = new TargetAuthorizationBarriers(store, "milvus", Map.of("group",
+        new TargetAuthorizationBarriers.Group("hbase-provider", SCOPE, DATASET, barrierInstaller)));
     return new AuthSessionService(store, protector, identities, "milvus", "hbase-provider", SCOPE,
         DATASET, Duration.ofMinutes(5), slots, Clock.systemUTC(), new SecureRandom(),
-        barrierInstaller);
+        store.registry, barriers, "realm", CONFIGURATION);
   }
 
   private FileCredentialKeyProvider keyProvider(String id, Path path) throws Exception {
@@ -1041,20 +1152,12 @@ class AuthSessionServiceTest {
     }
   }
 
-  private static final class FakeConfigurationStore implements AuthConfigurationStore {
-    private Optional<AuthConfigurationRecord> record = Optional.empty();
-
-    @Override public CompletionStage<Optional<AuthConfigurationRecord>> readConfiguration(
-        String tableGroupId, RequestScope scope) {
-      return CompletableFuture.completedFuture(record);
-    }
-  }
-
   private static final class FakeDeploymentRegistry implements AuthDeploymentRegistryStore {
     private AuthDeploymentRegistry current;
+    private int failCasAfterWrite;
     private FakeDeploymentRegistry(AuthDeploymentRegistry current) { this.current = current; }
     @Override public synchronized CompletionStage<Optional<AuthDeploymentRegistry>> readRegistry(RequestScope scope) {
-      return CompletableFuture.completedFuture(Optional.of(current));
+      return CompletableFuture.completedFuture(Optional.ofNullable(current));
     }
     @Override public CompletionStage<Boolean> createRegistryIfAbsent(AuthDeploymentRegistry initial, RequestScope scope) {
       throw new AssertionError("normal login must not create the deployment registry");
@@ -1065,11 +1168,19 @@ class AuthSessionServiceTest {
         return CompletableFuture.completedFuture(false);
       }
       current = replacement;
+      if (failCasAfterWrite > 0 && --failCasAfterWrite == 0) {
+        return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNKNOWN));
+      }
       return CompletableFuture.completedFuture(true);
     }
   }
 
   private static final class FakeStore implements AuthSessionStore {
+    private final FakeDeploymentRegistry registry = new FakeDeploymentRegistry(
+        AuthDeploymentRegistry.initial("milvus", java.util.List.of(new AuthDeploymentRegistry.Group(
+            "group", "hbase-provider", "realm", "profile", DATASET, CONFIGURATION, true))));
+    private final AuthorizationBarrierInstaller installer = new AuthorizationBarrierInstaller(
+        new FakeControlStore(), Clock.fixed(Instant.ofEpochMilli(10), ZoneOffset.UTC));
     private final Map<ByteKey, AuthSession> sessions = new HashMap<>();
     private final Map<Integer, AuthSlot> slots = new HashMap<>();
     private final Map<ByteKey, SubjectAuthority> authorities = new HashMap<>();
@@ -1149,6 +1260,7 @@ class AuthSessionServiceTest {
     private final AtomicReference<ControlSnapshot> current = new AtomicReference<>(
         snapshot(initialBarrierState()));
     private boolean holdNextCas;
+    private boolean failNextCas;
     private ControlSnapshot heldObserved;
     private CommitState heldReplacement;
     private CompletableFuture<Boolean> heldResult;
@@ -1167,6 +1279,10 @@ class AuthSessionServiceTest {
     @Override public CompletableFuture<Boolean> compareAndSet(
         ControlSnapshot observed, CommitState replacement, RequestScope scope) {
       synchronized (current) {
+        if (failNextCas) {
+          failNextCas = false;
+          return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.PERMISSION));
+        }
         if (holdNextCas) {
           holdNextCas = false;
           heldObserved = observed;

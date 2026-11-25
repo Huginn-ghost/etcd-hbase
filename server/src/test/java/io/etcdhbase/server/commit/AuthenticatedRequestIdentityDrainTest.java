@@ -26,6 +26,7 @@ import io.etcdhbase.hbase.api.HBaseConnectionFactory;
 import io.etcdhbase.hbase.connection.HBaseConnectionRouter;
 import io.etcdhbase.hbase.identity.HBaseBackendIdentityProvider;
 import io.etcdhbase.server.auth.AuthSessionService;
+import io.etcdhbase.server.auth.AuthDeploymentFixture;
 import io.etcdhbase.server.auth.ProviderSessionIdentityManager;
 import io.etcdhbase.spi.identity.AuthenticationScope;
 import io.etcdhbase.spi.identity.AuthorizedBackendIdentity;
@@ -77,9 +78,12 @@ class AuthenticatedRequestIdentityDrainTest {
         new ProviderFactory(firstProvider, nextProvider), router, SCOPE, PROVIDER_ID, 1);
     var store = mock(AuthSessionStore.class);
     var protector = mock(CredentialEnvelopeProtector.class);
+    var deployment = new AuthDeploymentFixture(store, TRUST_DOMAIN, PROVIDER_ID, SCOPE,
+        DATASET_DIGEST, Clock.fixed(NOW, ZoneOffset.UTC));
     var sessionService = new AuthSessionService(store, protector, identities, TRUST_DOMAIN,
         PROVIDER_ID, SCOPE, DATASET_DIGEST, Duration.ofMinutes(5), 1,
-        Clock.fixed(NOW, ZoneOffset.UTC), new SecureRandom());
+        Clock.fixed(NOW, ZoneOffset.UTC), new SecureRandom(), deployment, deployment.barriers(),
+        AuthDeploymentFixture.IDENTITY_DOMAIN, deployment.configurationDigest());
     var resolver = new AuthenticatedRequestIdentityResolver(TABLE_GROUP,
         identity("service", "service-context", 0), filledKey(32, (byte) 0x51), sessionService);
     var firstIdentity = identity(PRINCIPAL, "request-context-1", 3);
@@ -186,7 +190,7 @@ class AuthenticatedRequestIdentityDrainTest {
   private static SubjectAuthority authority(AuthSession session) {
     return new SubjectAuthority(session.subjectDigest(), TRUST_DOMAIN, PROVIDER_ID, SCOPE,
         session.credentialGeneration(), session.authorizationGeneration(),
-        SubjectAuthority.State.ACTIVE);
+        SubjectAuthority.State.ACTIVE, java.util.List.of(), filledKey(16, (byte) 0x61), 2, 1);
   }
 
   private static AuthSlot slot(AuthSession session) {

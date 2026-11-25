@@ -14,6 +14,7 @@ import io.etcdhbase.core.auth.AuthSessionStore;
 import io.etcdhbase.core.auth.AuthorizationRevocation;
 import io.etcdhbase.core.auth.SubjectAuthority;
 import io.etcdhbase.core.auth.TargetAuthorizationBarriers;
+import io.etcdhbase.core.auth.TargetConfigurationBarriers;
 import io.etcdhbase.core.bytes.ByteKey;
 import io.etcdhbase.core.commit.AuthorizationBarrierInstaller;
 import io.etcdhbase.core.commit.CommitControlStore;
@@ -92,9 +93,15 @@ class TargetAuthorizationBarriersTest {
       assertThrows(IllegalStateException.class, () -> registry.current.updateConfiguration(List.of(groupA)));
       var barriersB = new TargetAuthorizationBarriers(authStore, "trust", Map.of("b", binding(groupB, controlB)));
       var restartedB = new DeploymentRevocationCoordinator(registry, authStore, barriersB, "trust", "realm",
-          groupB.datasetDigest(), groupB.configurationDigest(), new SecureRandom(), Set.of("b"));
+          groupB.datasetDigest(), groupB.configurationDigest(), new SecureRandom(), Set.of("b"),
+          new TargetConfigurationBarriers(Map.of("b", new TargetConfigurationBarriers.Group(
+              groupB.datasetDigest(), new AuthorizationBarrierInstaller(controlB, Clock.fixed(
+                  Instant.ofEpochMilli(10), ZoneOffset.UTC))))));
       var staleB = new DeploymentRevocationCoordinator(registry, authStore, barriersB, "trust", "realm",
-          groupB.datasetDigest(), bytes(99, 32), new SecureRandom(), Set.of("b"));
+          groupB.datasetDigest(), bytes(99, 32), new SecureRandom(), Set.of("b"),
+          new TargetConfigurationBarriers(Map.of("b", new TargetConfigurationBarriers.Group(
+              groupB.datasetDigest(), new AuthorizationBarrierInstaller(controlB, Clock.fixed(
+                  Instant.ofEpochMilli(10), ZoneOffset.UTC))))));
       var beforeRecovery = registry.current;
       assertThrows(CompletionException.class, () -> staleB.resumePending("provider",
           new AuthenticationScope("b", "profile"), scope).toCompletableFuture().join());
@@ -105,7 +112,10 @@ class TargetAuthorizationBarriersTest {
       assertTrue(registry.current.revocation().targets().get(1).released());
       var barriersA = new TargetAuthorizationBarriers(authStore, "trust", Map.of("a", binding(groupA, controlA)));
       var restartedA = new DeploymentRevocationCoordinator(registry, authStore, barriersA, "trust", "realm",
-          groupA.datasetDigest(), groupA.configurationDigest(), new SecureRandom(), Set.of("a"));
+          groupA.datasetDigest(), groupA.configurationDigest(), new SecureRandom(), Set.of("a"),
+          new TargetConfigurationBarriers(Map.of("a", new TargetConfigurationBarriers.Group(
+              groupA.datasetDigest(), new AuthorizationBarrierInstaller(controlA, Clock.fixed(
+                  Instant.ofEpochMilli(10), ZoneOffset.UTC))))));
       restartedA.resumePending("provider", new AuthenticationScope("a", "profile"), scope)
           .toCompletableFuture().join();
       assertEquals(AuthorizationRevocation.State.COMPLETED, registry.current.revocation().state());

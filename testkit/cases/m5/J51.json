@@ -171,10 +171,13 @@
       "class": "io.etcdhbase.server.auth.AuthSessionServiceTest",
       "methods": [
         "rotationResumesAfterAnUnknownAuthorityWriteAtEveryPersistedPhase",
+        "rotationResumesAfterAnUnknownRegistryWriteAtEveryPersistedPhase",
+        "failedBarrierInstallationIsRecoveredByAnotherRuntimeFromTheSameRegistry",
         "newerRotationFencesAnOlderRotationWaitingForBarrierCas",
         "deploymentRotationBlocksBothGroupsUntilTheirBarriersComplete",
         "independentGroupServicesResumeOnlyTheirOwnRegisteredBarriers",
         "localServicesCooperativelyRecoverConfigurationBarriers",
+        "registryBindingMustMatchBeforeAuthenticationCanChangeAuthority",
         "authStatusConfigurationMustMatchThePersistedBridge"
       ]
     },
