@@ -94,11 +94,12 @@ class CommitPublisherTest {
   }
 
   @Test
-  void legacyPublishWithoutAuthorizationProofFailsClosed() {
+  void missingAuthorizationProofIsRejectedBeforeHandoff() {
     Fixture fixture = new Fixture(true, ScriptedControlStore::write);
 
-    assertThrows(CompletionException.class, () -> fixture.publisher.publish(fixture.invocation,
-        fixture.owner, fixture.manifest, RequestScope.withoutDeadline()).join());
+    assertThrows(NullPointerException.class, () -> fixture.publisher.publish(fixture.invocation,
+        fixture.owner, fixture.manifest, RequestScope.withoutDeadline(),
+        (CommitAuthorizationProof) null));
 
     assertEquals(0, fixture.handoff.calls.get());
     assertEquals(0, fixture.control.casCalls.get());

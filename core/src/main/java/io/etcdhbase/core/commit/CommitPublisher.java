@@ -33,32 +33,9 @@ public final class CommitPublisher {
   }
 
   /**
-   * Returns only a publication observation. A selected result is pending until materialization and
-   * finalization complete; it is never an etcd success response by itself.
+   * Publishes with a captured proof that is revalidated before every new selection CAS. Returns
+   * only an observation: a selected result is not an etcd success until finalization completes.
    */
-  public CompletableFuture<CommitOutcomeResolver.Resolution> publish(
-      InvocationBinding invocation,
-      CommitOwnerService.OwnerToken owner,
-      ManifestRoot manifest,
-      RequestScope requestScope) {
-    return missingAuthorizationProof();
-  }
-
-  /**
-   * Legacy entry point retained for source compatibility. New selection requires an explicit
-   * captured authorization proof; an arbitrary local condition is not an authorization fence.
-   */
-  public CompletableFuture<CommitOutcomeResolver.Resolution> publish(
-      InvocationBinding invocation,
-      CommitOwnerService.OwnerToken owner,
-      ManifestRoot manifest,
-      RequestScope requestScope,
-      Runnable beforeSelection) {
-    Objects.requireNonNull(beforeSelection, "beforeSelection");
-    return missingAuthorizationProof();
-  }
-
-  /** Publishes with a captured proof that is revalidated before every new selection CAS. */
   public CompletableFuture<CommitOutcomeResolver.Resolution> publish(
       InvocationBinding invocation,
       CommitOwnerService.OwnerToken owner,
@@ -180,17 +157,17 @@ public final class CommitPublisher {
       return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
     }
     ManifestRoot manifest = verified.root();
-      PublicationSlot slot = new PublicationSlot(invocation.transactionId(), invocation.invocationId(),
-          owner.epoch(), invocation.baseSequence(), invocation.baseRevision(),
-          Math.addExact(invocation.baseSequence(), 1),
-          Math.addExact(invocation.baseRevision(), manifest.containsKeyChanges() ? 1 : 0),
-          manifest.containsKeyChanges(), manifest.systemIdentity(), manifest.digest());
-      CommitState selected = state.publish(slot);
-      beforeSelection.run();
-      return control.compareAndSet(observed, selected, scope)
-          .handle((updated, failure) -> new CasResult(updated, failure))
-          .thenCompose(result -> resolveAttempt(invocation, owner, verified, scope, authorization,
-              beforeSelection, attempt, result));
+    PublicationSlot slot = new PublicationSlot(invocation.transactionId(), invocation.invocationId(),
+        owner.epoch(), invocation.baseSequence(), invocation.baseRevision(),
+        Math.addExact(invocation.baseSequence(), 1),
+        Math.addExact(invocation.baseRevision(), manifest.containsKeyChanges() ? 1 : 0),
+        manifest.containsKeyChanges(), manifest.systemIdentity(), manifest.digest());
+    CommitState selected = state.publish(slot);
+    beforeSelection.run();
+    return control.compareAndSet(observed, selected, scope)
+        .handle((updated, failure) -> new CasResult(updated, failure))
+        .thenCompose(result -> resolveAttempt(invocation, owner, verified, scope, authorization,
+            beforeSelection, attempt, result));
   }
 
   private CompletableFuture<CommitOutcomeResolver.Resolution> resolveAttempt(
@@ -229,10 +206,6 @@ public final class CommitPublisher {
 
   private static <T> CompletableFuture<T> failed(Throwable failure) {
     return CompletableFuture.failedFuture(CompletionFailures.unwrapCompletion(failure));
-  }
-
-  private static CompletableFuture<CommitOutcomeResolver.Resolution> missingAuthorizationProof() {
-    return CompletableFuture.failedFuture(new BackendFailure(BackendFailure.Category.UNAVAILABLE));
   }
 
   private static BackendFailure scopeFailure(RequestScope scope) {
