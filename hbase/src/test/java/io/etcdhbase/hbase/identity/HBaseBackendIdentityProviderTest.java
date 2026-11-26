@@ -356,6 +356,8 @@ class HBaseBackendIdentityProviderTest {
       provider.retire(identity).toCompletableFuture().get(5, TimeUnit.SECONDS);
       verify(connection, times(2)).close();
       verify(context).close();
+      // Resource retirement can complete before the authentication notification releases capacity.
+      awaitFullyDrained(provider);
       authenticate(provider).get(5, TimeUnit.SECONDS);
     }
   }
@@ -442,7 +444,7 @@ class HBaseBackendIdentityProviderTest {
     }
   }
 
-  /** The closed-provider retry runs on a completion worker, so drain is not implied by close(). */
+  /** Resource cleanup and notification completion must both drain before capacity is reusable. */
   private static void awaitFullyDrained(HBaseBackendIdentityProvider provider) throws Exception {
     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
     while (!provider.isFullyDrained()) {
