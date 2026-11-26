@@ -336,9 +336,8 @@ class TxnGatewayAuthenticationTest {
       assertEquals(Status.Code.PERMISSION_DENIED,
           assertInstanceOf(StatusRuntimeException.class, fixture.failure.get()).getStatus().getCode());
       assertTrue(fixture.closed.get(), "rejected delivery releases the retained durable result");
-      // A rejected identity must also drop the read cache keyed by this authorization, otherwise a
-      // revoked session keeps serving cached ranges through the same digest.
-      fixture.verifyCacheInvalidated();
+      verify(fixture.reads).invalidateAuthorization(
+          AuthorizationScopeDigest.fromSessionRead(identity("milvus-user"), session()));
       scope.cancel();
       scope.cleanupCompletion().toCompletableFuture().get(1, TimeUnit.SECONDS);
       assertEquals(1, fixture.releases.get(),
@@ -401,11 +400,6 @@ class TxnGatewayAuthenticationTest {
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicBoolean completed = new AtomicBoolean();
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
-
-    /** Any authorization digest will do; the point is that the rejected path invalidates the cache. */
-    void verifyCacheInvalidated() {
-      verify(reads).invalidateAuthorization(any());
-    }
 
     private void start(RequestScope scope, boolean changed) {
       start(scope, true, changed);
