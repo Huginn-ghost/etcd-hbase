@@ -245,7 +245,15 @@ public final class TxnGateway implements BiConsumer<Rpc.TxnRequest, StreamObserv
       }).whenComplete((resolved, failure) -> dispatchResponse(observer, scope, terminal, gatewayDrained,
           resolved, failure, true, value -> value.resolution().changed()
               ? CompletableFuture.completedFuture(null)
-              : requestIdentities.revalidate(value.identity(), scope),
+              // A rejected revalidation must also drop the read cache keyed by this authorization,
+              // exactly as the standalone read path does; otherwise a revoked session keeps serving
+              // cached ranges through the same digest.
+              : requestIdentities.revalidate(value.identity(), scope)
+                  .whenComplete((ignored, validationFailure) -> {
+                    if (validationFailure != null) {
+                      reads.invalidateAuthorization(value.identity().readAuthorizationDigest());
+                    }
+                  }),
           value -> TxnResponseEmitter.sendResolved(command, value.resolution(),
               ResultMessages::decodeTree, clusterId, memberId, scope, account, countOutput(observer, delete == null)),
           value -> { if (value != null) value.resolution().close(); }));

@@ -336,6 +336,9 @@ class TxnGatewayAuthenticationTest {
       assertEquals(Status.Code.PERMISSION_DENIED,
           assertInstanceOf(StatusRuntimeException.class, fixture.failure.get()).getStatus().getCode());
       assertTrue(fixture.closed.get(), "rejected delivery releases the retained durable result");
+      // A rejected identity must also drop the read cache keyed by this authorization, otherwise a
+      // revoked session keeps serving cached ranges through the same digest.
+      fixture.verifyCacheInvalidated();
       scope.cancel();
       scope.cleanupCompletion().toCompletableFuture().get(1, TimeUnit.SECONDS);
       assertEquals(1, fixture.releases.get(),
@@ -388,6 +391,7 @@ class TxnGatewayAuthenticationTest {
     private final AuthSessionService.ResolvedIdentity original = mock(AuthSessionService.ResolvedIdentity.class);
     private final AuthSessionService.ResolvedIdentity current = mock(AuthSessionService.ResolvedIdentity.class);
     private final InvocationResultResolver resolver = mock(InvocationResultResolver.class);
+    private final TxnReadExecutor reads = mock(TxnReadExecutor.class);
     private final CompletableFuture<AuthSessionService.ResolvedIdentity> revalidation = new CompletableFuture<>();
     private final CompletableFuture<Void> forwarded = new CompletableFuture<>();
     private final AtomicInteger forwards = new AtomicInteger();
@@ -397,6 +401,11 @@ class TxnGatewayAuthenticationTest {
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicBoolean completed = new AtomicBoolean();
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
+
+    /** Any authorization digest will do; the point is that the rejected path invalidates the cache. */
+    void verifyCacheInvalidated() {
+      verify(reads).invalidateAuthorization(any());
+    }
 
     private void start(RequestScope scope, boolean changed) {
       start(scope, true, changed);
@@ -446,7 +455,7 @@ class TxnGatewayAuthenticationTest {
           CompletableFuture.completedFuture(
               new InvocationResultResolver.ResolvedTransaction(REVISION, changed, payload)));
       var gateway = new TxnGateway(TABLE_GROUP, identity("service-user"), ByteKey.copyOf(new byte[32]),
-          1, 1, 1 << 20, control, relay, resolver, mock(TxnReadExecutor.class),
+          1, 1, 1 << 20, control, relay, resolver, reads,
           budgets(), new BudgetManager.Reservation(1L << 16, 1L << 16, 1L << 16, 1L << 18, 1L << 16),
           worker, new RequestMetrics(), sessions);
       var key = ByteString.copyFromUtf8("key");
